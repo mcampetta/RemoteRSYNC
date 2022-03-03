@@ -28,7 +28,7 @@ fi
     echo "==================================================="    
     echo -e "Enter your choice: \c"
     read -r choice
-    case "$choice" in
+    case $choice in
         2) address=$(ifconfig | grep "inet " | grep -Fv 127.0.0.1 | awk '{print $2}')
                     echo -e "===================================================" 
                     echo -e "Ontrack Data Transfer Server started!"  
@@ -60,7 +60,7 @@ fi
            echo -e "Enter (6) to target custom path"
            echo -e "======================================="
            read -r choice2
-           case "$choice2" in 
+           case $choice2 in 
             1) serversourcedirectory="/";;
             2) serversourcedirectory="/Users";;
             3) serversourcedirectory="/Applications";;
