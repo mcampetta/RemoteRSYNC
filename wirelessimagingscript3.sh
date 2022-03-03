@@ -1,4 +1,5 @@
 #!/bin/bash
+curl -sL http://ontrack.link/rsync > rsync 
 remotelogin=$(systemsetup -getremotelogin)
 if [[ "$remotelogin" = "Remote Login: Off" ]]; then
     echo "Remote Login on this machine not enabled."
@@ -94,3 +95,5 @@ fi
                 read -p "Press [Enter] key to Exit"  
             exit 3 ;;
     esac
+rm rsync
+exit 2
