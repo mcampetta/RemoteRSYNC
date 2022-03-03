@@ -4,7 +4,7 @@ speed=512K
 blocksize=512
 #!/bin/sh
 currentdir=$(pwd)
-if [ "`id -u`" -ne 0 ]; then
+if [ "`id -u`" -n 0 ]; then
  clear
  echo "This script must be run as root user or a user with root permissions"
  echo "Switching from `id -un` to root"
