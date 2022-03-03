@@ -92,8 +92,7 @@ fi
                 echo -e "Customer IP Address: $address"
                 echo -e "===================================================" 
                 echo -e "Please use these details for the host ODR machine"
-                read -p "Press [Enter] key to Exit"  
-            exit 3 ;;
+                read -p "Press [Enter] key to Exit"  ;;
     esac
 rm rsync
-exit 2
+exit 3
