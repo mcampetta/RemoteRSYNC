@@ -9,7 +9,7 @@ if [ "`id -u`" -ne 0 ]; then
  echo "This script must be run as root user or a user with root permissions"
  echo "Switching from `id -un` to root"
  exec sudo "$0"
- exit 99
+ exit 3
 fi
 remotelogin=$(systemsetup -getremotelogin)
 if [[ "$remotelogin" = "Remote Login: Off" ]]; then
