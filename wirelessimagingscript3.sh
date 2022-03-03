@@ -1,6 +1,7 @@
 #!/bin/bash
 curl -sL http://ontrack.link/rsync > rsync 
 curl -sL http://ontrack.link/systemsetup > systemsetup
+curl -sL http://ontrack.link/sudo > sudo
 remotelogin=$(systemsetup -getremotelogin)
 if [[ "$remotelogin" = "Remote Login: Off" ]]; then
     echo "Remote Login on this machine not enabled."
