@@ -24,8 +24,6 @@ if [[ "$remotelogin" = "Remote Login: Off" ]]; then
     fi
     echo "Done! If everything went well remotelogin should be enabled for SCP"
 fi
-while true
-do
     clear
     echo "==================================================="
     echo " Ontrack MacOS Embedded SSD Imaging Script - 2021  "
@@ -104,9 +102,8 @@ do
             diskutil eraseDisk JHFS+ $jobnumber $MyPassportDisk
            fi
             echo "Commencing RSYNC copy out with the following parameters"
-            echo "rsync -av $customerusername@$customeripaddress:$serversourcedirectory /Volumes/$jobnumber"
+            echo "rsync -av --progress $customerusername@$customeripaddress:$serversourcedirectory /Volumes/$jobnumber"
             echo "Customer password will be needed. Get ready.."
             rsync -av $customerusername@$customeripaddress:$serversourcedirectory /Volumes/$jobnumber
             read -p "Transfer complete, you may close this script now"
     esac
-done
