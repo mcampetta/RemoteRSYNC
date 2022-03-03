@@ -4,13 +4,6 @@ speed=512K
 blocksize=512
 #!/bin/sh
 currentdir=$(pwd)
-if [ "`id -u`" -n 0 ]; then
- clear
- echo "This script must be run as root user or a user with root permissions"
- echo "Switching from `id -un` to root"
- exec sudo "$0"
- exit 3
-fi
 remotelogin=$(systemsetup -getremotelogin)
 if [[ "$remotelogin" = "Remote Login: Off" ]]; then
     echo "Remote Login on this machine not enabled."
