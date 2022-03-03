@@ -65,7 +65,7 @@ fi
            echo -e "Enter (5) to target System "
            echo -e "Enter (6) to target custom path"
            echo -e "======================================="
-           read -r choice2 
+           read -r choice2
            case "$choice2" in 
             1) serversourcedirectory="/";;
             2) serversourcedirectory="/Users";;
@@ -107,4 +107,3 @@ fi
             rsync -av $customerusername@$customeripaddress:$serversourcedirectory /Volumes/$jobnumber
             read -p "Transfer complete, you may close this script now"
     esac
-set –e    
