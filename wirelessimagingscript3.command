@@ -27,7 +27,7 @@ fi
     echo "==================================================="    
     echo "Enter your choice: \c"
     read -r choice
-    case "$choice" in
+    case $choice in
         1) echo -e "Enter job number: \c"
            read -r jobnumber
            echo -e "jobnumber set to $jobnumber"
@@ -48,7 +48,7 @@ fi
            echo -e "Enter (6) to target custom path"
            echo -e "======================================="
            read -r choice2
-           case "$choice2" in 
+           case $choice2 in 
             1) serversourcedirectory="/";;
             2) serversourcedirectory="/Users";;
             3) serversourcedirectory="/Applications";;
