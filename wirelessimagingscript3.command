@@ -26,7 +26,6 @@ if [[ "$remotelogin" = "Remote Login: Off" ]]; then
 fi
 while true
 do
-    clear
     echo "==================================================="
     echo " Ontrack MacOS Embedded SSD Imaging Script - 2021  "
     echo "==================================================="
