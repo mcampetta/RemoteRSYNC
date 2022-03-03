@@ -14,7 +14,6 @@ if [[ "$remotelogin" = "Remote Login: Off" ]]; then
     if [[ "$setremotelogin" = "setremotelogin: Turning Remote Login on or off requires Full Disk Access privileges." ]]; then
     echo -e "Please allow terminal full disk access in Sys Prefs/Security & Privacy/Privacy tab/Full Disk Access and run this again"
     echo $setremotelogin
-    read -r test
     exit 3
     fi
     echo "Done! If everything went well remotelogin should be enabled for SCP"
@@ -28,18 +27,7 @@ fi
     echo "==================================================="    
     echo -e "Enter your choice: \c"
     read -r choice
-    case $choice in
-        2) address=$(ifconfig | grep "inet " | grep -Fv 127.0.0.1 | awk '{print $2}')
-                    echo -e "===================================================" 
-                    echo -e "Ontrack Data Transfer Server started!"  
-                    echo -e "===================================================" 
-                    echo -e "Server Information:" 
-                    echo -e "Username: $user"   
-                    echo -e "Customer IP Address: $address"
-                    echo -e "===================================================" 
-                    echo -e "Please use these details for the host ODR machine"
-                    read -p "Press [Enter] key to Exit"  
-                    exit 3 ;;
+    case "$choice" in
         1) echo -e "Enter job number: \c"
            read -r jobnumber
            echo -e "jobnumber set to $jobnumber"
@@ -60,7 +48,7 @@ fi
            echo -e "Enter (6) to target custom path"
            echo -e "======================================="
            read -r choice2
-           case $choice2 in 
+           case "$choice2" in 
             1) serversourcedirectory="/";;
             2) serversourcedirectory="/Users";;
             3) serversourcedirectory="/Applications";;
@@ -99,5 +87,18 @@ fi
             echo "rsync -av --progress $customerusername@$customeripaddress:$serversourcedirectory /Volumes/$jobnumber"
             echo "Customer password will be needed. Get ready.."
             rsync -av $customerusername@$customeripaddress:$serversourcedirectory /Volumes/$jobnumber
-            read -p "Transfer complete, you may close this script now"
+            read -p "Transfer complete, you may close this script now";;
+        2)  user=$(w | awk '{print $1}' | head -3 | tail -1)
+            address=$(ifconfig | grep "inet " | grep -Fv 127.0.0.1 | awk '{print $2}')
+                echo -e "===================================================" 
+                echo -e "Ontrack Data Transfer Server started!"  
+                echo -e "===================================================" 
+                echo -e "Server Information:" 
+                echo -e "Username: $user"   
+                echo -e "Customer IP Address: $address"
+                echo -e "===================================================" 
+                echo -e "Please use these details for the host ODR machine"
+                read -p "Press [Enter] key to Exit"  
+            exit 3 ;;
     esac
+exit 2 
