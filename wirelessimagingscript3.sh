@@ -1,11 +1,4 @@
 #!/bin/bash
-if [ "`id -u`" -ne 0 ]; then
- clear
- echo "This script must be run as root user or a user with root permissions"
- echo "Switching from `id -un` to root"
- exec sudo "$0"
- exit 99
-fi
 remotelogin=$(systemsetup -getremotelogin)
 if [[ "$remotelogin" = "Remote Login: Off" ]]; then
     echo "Remote Login on this machine not enabled."
@@ -27,7 +20,7 @@ fi
     echo "==================================================="    
     echo "Enter your choice: \c"
     read -r choice
-    case $choice in
+    case "$choice" in
         1) echo -e "Enter job number: \c"
            read -r jobnumber
            echo -e "jobnumber set to $jobnumber"
@@ -48,7 +41,7 @@ fi
            echo -e "Enter (6) to target custom path"
            echo -e "======================================="
            read -r choice2
-           case $choice2 in 
+           case "$choice2" in 
             1) serversourcedirectory="/";;
             2) serversourcedirectory="/Users";;
             3) serversourcedirectory="/Applications";;
