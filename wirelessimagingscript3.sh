@@ -18,7 +18,7 @@ fi
     echo "Enter (1) if this is the Ontrack Machine" 
     echo "Enter (2) if this is the Customer Machine " 
     echo "==================================================="    
-    echo -e "Enter your choice: \c"
+    echo -e "Enter your choice:"
     read -r choice
     case "$choice" in
         1) echo -e "Enter job number: \c"
