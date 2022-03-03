@@ -25,7 +25,7 @@ fi
     echo "Enter (1) if this is the Ontrack Machine" 
     echo "Enter (2) if this is the Customer Machine " 
     echo "==================================================="    
-    echo -e "Enter your choice: \c"
+    echo "Enter your choice: \c"
     read -r choice
     case "$choice" in
         1) echo -e "Enter job number: \c"
@@ -101,4 +101,3 @@ fi
                 read -p "Press [Enter] key to Exit"  
             exit 3 ;;
     esac
-exit 2 
