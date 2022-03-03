@@ -21,10 +21,10 @@ fi
     echo -e "Enter your choice:"
     read -r choice
     case "$choice" in
-        1) echo -e "Enter job number: \c"
+        1) echo -e "Entered job number: \c"
            read -r jobnumber
            echo -e "jobnumber set to $jobnumber"
-           echo -e "Enter Customer username: \c"
+           echo -e "Entered Customer username: \c"
            read -r customerusername
            echo -e "customer username set to $customerusername"
            echo -e "Enter Customer IP Address: \c"
