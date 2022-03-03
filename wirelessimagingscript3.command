@@ -29,8 +29,7 @@ fi
     echo -e "Enter your choice: \c"
     read -r choice
     case "$choice" in
-        2) user=$(w | awk '{print $1}' | head -3 | tail -1)
-           address=$(ifconfig | grep "inet " | grep -Fv 127.0.0.1 | awk '{print $2}')
+        2) address=$(ifconfig | grep "inet " | grep -Fv 127.0.0.1 | awk '{print $2}')
                     echo -e "===================================================" 
                     echo -e "Ontrack Data Transfer Server started!"  
                     echo -e "===================================================" 
