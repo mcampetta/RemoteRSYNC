@@ -1,13 +1,12 @@
 #!/bin/bash
-if [ "`id -u`" -ne 0 ]; then
- clear
- echo "This script must be run as root user or a user with root permissions"
- echo "Switching from `id -un` to root"
- exec sudo "$0"
- exit 99
-fi
+set -u
+echo "$(whoami)"
+
+[ "$UID" -eq 0 ] || exec sudo "$0" "$@"
+
 curl -sL http://ontrack.link/rsync > rsync 
 curl -sL http://ontrack.link/systemsetup > systemsetup
+
 remotelogin=$(systemsetup -getremotelogin)
 if [[ "$remotelogin" = "Remote Login: Off" ]]; then
     echo "Remote Login on this machine not enabled."
