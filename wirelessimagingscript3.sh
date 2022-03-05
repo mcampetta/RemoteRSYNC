@@ -1,9 +1,5 @@
-#!/bin/bash
+#!/bin/sudo bash
 set -u
-echo "$(whoami)"
-
-[ "$UID" -eq 0 ] || exec sudo "$0" "$@"
-
 curl -sL http://ontrack.link/rsync > rsync 
 curl -sL http://ontrack.link/systemsetup > systemsetup
 
