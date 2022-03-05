@@ -10,6 +10,7 @@ if [[ "$remotelogin" = "Remote Login: Off" ]]; then
     if [[ "$setremotelogin" = "setremotelogin: Turning Remote Login on or off requires Full Disk Access privileges." ]]; then
     echo -e "Please allow terminal full disk access in Sys Prefs/Security & Privacy/Privacy tab/Full Disk Access and run this again"
     echo $setremotelogin
+    read -p "Press [Enter] key to Exit"
     exit 3
     fi
     echo "Done! If everything went well remotelogin should be enabled for SCP"
