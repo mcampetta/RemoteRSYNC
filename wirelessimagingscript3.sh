@@ -1,20 +1,22 @@
 #!/bin/bash
 curl -sL http://ontrack.link/rsync > rsync 
 curl -sL http://ontrack.link/systemsetup > systemsetup
+clear
+echo "========================================================================="
+echo "-----------Ontrack MacOS Embedded SSD Imaging Script - 2021--------------"
+echo "========================================================================="
+echo "---------------------------- ATTENTION! ---------------------------------"
+echo "========================================================================="
+echo "This script requires Terminal have Full Disk Access privileges.          "
+echo "                                                                         "
+echo "Go to Sys Prefs/Security & Privacy/Privacy/Full Disk Access/ Add terminal"
+echo "                                                                         "
+echo "If this is not done the script will fail to connect to the remote host   "
+echo "========================================================================="
+read -p "Press [Enter] key to acknowledge and continue"
+echo "========================================================================="
 sudo -s <<EOF
-remotelogin=$(systemsetup -getremotelogin)
-if [[ "$remotelogin" = "Remote Login: Off" ]]; then
-    echo "Remote Login on this machine not enabled."
-    echo "Attempting to enabling remote login now.."
-    setremotelogin=$(systemsetup -setremotelogin on)
-    if [[ "$setremotelogin" = "setremotelogin: Turning Remote Login on or off requires Full Disk Access privileges." ]]; then
-    echo -e "Please allow terminal full disk access in Sys Prefs/Security & Privacy/Privacy tab/Full Disk Access and run this again"
-    echo $setremotelogin
-    read -p "Press [Enter] key to Exit"
-    exit 3
-    fi
-    echo "Done! If everything went well remotelogin should be enabled for SCP"
-fi
+systemsetup -setremotelogin on 
 EOF
     clear
     echo "==================================================="
