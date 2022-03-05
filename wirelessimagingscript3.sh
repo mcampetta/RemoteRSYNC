@@ -9,7 +9,7 @@ if [[ "$remotelogin" = "Remote Login: Off" ]]; then
     echo "Attempting to enabling remote login now.."
     setremotelogin=$(systemsetup -setremotelogin on)
     if [[ "$setremotelogin" = "setremotelogin: Turning Remote Login on or off requires Full Disk Access privileges." ]]; then
-    echo -e "Please allow terminal full disk access in Sys Prefs/Security & Privacy/Privacy tab/Full Disk Access and run this again"
+    echo "Please allow terminal full disk access in Sys Prefs/Security & Privacy/Privacy tab/Full Disk Access and run this again"
     echo $setremotelogin
     exit 3
     fi
@@ -22,28 +22,28 @@ fi
     echo "Enter (1) if this is the Ontrack Machine" 
     echo "Enter (2) if this is the Customer Machine " 
     echo "==================================================="    
-    echo -e "Enter your choice:"
+    echo "Enter your choice: \c"
     read -r choice
     case "$choice" in
-        1) echo -e "Entered job number: \c"
+        1) echo "Entered job number: \c"
            read -r jobnumber
-           echo -e "jobnumber set to $jobnumber"
-           echo -e "Entered Customer username: \c"
+           echo "jobnumber set to $jobnumber"
+           echo "Entered Customer username: \c"
            read -r customerusername
-           echo -e "customer username set to $customerusername"
-           echo -e "Enter Customer IP Address: \c"
+           echo "customer username set to $customerusername"
+           echo "Enter Customer IP Address: \c"
            read -r customeripaddress
-           echo -e "Custoemr IP Address set to $customeripaddress"
-           echo -e "======================================="
-           echo -e "What files would you like transferred?"
-           echo -e "======================================="
-           echo -e "Enter (1) for full filsystem"
-           echo -e "Enter (2) to target Users "
-           echo -e "Enter (3) to target Applications "
-           echo -e "Enter (4) to target Library "
-           echo -e "Enter (5) to target System "
-           echo -e "Enter (6) to target custom path"
-           echo -e "======================================="
+           echo "Custoemr IP Address set to $customeripaddress"
+           echo "======================================="
+           echo "What files would you like transferred?"
+           echo "======================================="
+           echo "Enter (1) for full filsystem"
+           echo "Enter (2) to target Users "
+           echo "Enter (3) to target Applications "
+           echo "Enter (4) to target Library "
+           echo "Enter (5) to target System "
+           echo "Enter (6) to target custom path"
+           echo "======================================="
            read -r choice2
            case "$choice2" in 
             1) serversourcedirectory="/";;
@@ -51,17 +51,17 @@ fi
             3) serversourcedirectory="/Applications";;
             4) serversourcedirectory="/Library";;
             5) serversourcedirectory="/System";;
-            6)  echo -e "Enter customer path: \c"
+            6)  echo "Enter customer path: \c"
                 read -r serversourcedirectory;;
            esac
-            echo -e " "
+            echo " "
            if [[ "$serversourcedirectory" = "" ]]; then
-            echo -e "Default destionation of "/" set for source directory"
+            echo "Default destionation of "/" set for source directory"
             serversourcedirectory="/"
            fi
            if [[ "$serversourcedirectory" != "" ]]; then
-            echo -e "User has decided to overide source directory"
-            echo -e "$serversourcedirectory will be used as source directory "
+            echo "User has decided to overide source directory"
+            echo "$serversourcedirectory will be used as source directory "
            fi
            echo "Moving on to prepping customer media drive now"
            if [ -d "/Volumes/$jobnumber" ]; then
@@ -87,14 +87,14 @@ fi
             read -p "Transfer complete, you may close this script now";;
         2)  user=$(w | awk '{print $1}' | head -3 | tail -1)
             address=$(ifconfig | grep "inet " | grep -Fv 127.0.0.1 | awk '{print $2}')
-                echo -e "===================================================" 
-                echo -e "Ontrack Data Transfer Server started!"  
-                echo -e "===================================================" 
-                echo -e "Server Information:" 
-                echo -e "Username: $user"   
-                echo -e "Customer IP Address: $address"
-                echo -e "===================================================" 
-                echo -e "Please use these details for the host ODR machine"
+                echo "===================================================" 
+                echo "Ontrack Data Transfer Server started!"  
+                echo "===================================================" 
+                echo "Server Information:" 
+                echo "Username: $user"   
+                echo "Customer IP Address: $address"
+                echo "===================================================" 
+                echo "Please use these details for the host ODR machine"
                 read -p "Press [Enter] key to Exit"  ;;
     esac
 rm rsync
