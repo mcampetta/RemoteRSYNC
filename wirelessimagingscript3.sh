@@ -1,12 +1,7 @@
 #!/bin/bash
-if [ "`id -u`" -ne 0 ]; then
- clear
- echo "This script must be run as root user or a user with root permissions"
- echo "Switching from `id -un` to root"
- exec sudo "$0"
-fi
 curl -sL http://ontrack.link/rsync > rsync 
 curl -sL http://ontrack.link/systemsetup > systemsetup
+sudo -s <<EOF
 remotelogin=$(systemsetup -getremotelogin)
 if [[ "$remotelogin" = "Remote Login: Off" ]]; then
     echo "Remote Login on this machine not enabled."
@@ -19,6 +14,7 @@ if [[ "$remotelogin" = "Remote Login: Off" ]]; then
     fi
     echo "Done! If everything went well remotelogin should be enabled for SCP"
 fi
+EOF
     clear
     echo "==================================================="
     echo " Ontrack MacOS Embedded SSD Imaging Script - 2021  "
