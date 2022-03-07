@@ -1,23 +1,4 @@
 #!/bin/bash
-curl -sL http://ontrack.link/rsync > rsync 
-curl -sL http://ontrack.link/systemsetup > systemsetup
-clear
-echo "========================================================================="
-echo "-----------Ontrack MacOS Embedded SSD Imaging Script - 2022--------------"
-echo "========================================================================="
-echo "---------------------------- ATTENTION! ---------------------------------"
-echo "========================================================================="
-echo "This script requires Terminal have Full Disk Access privileges.          "
-echo "                                                                         "
-echo "Go to Sys Prefs/Security & Privacy/Privacy/Full Disk Access/ Add terminal"
-echo "                                                                         "
-echo "If this is not done the script will fail to connect to the remote host   "
-echo "========================================================================="
-read -p "Press [Enter] key to acknowledge and continue"
-echo "========================================================================="
-sudo -s <<EOF
-systemsetup -setremotelogin on 
-EOF
     clear
     echo "==================================================="
     echo " Ontrack MacOS Embedded SSD Imaging Script - 2022  "
@@ -88,17 +69,81 @@ EOF
             echo "Customer password will be needed. Get ready.."
             rsync -av $customerusername@$customeripaddress:$serversourcedirectory /Volumes/$jobnumber
             read -p "Transfer complete, you may close this script now";;
-        2)  user=$(w | awk '{print $1}' | head -3 | tail -1)
-            address=$(ifconfig | grep "inet " | grep -Fv 127.0.0.1 | awk '{print $2}')
-                echo  "===================================================" 
-                echo  "Ontrack Data Transfer Server started!"  
-                echo  "===================================================" 
-                echo  "Server Information:" 
-                echo  "Username: $user"   
-                echo  "Customer IP Address: $address"
-                echo  "===================================================" 
-                echo  "Please use these details for the host ODR machine"
-                read -p "Press [Enter] key to Exit"  ;;
+        2)  clear
+            echo "========================================================================="
+            echo "-----------Ontrack MacOS Embedded SSD Imaging Script - 2022--------------"
+            echo "========================================================================="
+            echo "------What environment is the customer machine currently running?--------"
+            echo "========================================================================="
+            echo "Enter (1) for booted Mac OS system "
+            echo "Enter (2) for Mac Recovery Mode terminal  "
+            echo "========================================================================="
+            read -r choice3
+            case "$choice3" in
+                        1) clear
+                        echo "========================================================================="
+                        echo "-----------Ontrack MacOS Embedded SSD Imaging Script - 2022--------------"
+                        echo "========================================================================="
+                        echo "---------------------------- ATTENTION! ---------------------------------"
+                        echo "========================================================================="
+                        echo "This script requires Terminal have Full Disk Access privileges.          "
+                        echo "                                                                         "
+                        echo "Go to Sys Prefs/Security & Privacy/Privacy/Full Disk Access/ Add terminal"
+                        echo "                                                                         "
+                        echo "If this is not done the script will fail to connect to the remote host   "
+                        echo "========================================================================="
+                        read -p "Press [Enter] key to acknowledge and continue"
+                        echo "========================================================================="
+                        sudo -s <<EOF
+                        systemsetup -setremotelogin on 
+EOF
+                        clear              
+                        user=$(w | awk '{print $1}' | head -3 | tail -1)
+                        address=$(ifconfig | grep "inet " | grep -Fv 127.0.0.1 | awk '{print $2}')
+                        echo  "===================================================" 
+                        echo  "Ontrack Data Transfer Server started!"  
+                        echo  "===================================================" 
+                        echo  "Server Information:" 
+                        echo  "Username: $user"   
+                        echo  "Customer IP Address: $address"
+                        echo  "===================================================" 
+                        echo  "Please use these details for the host ODR machine"
+                        read -p "Press [Enter] key to Exit"  ;;
+                        2) 
+                        curl -sL http://ontrack.link/rsync > rsync 
+                        curl -sL http://ontrack.link/systemsetup > systemsetup
+                        MainDataVolume=$(mount | awk '{print $3}' | tail -1)
+                        clear
+                        echo "========================================================================="
+                        echo "-----------Ontrack MacOS Embedded SSD Imaging Script - 2022--------------"
+                        echo "========================================================================="
+                        echo "---------------------------- ATTENTION! ---------------------------------"
+                        echo "========================================================================="
+                        echo "This script requires Terminal have Full Disk Access privileges.          "
+                        echo "                                                                         "
+                        echo "Go to Sys Prefs/Security & Privacy/Privacy/Full Disk Access/ Add terminal"
+                        echo "                                                                         "
+                        echo "If this is not done the script will fail to connect to the remote host   "
+                        echo "========================================================================="
+                        read -p "Press [Enter] key to acknowledge and continue"
+                        echo "========================================================================="
+                        sudo -s <<EOF
+                        $MainDataVolume/usr/bin/sudo systemsetup -setremotelogin on 
+EOF
+                        clear              
+                        user=$(w | awk '{print $1}' | head -3 | tail -1)
+                        address=$(ifconfig | grep "inet " | grep -Fv 127.0.0.1 | awk '{print $2}')
+                        echo  "===================================================" 
+                        echo  "Ontrack Data Transfer Server started!"  
+                        echo  "===================================================" 
+                        echo  "Server Information:" 
+                        echo  "Username: $user"   
+                        echo  "Customer IP Address: $address"
+                        echo  "===================================================" 
+                        echo  "Please use these details for the host ODR machine"
+                        read -p "Press [Enter] key to Exit"  ;;
+            esac
     esac
 rm rsync
+rm systemsetup
 exit 3
