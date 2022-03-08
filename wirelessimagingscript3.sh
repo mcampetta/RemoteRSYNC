@@ -109,7 +109,7 @@ EOF
             echo "Doing a few quick checks now.."
             systemvolume=$(mount | grep sealed | awk -F 'on' '{print $2 FS "."}' | cut -d '(' -f1 | sed '/Update/d')
             systemvolume=`echo $systemvolume | sed 's/ *$//g'`
-            #systemvolume=$(printf %q "$systemvolume")
+            systemvolume=$(printf %q "$systemvolume")
             #This part of the searchest for the largest volume and assumes it is the main data volume. This is thought of as safe since the customer machine should have no drives attached and it's largest volume should be it's data volume (almost all of the time)
             largestvolume=$(df -Hl | awk '{print $3}' | sort -nr | sed '/M/d' | sed '/Used/d' | head -n1)
             selectedVolume=$(df -Hl | grep $largestvolume)
@@ -130,7 +130,7 @@ EOF
                 /usr/bin/rsync -av $datavolume$serversourcedirectory $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
             fi
             if [[ "$systemvolume" != "/" ]]; then
-                "$systemvolume/usr/bin/rsync" -av $datavolume$serversourcedirectory $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
+                $systemvolume/usr/bin/rsync -av $datavolume$serversourcedirectory $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
             fi            
             read -p "Transfer complete, you may close this script now";;                   
     esac
