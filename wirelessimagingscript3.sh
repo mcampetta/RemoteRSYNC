@@ -130,7 +130,7 @@ EOF
                 /usr/bin/rsync -av $datavolume$serversourcedirectory $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
             fi
             if [[ "$systemvolume" != "/" ]]; then
-                /$systemvolume/usr/bin/rsync -av $datavolume$serversourcedirectory $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
+                $systemvolume/usr/bin/rsync -av $datavolume$serversourcedirectory $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
             fi            
             read -p "Transfer complete, you may close this script now";;                   
     esac
