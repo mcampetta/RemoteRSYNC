@@ -114,7 +114,10 @@ EOF
             largestvolume=$(df -Hl | awk '{print $3}' | sort -nr | sed '/M/d' | sed '/Used/d' | head -n1)
             selectedVolume=$(df -Hl | grep $largestvolume)
             value=${selectedVolume#*%*%}
-            value=$(echo "$value" | xargs)
+            value=$(echo "$value" | sed 's/ *$//g')
+            value="$(echo -e "${value}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            #echo "$value"
+            #read -p "Pausing script, press [enter] to continue"
             datavolume=$value
             datavolume=$(printf %q "$datavolume")
             echo "System Volume:$systemvolume"
