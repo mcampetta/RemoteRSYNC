@@ -9,7 +9,7 @@
     echo  "Enter your choice:"
     read -r choice
     case "$choice" in
-        1)  clear
+        1)  #clear
             echo "========================================================================="
             echo "-----------Ontrack MacOS Embedded SSD Imaging Script - 2022--------------"
             echo "========================================================================="
@@ -26,7 +26,7 @@
             sudo -s <<EOF
             systemsetup -setremotelogin on 
 EOF
-            clear
+            #clear
             echo -e "Enter Job Number: \c"
             read -r jobnumber
             echo  "jobnumber set to $jobnumber"
@@ -48,7 +48,7 @@ EOF
             MyPassportDisk=${MyPassportDisk::${#MyPassportDisk}-2}                  
             diskutil eraseDisk JHFS+ $jobnumber $MyPassportDisk
             fi
-            clear              
+            #clear              
             user=$(w | awk '{print $1}' | head -3 | tail -1)
             address=$(ifconfig | grep "inet " | grep -Fv 127.0.0.1 | awk '{print $2}')
             echo  "===================================================" 
@@ -67,7 +67,7 @@ EOF
             echo  "You may run that on the customer machine now  ...  "
             echo  "===================================================" 
             read -p "Press [Enter] key to Exit"  ;;
-        2)  clear 
+        2)  #clear 
             echo -e "Enter Job Number: \c"
             read -r jobnumber
             echo  "jobnumber set to $jobnumber"
