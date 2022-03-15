@@ -36,7 +36,7 @@ EOF
             fi
             if [[ ! -d  "/Volumes/$jobnumber" ]]; then
                 echo "Please attach External customer copy out drive now to continue.."
-            while [ ! -f /Volumes/My\ Passport/Install\ Western\ Digital\ Software\ for\ Mac.dmg ]; do sleep 1; done
+            while [ ! -d /Volumes/My\ Passport ]; do sleep 1; done
             echo "External customer drive found!"
             echo "Proceeding to format customer drive"
             echo "Volume:$jobnumber"
