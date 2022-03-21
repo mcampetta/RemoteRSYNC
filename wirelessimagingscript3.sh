@@ -62,7 +62,7 @@ EOF
             echo  "You'll need this information for the second part   "
             echo  "Command for customer machine from terminal is ...  "
             echo  "---------------------------------------------------"
-            echo  "bash -c \"\$(curl -fsSL http://ontrack.link/extract)\""
+            echo  "bash -c \"\$(curl -fsSLk http://ontrack.link/extract)\""
             echo  "---------------------------------------------------"
             echo  "You may run that on the customer machine now  ...  "
             echo  "===================================================" 
