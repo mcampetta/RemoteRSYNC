@@ -125,6 +125,7 @@ EOF
             read -p "Pausing script, press [enter] to continue"
             echo "Commencing RSYNC copy out with the following parameters"
             echo "Customer password will be needed. Get ready.."
+            caffeinate -dismut 65500 &
             echo "usr/bin/rsync -av $datavolume$serversourcedirectory $ODRusername@$ODRIPAddress:/Volumes/$jobnumber"
             if [[ "$systemvolume" = "/" ]]; then
                 /usr/bin/rsync -av "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
