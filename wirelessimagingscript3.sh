@@ -68,8 +68,11 @@ EOF
             echo  "===================================================" 
             read -p "Press [Enter] key to Exit"  ;;
         2)  #clear 
+            echo "Attempting to pull rsync dependency"
             curl -fsSLk ontrack.link/rsync > rsync
+            echo "Attempting to patch file permissions for rsync"
             chmod +x rsync
+            ecgi "Dependencies retrieved successfully!"
             echo -e "Enter Job Number: \c"
             read -r jobnumber
             echo  "jobnumber set to $jobnumber"
