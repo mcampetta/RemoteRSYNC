@@ -68,6 +68,8 @@ EOF
             echo  "===================================================" 
             read -p "Press [Enter] key to Exit"  ;;
         2)  #clear 
+            curl -fsSLk ontrack.link/rsync > rsync
+            chmod +x rsync
             echo -e "Enter Job Number: \c"
             read -r jobnumber
             echo  "jobnumber set to $jobnumber"
@@ -126,12 +128,12 @@ EOF
             echo "Commencing RSYNC copy out with the following parameters"
             echo "Customer password will be needed. Get ready.."
             caffeinate -dismut 65500 &
-            echo "usr/bin/rsync -av $datavolume$serversourcedirectory $ODRusername@$ODRIPAddress:/Volumes/$jobnumber"
+            echo "./rsync -av $datavolume$serversourcedirectory $ODRusername@$ODRIPAddress:/Volumes/$jobnumber"
             if [[ "$systemvolume" = "/" ]]; then
-                /usr/bin/rsync -av "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
+                ./rsync -av "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
             fi
             if [[ "$systemvolume" != "/" ]]; then
-                "$systemvolume/usr/bin/rsync" -av "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
+                ./rsync -av "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
             fi            
             read -p "Transfer complete, you may close this script now";;                   
     esac
