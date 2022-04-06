@@ -68,6 +68,45 @@ EOF
             echo  "===================================================" 
             read -p "Press [Enter] key to Exit"  ;;
         2)  #clear 
+            echo "Lets first check that the system time is acurate"
+            systemtime=$(date)
+            echo -e "$systemtime"
+            echo -e "Is the systen time correct? Enter (y)or (n): \c"
+            read -r choice3
+                case "$choice3" in
+                    y);;
+                    n)  echo -e "retrieving system time from google servers.."
+                        googletime=$(curl -I 'https://google.com/' 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g')
+                        echo -e "Retrieved google time is.."
+                        echo -e "$googletime"
+                        googletimeepoch=$(date -j -u -f "%a, %d %b %Y %T %Z" "$googletime" +%s)
+                        echo -e "Retrieved google time in epoch is.."
+                        echo -e "$googletimeepoch"    
+                        echo -e "Please type in time zone offset. (ex -18000)"
+                        echo -e "Common offset table belowfor reference"
+                        echo  "=============================="
+                        echo -e "EDT = -14400"
+                        echo -e "EST = -14400"
+                        echo -e "CDT = -18000 (Minneapolis)"
+                        echo -e "CEST = +7200"
+                        echo -e "AEST = +36000"
+                        echo -e "EEST = +10800"
+                        echo -e "HKST = +28800"
+                        echo -e "BST = +3600"
+                        echo -e "CST = +28800"
+                        echo -e "JST = +32400"
+                        echo -e "=============================="
+                        read -r offset
+                        echo -e "selected offset is $offset"
+                        googletimeepochadjusted=$(echo $(($googletimeepoch + $offset)))
+                        echo -e "Adjusted google time is $googletimeepochadjusted in epoch format"
+                        googletimeadjustedmac=$(date -j -u -f "%s" $googletimeepochadjusted +%m%d%H%M%y)
+                        echo -e "Adjusted google time is $googletimeadjustedmac in mac format which is month day hour minute year format"
+                        echo -e "Attempting to update correct date now.."
+                        date $googletimeadjustedmac
+                        echo -e "If date didin't change please make sure script is root.."
+                    ;;
+                esac
             echo -e "Enter Job Number: \c"
             read -r jobnumber
             echo  "jobnumber set to $jobnumber"
