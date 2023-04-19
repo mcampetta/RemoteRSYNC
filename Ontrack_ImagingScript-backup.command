@@ -92,8 +92,8 @@ do
         4)  echo -e "Enter job number: \c"
             read -r jobnumber
             echo "Searching for source customer drives.."
-            retrieveLast2AttachedDevices=$(mount | grep -v "My Passport" | tail -3)
-            retrieveLast2AttachedDevicesMountedSize=$(df -Hl |  grep -v "My Passport" | awk '{print $3}' | tail -3)
+            retrieveLast2AttachedDevices=$(mount | grep -v "My Passport" | grep -v "$jobnumber" | tail -3)
+            retrieveLast2AttachedDevicesMountedSize=$(df -Hl |  grep -v "My Passport" | grep -v "$jobnumber" | awk '{print $3}' | tail -3)
             #echo "$retrieveLast2AttachedDevicesMountedSize"
             retrieveLast2AttachedDevicesMountedSizeArray=($retrieveLast2AttachedDevicesMountedSize)
             IFS=$'\n'
@@ -109,15 +109,22 @@ do
             #retrieveLast2AttachedDevices=$(mount | tail -2)
             #echo "Selecting Largest recently mounted storage volume by size"
             echo -e "Is this the correct drive?"
-            selectedVolume=$(df -Hl | grep -v "My Passport" | tail -3 | grep $largestStorageVolumeRecentlyMounted)
+            selectedVolume=$(df -Hl | grep -v "My Passport" | grep -v "$jobnumber" | tail -3 | grep $largestStorageVolumeRecentlyMounted)
             value=${selectedVolume#*%*%}
-            value=$(echo "$value" | xargs)
+            value="$(echo -e "${value}" | sed -e 's/^[[:space:]]*//')"
+            #value=$(echo "$value" | xargs)
+            #value=$(printf %q "$value")
             echo "Selected $value"
             Source_Volume=$value
-            #Source_Volume=$(echo "$value" | sed 's/ /\\ /g' )
+            Source_Volume=$(echo "$Source_Volume" | sed "s@\\\\@@g")
             echo -e "Press enter to confirm and continue otherwise overide by manuall dragging and dropping mounted drive from finder"
             read response
             if [[ "$response" != "" ]]; then
+                    response=$(echo "$response" | sed "s@\\\\@@g")
+                    if [[ "$lastchar" = " " ]]; then
+                        echo -e "Illegal last char in Volume name identified, replacing.."
+                        read -p "Press Enter"
+                    fi
                     echo "User has decided to overide and use $response instead!"
                     echo "Moving on to prepping customer media drive now"
                     if [ -d "/Volumes/$jobnumber" ]; then
@@ -125,7 +132,7 @@ do
                     elif [[ ! -d  "/Volumes/$jobnumber" ]]; then
                         #statements
                         echo "Please attach External customer copy out drive now to continue.."
-                        while [ ! -f /Volumes/My\ Passport/Install\ Western\ Digital\ Software\ for\ Mac.dmg ]; do sleep 1; done
+                        while [ ! -d /Volumes/My\ Passport ]; do sleep 1; done
                         echo "External customer drive found!"
                         echo "Proceeding to format customer drive"
                         echo "Volume:$jobnumber"
@@ -137,23 +144,24 @@ do
                         MyPassportDisk=${MyPassportDisk::${#MyPassportDisk}-2}                  
                         diskutil eraseDisk JHFS+ $jobnumber $MyPassportDisk
                     fi        
-                    response=$(echo "$response" | sed "s@\\\\@@g")
-                    response=$(echo "$response" | xargs)
-                    echo "Commencing RSYNC copy out with the following parameters"
-                    echo "rsync -av --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" ""$response/"" "/Volumes/$jobnumber/$jobnumber""
+                    response="$(echo -e "${response}" | sed -e 's/[[:space:]]*$//')"
                     echo "Creating $jobnumber subfolder.. at /Volumes/$jobnumber/"
-                    mkdir -p "/Volumes/$jobnumber/$jobnumber"
-                    rsync -av --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" ""$response/"" "/Volumes/$jobnumber/$jobnumber"
+                    if [ -d "Volumes/$jobnumber" ]; then
+                        mkdir -p "/Volumes/$jobnumber/$jobnumber"
+                    fi
+                    echo "Commencing RSYNC copy out with the following parameters"
+                    echo "rsync -av --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" \"$response/\" "/Volumes/$jobnumber/$jobnumber""
+                    rsync -av --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" "$response/" "/Volumes/$jobnumber/$jobnumber"
                 exit 3
             fi
             if [[ "$response" = "" ]]; then
-                    echo "User has decided to autodetected volume.."
+                    echo "User has decided to autodetect volume.."
                     echo "Moving on to prepping customer media drive now"
                     if [ -d "/Volumes/$jobnumber" ]; then
                         echo "Existing destination device identified.."
                     elif [[ ! -d  "/Volumes/$jobnumber" ]]; then
                         echo "Please attach External customer copy out drive now to continue.."
-                        while [ ! -f /Volumes/My\ Passport/Install\ Western\ Digital\ Software\ for\ Mac.dmg ]; do sleep 1; done
+                        while [ ! -d /Volumes/My\ Passport ]; do sleep 1; done
                         echo "External customer drive found!"
                         echo "Proceeding to format customer drive"
                         echo "Volume:$jobnumber"
@@ -165,10 +173,13 @@ do
                         MyPassportDisk=${MyPassportDisk::${#MyPassportDisk}-2}                  
                         diskutil eraseDisk JHFS+ $jobnumber $MyPassportDisk
                     fi
-                    echo "Commencing RSYNC copy out with the following parameters"
-                    echo "rsync -av --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" $Source_Volume/ "/Volumes/$jobnumber/$jobnumber""
+                    Source_Volume="$(echo -e "${Source_Volume}" | sed -e 's/[[:space:]]*$//')"
                     echo "Creating $jobnumber subfolder.. at /Volumes/$jobnumber/"
-                    mkdir -p "/Volumes/$jobnumber/$jobnumber"                    
+                    if [ -d "Volumes/$jobnumber" ]; then
+                        mkdir -p "/Volumes/$jobnumber/$jobnumber"
+                    fi
+                    echo "Commencing RSYNC copy out with the following parameters"
+                    echo "rsync -av --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" \"$Source_Volume/\" "/Volumes/$jobnumber/$jobnumber""
                     rsync -av --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" "$Source_Volume/" "/Volumes/$jobnumber/$jobnumber"
                 exit 3
             fi
