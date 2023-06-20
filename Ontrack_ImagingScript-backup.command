@@ -3,13 +3,6 @@
 speed=512K
 blocksize=512
 #!/bin/sh
-if [ "`id -u`" -ne 0 ]; then
- clear
- echo "This script must be run as root user or a user with root permissions"
- echo "Switching from `id -un` to root"
- exec sudo "$0"
- exit 3
-fi
 while true
 do
     clear
