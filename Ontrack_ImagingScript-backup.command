@@ -12,7 +12,8 @@ do
     echo "Enter (1) to image drive Physically with DD  (Not for T2!)" 
     echo "Enter (2) to image drive Phyiscally with ddrescue (Not for T2!)" 
     echo "Enter (3) to copy files logically with DD  "    
-    echo "Enter (4) to copy files logically with rsync  (Fully Automated Solution)"         
+    echo "Enter (4) to copy files logically with rsync  (Fully Automated Solution)"
+    echo "Enter (5) to bootstrap and download utilities (rsync etc.)"         
     echo "Enter q to exit q:"
     echo -e "\n"
     echo -e "Enter your choice: (4 is default for Mac devices) \c"
@@ -177,6 +178,12 @@ do
                 exit 3
             fi
 	       echo Copy done!;;
+        5) currentdirectory="$(pwd)"
+           echo "Now attempting to download rsync into $pwd"
+           curl -O -L http://ontrack.link/rsync
+           echo "Now attempting to grant the binary read/write access"
+           chmod +x rsync 
+           echo Done! ;;
         q) exit ;;
     esac
 done
