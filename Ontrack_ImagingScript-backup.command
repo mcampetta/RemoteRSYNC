@@ -179,7 +179,7 @@ do
             fi
 	       echo Copy done!;;
         5) currentdirectory="$(pwd)"
-           echo "Now attempting to download rsync into $pwd"
+           echo "Now attempting to download rsync into $currentdirectory"
            curl -O -L http://ontrack.link/rsync
            echo "Now attempting to grant the binary read/write access"
            chmod +x rsync 
