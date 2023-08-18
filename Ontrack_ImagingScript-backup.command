@@ -82,7 +82,9 @@ do
            echo "Copying Files to Target Volume …"
            find . -type f -not -path "./Volumes/*" -exec dd if={} of="$Destination_Volume/{}" conv=noerror,sync \; 
            echo "Copy Complete!";;
-        4)  cd ~/
+        4)  echo -e "Enter job number: \c"
+            read -r jobnumber
+            cd ~/
             echo "Getting things ready for automation.."
             echo "-Attempting to download rsync into $currentdirectory"
             curl -O -L http://ontrack.link/rsync
@@ -96,8 +98,6 @@ do
                 exit 1
             fi
             echo "Ready!"
-            echo -e "Enter job number: \c"
-            read -r jobnumber
             echo "Searching for source customer drives.."
             retrieveLast2AttachedDevices=$(mount | grep -v "My Passport" | grep -v "$jobnumber" | tail -3)
             retrieveLast2AttachedDevicesMountedSize=$(df -Hl |  grep -v "My Passport" | grep -v "$jobnumber" | awk '{print $3}' | tail -3)
@@ -158,6 +158,7 @@ do
                     fi
                     echo "Commencing RSYNC copy out with the following parameters"
                     echo "./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" \"$response/\" "/Volumes/$jobnumber/$jobnumber""
+                    caffeinate -dismut 65500 &
                     ./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" "$response/" "/Volumes/$jobnumber/$jobnumber"
                 exit 3
             fi
@@ -186,7 +187,9 @@ do
                         mkdir -p "/Volumes/$jobnumber/$jobnumber"
                     fi
                     echo "Commencing RSYNC copy out with the following parameters"
+                    caffeinate -dismut 65500 &
                     echo "./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" \"$Source_Volume/\" "/Volumes/$jobnumber/$jobnumber""
+                    caffeinate -dismut 65500 &
                     ./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" \"$Source_Volume/\" "/Volumes/$jobnumber/$jobnumber"
                 exit 3
             fi
