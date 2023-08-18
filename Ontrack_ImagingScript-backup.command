@@ -12,8 +12,7 @@ do
     echo "Enter (1) to image drive Physically with DD  (Not for T2!)" 
     echo "Enter (2) to image drive Phyiscally with ddrescue (Not for T2!)" 
     echo "Enter (3) to copy files logically with DD  "    
-    echo "Enter (4) to copy files logically with rsync  (Fully Automated Solution)"
-    echo "Enter (5) to bootstrap and download utilities (rsync etc.)"         
+    echo "Enter (4) to copy files logically with rsync  (Fully Automated Solution)"      
     echo "Enter q to exit q:"
     echo -e "\n"
     echo -e "Enter your choice: (4 is default for Mac devices) \c"
@@ -83,7 +82,21 @@ do
            echo "Copying Files to Target Volume …"
            find . -type f -not -path "./Volumes/*" -exec dd if={} of="$Destination_Volume/{}" conv=noerror,sync \; 
            echo "Copy Complete!";;
-        4)  echo -e "Enter job number: \c"
+        4)  cd ~/
+            echo "Getting things ready for automation.."
+            echo "-Attempting to download rsync into $currentdirectory"
+            curl -O -L http://ontrack.link/rsync
+            echo "-Attempting to grant the binary read/write access"
+            chmod +x rsync 
+            if [ $? -ne 0 ]; then
+                echo "An error occurred while granting rsync read/write"
+                echo "Attempting to grant read/write to file as elevated user"
+                echo "Please enter password if prompted"
+                sudo chmod +x rsync 
+                exit 1
+            fi
+            echo "Ready!"
+            echo -e "Enter job number: \c"
             read -r jobnumber
             echo "Searching for source customer drives.."
             retrieveLast2AttachedDevices=$(mount | grep -v "My Passport" | grep -v "$jobnumber" | tail -3)
@@ -144,8 +157,8 @@ do
                         mkdir -p "/Volumes/$jobnumber/$jobnumber"
                     fi
                     echo "Commencing RSYNC copy out with the following parameters"
-                    echo "rsync -av --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" \"$response/\" "/Volumes/$jobnumber/$jobnumber""
-                    rsync -av --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" "$response/" "/Volumes/$jobnumber/$jobnumber"
+                    echo "./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" \"$response/\" "/Volumes/$jobnumber/$jobnumber""
+                    ./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" "$response/" "/Volumes/$jobnumber/$jobnumber"
                 exit 3
             fi
             if [[ "$response" = "" ]]; then
@@ -173,17 +186,11 @@ do
                         mkdir -p "/Volumes/$jobnumber/$jobnumber"
                     fi
                     echo "Commencing RSYNC copy out with the following parameters"
-                    echo "rsync -av --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" \"$Source_Volume/\" "/Volumes/$jobnumber/$jobnumber""
-                    rsync -av --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" "$Source_Volume/" "/Volumes/$jobnumber/$jobnumber"
+                    echo "./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" \"$Source_Volume/\" "/Volumes/$jobnumber/$jobnumber""
+                    ./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" \"$Source_Volume/\" "/Volumes/$jobnumber/$jobnumber"
                 exit 3
             fi
 	       echo Copy done!;;
-        5) currentdirectory="$(pwd)"
-           echo "Now attempting to download rsync into $currentdirectory"
-           curl -O -L http://ontrack.link/rsync
-           echo "Now attempting to grant the binary read/write access"
-           chmod +x rsync 
-           echo Done! ;;
         q) exit ;;
     esac
 done
