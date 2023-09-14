@@ -7,7 +7,7 @@ while true
 do
     clear
     echo "==================================================="
-    echo " Ontrack MacOS Embedded SSD Imaging Script - 2021  "
+    echo " Ontrack MacOS Embedded SSD Imaging Script - 2023  "
     echo "==================================================="
     echo "Enter (1) to image drive Physically with DD  (Not for T2!)" 
     echo "Enter (2) to image drive Phyiscally with ddrescue (Not for T2!)" 
@@ -84,20 +84,46 @@ do
            echo "Copy Complete!";;
         4)  echo -e "Enter job number: \c"
             read -r jobnumber
-            cd ~/
-            echo "Getting things ready for automation.."
-            echo "-Attempting to download rsync into $currentdirectory"
-            curl -O -L http://ontrack.link/rsync
-            echo "-Attempting to grant the binary read/write access"
-            chmod +x rsync 
-            if [ $? -ne 0 ]; then
-                echo "An error occurred while granting rsync read/write"
-                echo "Attempting to grant read/write to file as elevated user"
-                echo "Please enter password if prompted"
-                sudo chmod +x rsync 
-                exit 1
-            fi
-            echo "Ready!"
+            arch=$(uname -m)
+            if [[ $arch == x86_64* ]]; then
+    		echo "X64 Architecture"
+		arch=$("")
+                cd ~/
+                echo "Getting things ready for automation.."
+                echo "-Attempting to download rsync into $currentdirectory"
+                curl -O -L http://ontrack.link/rsync
+                echo "-Attempting to grant the binary read/write access"
+                chmod +x rsync 
+                if [ $? -ne 0 ]; then
+                    echo "An error occurred while granting rsync read/write"
+                    echo "Attempting to grant read/write to file as elevated user"
+                    echo "Please enter password if prompted"
+                    sudo chmod +x rsync 
+                    exit 1
+                fi
+                echo "Ready!"
+	    elif [[ $arch == i*86 ]]; then
+    		echo "X32 Architecture"
+		echo "No support for this architecture yet, script will fail"
+	    elif  [[ $arch == arm* ]]; then
+    		echo "ARM Architecture"
+                cd ~/
+                echo "Getting things ready for automation.."
+                echo "-Attempting to download rsync into $currentdirectory"
+                curl -O -L http://ontrack.link/rsync_arm
+                echo "-Attempting to grant the binary read/write access"
+                chmod +x rsync_arm
+                if [ $? -ne 0 ]; then
+                    echo "An error occurred while granting rsync read/write"
+                    echo "Attempting to grant read/write to file as elevated user"
+                    echo "Please enter password if prompted"
+                    sudo chmod +x rsync_arm
+                    exit 1
+                fi
+		echo "Attempting to rename rsync binary"
+		mv rsync_arm rsync
+	    fi
+
             echo "Searching for source customer drives.."
             retrieveLast2AttachedDevices=$(mount | grep -v "My Passport" | grep -v "$jobnumber" | tail -3)
             retrieveLast2AttachedDevicesMountedSize=$(df -Hl |  grep -v "My Passport" | grep -v "$jobnumber" | awk '{print $3}' | tail -3)
@@ -187,10 +213,8 @@ do
                         mkdir -p "/Volumes/$jobnumber/$jobnumber"
                     fi
                     echo "Commencing RSYNC copy out with the following parameters"
-                    caffeinate -dismut 65500 &
                     echo "./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" \"$Source_Volume/\" "/Volumes/$jobnumber/$jobnumber""
-                    caffeinate -dismut 65500 &
-                    ./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" \"$Source_Volume/\" "/Volumes/$jobnumber/$jobnumber"
+                    caffeinate -dismut 65500 & rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" \"$Source_Volume/\" "/Volumes/$jobnumber/$jobnumber"
                 exit 3
             fi
 	       echo Copy done!;;
