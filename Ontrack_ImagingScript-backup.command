@@ -7,7 +7,7 @@ while true
 do
     clear
     echo "==================================================="
-    echo " Ontrack MacOS Embedded SSD Imaging Script - 2021  "
+    echo " Ontrack MacOS Embedded SSD Imaging Script - 2023v2"
     echo "==================================================="
     echo "Enter (1) to image drive Physically with DD  (Not for T2!)" 
     echo "Enter (2) to image drive Phyiscally with ddrescue (Not for T2!)" 
