@@ -7,7 +7,7 @@ while true
 do
     clear
     echo "==================================================="
-    echo " Ontrack MacOS Embedded SSD Imaging Script - 2023  "
+    echo " Ontrack MacOS Embedded SSD Imaging Script - 2021  "
     echo "==================================================="
     echo "Enter (1) to image drive Physically with DD  (Not for T2!)" 
     echo "Enter (2) to image drive Phyiscally with ddrescue (Not for T2!)" 
@@ -84,7 +84,7 @@ do
            echo "Copy Complete!";;
         4)  echo -e "Enter job number: \c"
             read -r jobnumber
-            arch=$(uname -m)
+            arch=$(machine)
             if [[ $arch == x86_64* ]]; then
     		echo "X64 Architecture"
 		arch=$("")
