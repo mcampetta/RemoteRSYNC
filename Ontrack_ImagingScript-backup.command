@@ -87,7 +87,6 @@ do
             arch=$(machine)
             if [[ $arch == x86_64* ]]; then
             echo "X64 Architecture"
-        arch=$("")
                 cd ~/
                 echo "Getting things ready for automation.."
                 echo "-Attempting to download rsync into $currentdirectory"
