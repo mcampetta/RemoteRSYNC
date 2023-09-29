@@ -19,9 +19,9 @@ do
     read -r choice
     case "$choice" in
         1) echo -e "Choose source device \c "
- 	   echo -e "\n"
- 	   diskutil list
-	   echo -e "Enter name of source (example disk1): \c"
+       echo -e "\n"
+       diskutil list
+       echo -e "Enter name of source (example disk1): \c"
            read -r iso 
            echo -e "Enter name of destination device (example disk2): \c"
            read -r device 
@@ -37,9 +37,9 @@ do
         2) echo -e "Enter job number: \c"
            read -r jobnumber
            echo -e "Choose source device \c "
- 	   echo -e "\n"
- 	   diskutil list
-	   echo -e "Enter name of source (example disk1): \c"
+       echo -e "\n"
+       diskutil list
+       echo -e "Enter name of source (example disk1): \c"
            read -r iso 
            echo -e "Enter name of destination device (example disk2): \c"
            read -r device 
@@ -59,7 +59,7 @@ do
            echo ..................................
            df -l | grep -v Mounted| awk ' { print $9 } '
            echo .................................. 
-	# echo /Volumes/*
+    # echo /Volumes/*
            read Source_Volume
            clear
            echo "Targeting $Source_Volume as source volume."
@@ -86,8 +86,8 @@ do
             read -r jobnumber
             arch=$(machine)
             if [[ $arch == x86_64* ]]; then
-    		echo "X64 Architecture"
-		arch=$("")
+            echo "X64 Architecture"
+        arch=$("")
                 cd ~/
                 echo "Getting things ready for automation.."
                 echo "-Attempting to download rsync into $currentdirectory"
@@ -102,11 +102,11 @@ do
                     exit 1
                 fi
                 echo "Ready!"
-	    elif [[ $arch == i*86 ]]; then
-    		echo "X32 Architecture"
-		echo "No support for this architecture yet, script will fail"
-	    elif  [[ $arch == arm* ]]; then
-    		echo "ARM Architecture"
+        elif [[ $arch == i*86 ]]; then
+            echo "X32 Architecture"
+        echo "No support for this architecture yet, script will fail"
+        elif  [[ $arch == arm* ]]; then
+            echo "ARM Architecture"
                 cd ~/
                 echo "Getting things ready for automation.."
                 echo "-Attempting to download rsync into $currentdirectory"
@@ -120,9 +120,9 @@ do
                     sudo chmod +x rsync_arm
                     exit 1
                 fi
-		echo "Attempting to rename rsync binary"
-		mv rsync_arm rsync
-	    fi
+        echo "Attempting to rename rsync binary"
+        mv rsync_arm rsync
+        fi
 
             echo "Searching for source customer drives.."
             retrieveLast2AttachedDevices=$(mount | grep -v "My Passport" | grep -v "$jobnumber" | tail -3)
@@ -213,11 +213,16 @@ do
                         mkdir -p "/Volumes/$jobnumber/$jobnumber"
                     fi
                     echo "Commencing RSYNC copy out with the following parameters"
+                    if [[ $arch == x86_64* ]]; then
+                    echo "./rsync -av  --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" \"$Source_Volume/\" "/Volumes/$jobnumber/$jobnumber""
+                    caffeinate -dismut 65500 & ./rsync -av  --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" \"$Source_Volume/\" "/Volumes/$jobnumber/$jobnumber"    
+                    elif  [[ $arch == arm* ]]; then
                     echo "./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" \"$Source_Volume/\" "/Volumes/$jobnumber/$jobnumber""
                     caffeinate -dismut 65500 & ./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" \"$Source_Volume/\" "/Volumes/$jobnumber/$jobnumber"
+                    fi
                 exit 3
             fi
-	       echo Copy done!;;
+           echo Copy done!;;
         q) exit ;;
     esac
 done
