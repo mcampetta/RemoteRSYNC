@@ -107,20 +107,6 @@ EOF
                         echo -e "If date didin't change please make sure script is root.."
                     ;;
                 esac
-            cd ~/
-            echo "Getting things ready for automation.."
-            echo "-Attempting to download rsync into $currentdirectory"
-            curl -O -L http://ontrack.link/rsync
-            echo "-Attempting to grant the binary read/write access"
-            chmod +x rsync 
-            if [ $? -ne 0 ]; then
-                echo "An error occurred while granting rsync read/write"
-                echo "Attempting to grant read/write to file as elevated user"
-                echo "Please enter password if prompted"
-                sudo chmod +x rsync 
-                exit 1
-            fi
-            echo "Ready!"    
             echo -e "Enter Job Number: \c"
             read -r jobnumber
             echo  "jobnumber set to $jobnumber"
@@ -177,14 +163,14 @@ EOF
             echo "Data Volume:$datavolume"
             read -p "Pausing script, press [enter] to continue"
             echo "Commencing RSYNC copy out with the following parameters"
-            echo "Ontrack ODR password will be needed. Get ready.."
+            echo "Customer password will be needed. Get ready.."
             caffeinate -dismut 65500 &
             echo "usr/bin/rsync -av $datavolume$serversourcedirectory $ODRusername@$ODRIPAddress:/Volumes/$jobnumber"
             if [[ "$systemvolume" = "/" ]]; then
-                ./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude 'Dropbox' --exclude 'Volumes' --exclude '.DocumentRevisions-V100' --exclude 'Cloud Storage' "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
+                /usr/bin/rsync -av "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
             fi
             if [[ "$systemvolume" != "/" ]]; then
-                ./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude 'Dropbox' --exclude 'Volumes' --exclude '.DocumentRevisions-V100' --exclude 'Cloud Storage' "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
+                "$systemvolume/usr/bin/rsync" -av "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
             fi            
             read -p "Transfer complete, you may close this script now";;                   
     esac
