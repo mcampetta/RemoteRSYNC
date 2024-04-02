@@ -107,7 +107,7 @@ EOF
                         echo -e "If date didin't change please make sure script is root.."
                     ;;
                 esac
-            if [[ $arch == x86_64* ]]; then
+            if [[ $machine == x86_64* ]]; then
             echo "X64 Architecture"
                 cd ~/
                 echo "Getting things ready for automation.."
@@ -123,7 +123,7 @@ EOF
                     exit 1
                 fi
                 echo "Ready!"
-            elif  [[ $arch == arm* ]]; then
+            elif  [[ $machine == arm* ]]; then
             echo "ARM Architecture"
                 cd ~/
                 echo "Getting things ready for automation.."
