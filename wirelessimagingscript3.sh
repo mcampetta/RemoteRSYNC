@@ -202,11 +202,13 @@ EOF
             caffeinate -dismut 65500 &
             echo "usr/bin/rsync -av $datavolume$serversourcedirectory $ODRusername@$ODRIPAddress:/Volumes/$jobnumber"
             if [[ "$systemvolume" = "/" ]]; then
-                ./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude 'Dropbox' --exclude 'Volumes' --exclude '.DocumentRevisions-V100' --exclude 'Cloud Storage' "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
+                #/usr/bin/rsync -av "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
+                ./rsync -av --exclude 'Dropbox' --exclude 'Volumes' --exclude '.DocumentRevisions-V100' --exclude 'Cloud Storage' "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
             fi
             if [[ "$systemvolume" != "/" ]]; then
-                ./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude 'Dropbox' --exclude 'Volumes' --exclude '.DocumentRevisions-V100' --exclude 'Cloud Storage' "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
+                #"$systemvolume/usr/bin/rsync" -av "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
+                ./rsync -av --exclude 'Dropbox' --exclude 'Volumes' --exclude '.DocumentRevisions-V100' --exclude 'Cloud Storage' "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
             fi            
             read -p "Transfer complete, you may close this script now";;                   
     esac
-exit 3    
+exit 3      
