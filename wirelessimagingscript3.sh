@@ -107,8 +107,8 @@ EOF
                         echo -e "If date didin't change please make sure script is root.."
                     ;;
                 esac
-            arch=$(machine)
-            if [[ $machine == x86_64* ]]; then
+            arch=$(machine)    
+            if [[ $arch == x86_64* ]]; then
             echo "X64 Architecture"
                 cd ~/
                 echo "Getting things ready for automation.."
@@ -124,7 +124,7 @@ EOF
                     exit 1
                 fi
                 echo "Ready!"
-            elif  [[ $machine == arm* ]]; then
+            elif  [[ $arch == arm* ]]; then
             echo "ARM Architecture"
                 cd ~/
                 echo "Getting things ready for automation.."
@@ -139,9 +139,9 @@ EOF
                     sudo chmod +x rsync_arm
                     exit 1
                 fi
-        echo "Attempting to rename rsync binary"
-        mv rsync_arm rsync
-        fi    
+            echo "Attempting to rename rsync binary"
+            mv rsync_arm rsync
+            fi    
             echo -e "Enter Job Number: \c"
             read -r jobnumber
             echo  "jobnumber set to $jobnumber"
@@ -200,7 +200,7 @@ EOF
             echo "Commencing RSYNC copy out with the following parameters"
             echo "Ontrack ODR password will be needed. Get ready.."
             caffeinate -dismut 65500 &
-            echo "usr/bin/rsync -av $datavolume$serversourcedirectory $ODRusername@$ODRIPAddress:/Volumes/$jobnumber"
+            echo "./rsync -av --exclude 'Dropbox' --exclude 'Volumes' --exclude '.DocumentRevisions-V100' --exclude 'Cloud Storage' $datavolume$serversourcedirectory $ODRusername@$ODRIPAddress:/Volumes/$jobnumber"
             if [[ "$systemvolume" = "/" ]]; then
                 #/usr/bin/rsync -av "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
                 ./rsync -av --exclude 'Dropbox' --exclude 'Volumes' --exclude '.DocumentRevisions-V100' --exclude 'Cloud Storage' "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
@@ -211,4 +211,4 @@ EOF
             fi            
             read -p "Transfer complete, you may close this script now";;                   
     esac
-exit 3      
+exit 3   
