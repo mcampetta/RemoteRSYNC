@@ -179,14 +179,13 @@ EOF
             echo "Commencing RSYNC copy out with the following parameters"
             echo "Ontrack ODR password will be needed. Get ready.."
             caffeinate -dismut 65500 &
-            #echo "./rsync -av $datavolume$serversourcedirectory $ODRusername@$ODRIPAddress:/Volumes/$jobnumber"
-            echo "./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude 'Dropbox' --exclude 'Volumes' --exclude '.DocumentRevisions-V100' --exclude 'Cloud Storage' "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber"
+            echo "usr/bin/rsync -av $datavolume$serversourcedirectory $ODRusername@$ODRIPAddress:/Volumes/$jobnumber"
             if [[ "$systemvolume" = "/" ]]; then
-                ./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude 'Dropbox' --exclude 'Volumes' --exclude '.DocumentRevisions-V100' --exclude 'Cloud Storage' "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
+                /usr/bin/rsync -av "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
             fi
             if [[ "$systemvolume" != "/" ]]; then
-                ./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude 'Dropbox' --exclude 'Volumes' --exclude '.DocumentRevisions-V100' --exclude 'Cloud Storage' "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
+                "$systemvolume/usr/bin/rsync" -av "$datavolume$serversourcedirectory" $ODRusername@$ODRIPAddress:/Volumes/$jobnumber
             fi            
-            read -p "Transfer complete, you may close this script now";;                   
+            read -p "Transfer complete, you may close this script now";;                 
     esac
 exit 3    
