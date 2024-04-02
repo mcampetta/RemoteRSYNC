@@ -107,6 +107,7 @@ EOF
                         echo -e "If date didin't change please make sure script is root.."
                     ;;
                 esac
+            arch=$(machine)
             if [[ $machine == x86_64* ]]; then
             echo "X64 Architecture"
                 cd ~/
