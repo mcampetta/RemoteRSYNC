@@ -125,7 +125,7 @@ do
 
             echo "Searching for source customer drives.."
             retrieveLast2AttachedDevices=$(mount | grep -v "My Passport" | grep -v "$jobnumber" | tail -3)
-            retrieveLast2AttachedDevicesMountedSize=$(df -Hl |  grep -v "My Passport" | grep -v "$jobnumber" | awk '{print $3}' | tail -3)
+            retrieveLast2AttachedDevicesMountedSize=$(df -Hl |  grep -v "My Passport" | grep -v "$jobnumber" | sed '/M/d' | sed '/k/d' | awk '{print $3}' | tail -3)
             #echo "$retrieveLast2AttachedDevicesMountedSize"
             retrieveLast2AttachedDevicesMountedSizeArray=($retrieveLast2AttachedDevicesMountedSize)
             IFS=$'\n'
