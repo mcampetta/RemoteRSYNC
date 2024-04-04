@@ -105,24 +105,35 @@ do
             echo "X32 Architecture"
         echo "No support for this architecture yet, script will fail"
         elif  [[ $arch == arm* ]]; then
-            echo "ARM Architecture"
-                cd ~/
-                echo "Getting things ready for automation.."
-                echo "-Attempting to download rsync into $currentdirectory"
-                curl -O -L http://ontrack.link/rsync_arm
-                echo "-Attempting to grant the binary read/write access"
-                chmod +x rsync_arm
-                if [ $? -ne 0 ]; then
-                    echo "An error occurred while granting rsync read/write"
-                    echo "Attempting to grant read/write to file as elevated user"
-                    echo "Please enter password if prompted"
-                    sudo chmod +x rsync_arm
-                    exit 1
-                fi
-        echo "Attempting to rename rsync binary"
-        mv rsync_arm rsync
+        echo "ARM Architecture"
+            cd ~/
+            echo "Getting things ready for automation.."
+            echo "-Attempting to download rsync into $currentdirectory"
+            curl -O -L http://ontrack.link/rsync_arm
+            curl -O -L https://github.com/mcampetta/RemoteRSYNC/raw/main/rsync.samba
+            echo "-Attempting to grant the binary read/write access"
+            chmod +x rsync_arm
+            if [ $? -ne 0 ]; then
+                echo "An error occurred while granting rsync read/write"
+                echo "Attempting to grant read/write to file as elevated user"
+                echo "Please enter password if prompted"
+                sudo chmod +x rsync_arm
+                exit 1
+            fi
+            chmod +x rsync.samba
+            if [ $? -ne 0 ]; then
+                echo "An error occurred while granting rsync read/write"
+                echo "Attempting to grant read/write to file as elevated user"
+                echo "Please enter password if prompted"
+                sudo chmod +x rsync.samba
+                exit 1
+            fi
+            basesystemmountpoint="$(mount -v | grep "^/" | head -n 1 | cut -d ' ' -f1)"
+            mount -t apfs -r -w $basesystemmountpoint /
+            mkdir -p /usr/libexec/rsync/ && mv rsync.samba $_
+            echo "Attempting to rename rsync binary"
+            mv rsync_arm rsync
         fi
-
             echo "Searching for source customer drives.."
             retrieveLast2AttachedDevices=$(mount | grep -v "My Passport" | grep -v "$jobnumber" | tail -3)
             retrieveLast2AttachedDevicesMountedSize=$(df -Hl |  grep -v "My Passport" | grep -v "$jobnumber" | awk '{print $3}' | sed '/M/d' | sed '/k/d' | sed '/Used/d' | tail -3)
