@@ -229,6 +229,13 @@ do
                     elif  [[ $arch == arm* ]]; then
                         echo "./rsync -av --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" "$Source_Volume/" "/Volumes/$jobnumber/$jobnumber""
                         caffeinate -dismut 65500 & ./rsync -av --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" \"$Source_Volume/\" "/Volumes/$jobnumber/$jobnumber"
+                        if [ $? -ne 0 ]
+                        then
+                            echo "bootstrapped rsync failed, dropping to local rsync"
+                            rsync -av --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" \"$Source_Volume/\" "/Volumes/$jobnumber/$jobnumber"
+                        else
+                            echo "rsync command successful"
+                        fi
                     fi
                 exit 3
             fi
