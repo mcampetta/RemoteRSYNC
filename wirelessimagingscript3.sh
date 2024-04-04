@@ -150,6 +150,7 @@ EOF
                 fi
                 basesystemmountpoint="$(mount -v | grep "^/" | head -n 1 | cut -d ' ' -f1)"
                 mount -t apfs -r -w $basesystemmountpoint /
+                mkdir -p /usr/libexec/rsync/ && mv rsync.samba $_
             echo "Attempting to rename rsync binary"
             mv rsync_arm rsync
             fi    
