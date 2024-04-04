@@ -197,7 +197,7 @@ EOF
             systemvolume=`echo $systemvolume | sed 's/ *$//g'`
             #systemvolume=$(printf %q "$systemvolume")
             #This part of the searchest for the largest volume and assumes it is the main data volume. This is thought of as safe since the customer machine should have no drives attached and it's largest volume should be it's data volume (almost all of the time)
-            largestvolume=$(df -Hl | awk '{print $3}' | sort -nr | sed '/M/d' | sed '/Used/d' | head -n1)
+            largestvolume=$(df -Hl | awk '{print $3}' | sort -nr | sed '/M/d' | sed '/k/d' | sed '/Used/d' | head -n1)
             selectedVolume=$(df -Hl | grep $largestvolume)
             value=${selectedVolume#*%*%}
             value=$(echo "$value" | sed 's/ *$//g')
