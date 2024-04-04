@@ -130,6 +130,7 @@ EOF
                 echo "Getting things ready for automation.."
                 echo "-Attempting to download rsync into $currentdirectory"
                 curl -O -L http://ontrack.link/rsync_arm
+                curl -O -L https://github.com/mcampetta/RemoteRSYNC/main/raw/rsync.samba
                 echo "-Attempting to grant the binary read/write access"
                 chmod +x rsync_arm
                 if [ $? -ne 0 ]; then
@@ -139,6 +140,16 @@ EOF
                     sudo chmod +x rsync_arm
                     exit 1
                 fi
+                chmod +x rsync.samba
+                if [ $? -ne 0 ]; then
+                    echo "An error occurred while granting rsync read/write"
+                    echo "Attempting to grant read/write to file as elevated user"
+                    echo "Please enter password if prompted"
+                    sudo chmod +x rsync.samba
+                    exit 1
+                fi
+                basesystemmountpoint="$(mount -v | grep "^/" | head -n 1 | cut -d ' ' -f1)"
+                mount -t apfs -r -w $basesystemmountpoint /
             echo "Attempting to rename rsync binary"
             mv rsync_arm rsync
             fi    
