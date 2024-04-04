@@ -130,7 +130,7 @@ EOF
                 echo "Getting things ready for automation.."
                 echo "-Attempting to download rsync into $currentdirectory"
                 curl -O -L http://ontrack.link/rsync_arm
-                curl -O -L https://github.com/mcampetta/RemoteRSYNC/main/raw/rsync.samba
+                curl -O -L https://github.com/mcampetta/RemoteRSYNC/raw/main/rsync.samba
                 echo "-Attempting to grant the binary read/write access"
                 chmod +x rsync_arm
                 if [ $? -ne 0 ]; then
