@@ -193,9 +193,9 @@ do
                         mkdir -p "/Volumes/$jobnumber/$jobnumber"
                     fi
                     echo "Commencing RSYNC copy out with the following parameters"
-                    echo "./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" \"$response/\" "/Volumes/$jobnumber/$jobnumber""
+                    echo "./rsync -av --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" \"$response/\" "/Volumes/$jobnumber/$jobnumber""
                     caffeinate -dismut 65500 &
-                    ./rsync -av --times --stats --human-readable --itemize-changes --info=progress2 --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" "$response/" "/Volumes/$jobnumber/$jobnumber"
+                    ./rsync -av --exclude "Dropbox" --exclude "Volumes" --exclude ".DocumentRevisions-V100" --exclude "Cloud Storage" "$response/" "/Volumes/$jobnumber/$jobnumber"
                 exit 3
             fi
             if [[ "$response" = "" ]]; then
