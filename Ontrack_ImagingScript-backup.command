@@ -31,7 +31,7 @@ do
                          echo "Exiting on user cancel"
                         exit 3
                 fi
-           sudo dd if=/dev/$iso of=/dev/$device bs=$blocksize
+           dd if=/dev/$iso of=/dev/$device bs=$blocksize
            echo "Copy Done! Press any key to return to main menu"
            read -r anykey;;
         2) echo -e "Enter job number: \c"
@@ -49,7 +49,7 @@ do
                          echo "Exiting on user cancel"
                         exit 3
                 fi
-           sudo ddrescue --verbose --force /dev/$iso /dev/$device $jobnumber.txt
+           ddrescue --verbose --force /dev/$iso /dev/$device $jobnumber.txt
            echo "Copy Done! Press any key to return to main menu"
            read -r anykey;; 
         3) echo .................................. 
@@ -97,7 +97,7 @@ do
                     echo "An error occurred while granting rsync read/write"
                     echo "Attempting to grant read/write to file as elevated user"
                     echo "Please enter password if prompted"
-                    sudo chmod +x rsync 
+                    chmod +x rsync 
                     exit 1
                 fi
                 echo "Ready!"
@@ -117,7 +117,7 @@ do
                 echo "An error occurred while granting rsync read/write"
                 echo "Attempting to grant read/write to file as elevated user"
                 echo "Please enter password if prompted"
-                sudo chmod +x rsync_arm
+                chmod +x rsync_arm
                 exit 1
             fi
             chmod +x rsync.samba
@@ -125,7 +125,7 @@ do
                 echo "An error occurred while granting rsync read/write"
                 echo "Attempting to grant read/write to file as elevated user"
                 echo "Please enter password if prompted"
-                sudo chmod +x rsync.samba
+                chmod +x rsync.samba
                 exit 1
             fi
             basesystemmountpoint="$(mount -v | grep "^/" | head -n 1 | cut -d ' ' -f1)"
