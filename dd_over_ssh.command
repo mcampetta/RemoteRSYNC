@@ -15,7 +15,7 @@ copy_files() {
   echo "Copying files to remote server..."
 
  find "$SOURCE_FOLDER" -type f -not -path "$SOURCE_FOLDER/Volumes/*" -print0 | \
- ssh "$USER@$IP_ADDRESS" 'xargs -0 -I{} sh -c "dd of=\"$DESTINATION_FOLDER/{}\" bs=4M"'
+ ssh "$USER@$IP_ADDRESS" "xargs -0 -I{} sh -c 'dd of=\"$DESTINATION_FOLDER/{}\" bs=4M'"
 
   echo "File transfer complete."
 }
