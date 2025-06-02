@@ -33,6 +33,7 @@ COPYFILE_DISABLE=1 tar -czf - \
   --exclude='.Trashes' \
   --exclude='.Spotlight-V100' \
   --exclude='.fseventsd' \
+  --exclude='.PreviousSystemInformation' \
   . | ssh "$USER@$IP_ADDRESS" "mkdir -p \"$REMOTE_PATH\" && cd \"$REMOTE_PATH\" && tar -xzf -" || {
   echo "Tar transfer failed."
   exit 1
