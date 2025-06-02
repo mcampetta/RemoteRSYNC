@@ -16,28 +16,68 @@ REMOTE_PATH="$4"
 # Normalize SOURCE_PATH
 SOURCE_PATH="${SOURCE_PATH%/}"
 
-echo "Transferring contents of $SOURCE_PATH to $USER@$IP_ADDRESS:$REMOTE_PATH using tar over ssh with compression, no metadata, and exclusions"
+echo "Detecting machine architecture..."
+
+ARCH=$(uname -m)
+if [ "$ARCH" = "x86_64" ]; then
+    TAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/gtarintel"
+    echo "Detected Intel architecture. Using Intel gtar binary."
+elif [ "$ARCH" = "arm64" ]; then
+    TAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/gtararm"
+    echo "Detected ARM (Apple Silicon) architecture. Using ARM gtar binary."
+else
+    echo "Unsupported architecture: $ARCH"
+    exit 1
+fi
+
+# Prepare temporary directory for gtar
+TMP_DIR=$(mktemp -d)
+GTAR_PATH="$TMP_DIR/gtar"
+
+echo "Downloading gtar binary to $GTAR_PATH..."
+curl -L -o "$GTAR_PATH" "$TAR_URL"
+chmod +x "$GTAR_PATH"
 
 # Test SSH connection
 if ! ssh "$USER@$IP_ADDRESS" "echo 'SSH connection successful'"; then
-  echo "SSH connection failed to $USER@$IP_ADDRESS. Exiting."
-  exit 1
+    echo "SSH connection failed to $USER@$IP_ADDRESS. Exiting."
+    exit 1
 fi
 
-# Perform tar transfer with exclusions
+# Perform tar transfer with comprehensive exclusions
 cd "$SOURCE_PATH" || { echo "Source path $SOURCE_PATH not found. Exiting."; exit 1; }
 
-COPYFILE_DISABLE=1 tar -czf - \
-  --exclude='*.sock' \
-  --exclude='.TemporaryItems' \
-  --exclude='.Trashes' \
-  --exclude='.Spotlight-V100' \
-  --exclude='.fseventsd' \
-  --exclude='.PreviousSystemInformation' \
-  --exclude='Library' \
-  . | ssh "$USER@$IP_ADDRESS" "mkdir -p \"$REMOTE_PATH\" && cd \"$REMOTE_PATH\" && tar -xzf -" || {
-  echo "Tar transfer failed."
-  exit 1
+COPYFILE_DISABLE=1 "$GTAR_PATH" -czf - \
+    --ignore-failed-read \
+    --exclude='*.sock' \
+    --exclude='.DS_Store' \
+    --exclude='.TemporaryItems' \
+    --exclude='.Trashes' \
+    --exclude='.Spotlight-V100' \
+    --exclude='.fseventsd' \
+    --exclude='.PreviousSystemInformation' \
+    --exclude='.DocumentRevisions-V100' \
+    --exclude='.vol' \
+    --exclude='.VolumeIcon.icns' \
+    --exclude='.PKInstallSandboxManager-SystemSoftware' \
+    --exclude='.MobileBackups' \
+    --exclude='.com.apple.TimeMachine' \
+    --exclude='.AppleDB' \
+    --exclude='.AppleDesktop' \
+    --exclude='.AppleDouble' \
+    --exclude='.CFUserTextEncoding' \
+    --exclude='.hotfiles.btree' \
+    --exclude='.metadata_never_index' \
+    --exclude='.com.apple.timemachine.donotpresent' \
+    --exclude='lost+found' \
+    --exclude='Library' \
+    . | ssh "$USER@$IP_ADDRESS" "mkdir -p \"$REMOTE_PATH\" && cd \"$REMOTE_PATH\" && tar -xzf -" || {
+    echo "Tar transfer failed."
+    exit 1
 }
 
 echo "Transfer complete."
+
+# Clean up
+echo "Cleaning up temporary files..."
+rm -rf "$TMP_DIR"
