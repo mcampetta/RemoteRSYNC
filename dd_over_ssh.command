@@ -16,7 +16,7 @@ REMOTE_PATH="$4"
 # Normalize SOURCE_PATH
 SOURCE_PATH="${SOURCE_PATH%/}"
 
-echo "Transferring contents of $SOURCE_PATH to $USER@$IP_ADDRESS:$REMOTE_PATH using tar over ssh with compression and metadata exclusion"
+echo "Transferring contents of $SOURCE_PATH to $USER@$IP_ADDRESS:$REMOTE_PATH using tar over ssh with compression, no metadata, and skipping inaccessible files"
 
 # Test SSH connection
 if ! ssh "$USER@$IP_ADDRESS" "echo 'SSH connection successful'"; then
@@ -24,17 +24,17 @@ if ! ssh "$USER@$IP_ADDRESS" "echo 'SSH connection successful'"; then
   exit 1
 fi
 
-# Perform tar transfer with gzip compression, excluding problematic system folders
+# Perform tar transfer with find filtering readable files
 cd "$SOURCE_PATH" || { echo "Source path $SOURCE_PATH not found. Exiting."; exit 1; }
 
-COPYFILE_DISABLE=1 tar -czf - \
-  --exclude='*.sock' \
-  --exclude='.TemporaryItems' \
-  --exclude='.Trashes' \
-  --exclude='.Spotlight-V100' \
-  --exclude='.fseventsd' \
-  --exclude='.PreviousSystemInformation' \
-  . | ssh "$USER@$IP_ADDRESS" "mkdir -p \"$REMOTE_PATH\" && cd \"$REMOTE_PATH\" && tar -xzf -" || {
+COPYFILE_DISABLE=1 find . \( -type f -o -type d \) -readable \
+  -not -path './.TemporaryItems*' \
+  -not -path './.Trashes*' \
+  -not -path './.Spotlight-V100*' \
+  -not -path './.fseventsd*' \
+  -not -path './.PreviousSystemInformation*' \
+  -not -path '*/Library*' \
+  -print0 | tar --null -T - -czf - | ssh "$USER@$IP_ADDRESS" "mkdir -p \"$REMOTE_PATH\" && cd \"$REMOTE_PATH\" && tar -xzf -" || {
   echo "Tar transfer failed."
   exit 1
 }
