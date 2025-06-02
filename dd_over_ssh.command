@@ -18,7 +18,7 @@ REMOTE_PATH="$4"
 SOURCE_PATH="${SOURCE_PATH%/}"
 
 # Confirm action
-echo "Transferring contents of $SOURCE_PATH to $USER@$IP_ADDRESS:$REMOTE_PATH using tar over ssh with compression"
+echo "Transferring contents of $SOURCE_PATH to $USER@$IP_ADDRESS:$REMOTE_PATH using tar over ssh with compression and without metadata (COPYFILE_DISABLE=1)"
 
 # Test SSH connectivity
 if ! ssh "$USER@$IP_ADDRESS" "echo 'SSH connection successful'"; then
@@ -26,10 +26,10 @@ if ! ssh "$USER@$IP_ADDRESS" "echo 'SSH connection successful'"; then
   exit 1
 fi
 
-# Perform tar transfer with gzip compression
+# Perform tar transfer with gzip compression, excluding sockets, and disabling metadata
 cd "$SOURCE_PATH" || { echo "Source path $SOURCE_PATH not found. Exiting."; exit 1; }
 
-COPYFILE_DISABLE=1 tar -czf - . | ssh "$USER@$IP_ADDRESS" "mkdir -p \"$REMOTE_PATH\" && cd \"$REMOTE_PATH\" && tar -xzf -" || {
+COPYFILE_DISABLE=1 tar -czf - --exclude='*.sock' . | ssh "$USER@$IP_ADDRESS" "mkdir -p \"$REMOTE_PATH\" && cd \"$REMOTE_PATH\" && tar -xzf -" || {
   echo "Tar transfer failed."
   exit 1
 }
