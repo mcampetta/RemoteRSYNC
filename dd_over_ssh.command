@@ -30,9 +30,10 @@ else
     exit 1
 fi
 
-# Prepare temporary directory for gtar
+# Prepare temporary directory for gtar and logs
 TMP_DIR=$(mktemp -d)
 GTAR_PATH="$TMP_DIR/gtar"
+LOG_FILE="$TMP_DIR/skipped_files.log"
 
 echo "Downloading gtar binary to $GTAR_PATH..."
 curl -L -o "$GTAR_PATH" "$TAR_URL"
@@ -44,7 +45,7 @@ if ! ssh "$USER@$IP_ADDRESS" "echo 'SSH connection successful'"; then
     exit 1
 fi
 
-# Perform tar transfer with comprehensive exclusions
+# Perform tar transfer with comprehensive exclusions and log skipped files
 cd "$SOURCE_PATH" || { echo "Source path $SOURCE_PATH not found. Exiting."; exit 1; }
 
 COPYFILE_DISABLE=1 "$GTAR_PATH" -czf - \
@@ -71,12 +72,23 @@ COPYFILE_DISABLE=1 "$GTAR_PATH" -czf - \
     --exclude='.com.apple.timemachine.donotpresent' \
     --exclude='lost+found' \
     --exclude='Library' \
-    . | ssh "$USER@$IP_ADDRESS" "mkdir -p \"$REMOTE_PATH\" && cd \"$REMOTE_PATH\" && tar -xzf -" || {
+    . 2> "$LOG_FILE" | ssh "$USER@$IP_ADDRESS" "mkdir -p \"$REMOTE_PATH\" && cd \"$REMOTE_PATH\" && tar -xzf -" || {
     echo "Tar transfer failed."
     exit 1
 }
 
 echo "Transfer complete."
+
+# Summarize skipped files
+SKIPPED_COUNT=$(grep -c "Cannot" "$LOG_FILE" || true)
+if [ "$SKIPPED_COUNT" -gt 0 ]; then
+    echo ""
+    echo "⚠️ Transfer skipped $SKIPPED_COUNT files or directories:"
+    grep "Cannot" "$LOG_FILE"
+    echo "Full log of skipped files saved to $LOG_FILE"
+else
+    echo "✅ No files were skipped."
+fi
 
 # Clean up
 echo "Cleaning up temporary files..."
