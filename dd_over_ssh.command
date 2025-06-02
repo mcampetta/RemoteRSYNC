@@ -1,55 +1,37 @@
 #!/bin/bash
 
-# Function to create directories on the remote host
-create_directories() {
-  echo "Creating directory structure on remote server..."
+# Usage: ./tar_transfer.sh username ipaddress source_path remote_path
 
-  find "$SOURCE_FOLDER" -type d -not -path "$SOURCE_FOLDER/Volumes/*" -print0 | \
-  ssh "$USER@$IP_ADDRESS" "xargs -0 -I{} sh -c 'mkdir -p \"$DESTINATION_FOLDER/{}\"'"
+# Input parameters
+USER="$1"
+IP_ADDRESS="$2"
+SOURCE_PATH="$3"
+REMOTE_PATH="$4"
 
-  echo "Directory structure creation complete."
-}
+# Prompt for missing parameters
+[ -z "$USER" ] && read -rp "Enter remote username: " USER
+[ -z "$IP_ADDRESS" ] && read -rp "Enter remote IP address: " IP_ADDRESS
+[ -z "$SOURCE_PATH" ] && read -rp "Enter local source path: " SOURCE_PATH
+[ -z "$REMOTE_PATH" ] && read -rp "Enter remote destination path: " REMOTE_PATH
 
-# Function to copy files to the remote host
-copy_files() {
-  echo "Copying files to remote server..."
+# Normalize SOURCE_PATH by removing trailing slashes
+SOURCE_PATH="${SOURCE_PATH%/}"
 
- find "$SOURCE_FOLDER" -type f -not -path "$SOURCE_FOLDER/Volumes/*" -print0 | \
- ssh "$USER@$IP_ADDRESS" "xargs -0 -I{} sh -c 'dd of=\"$DESTINATION_FOLDER/{}\" bs=4M'"
+# Confirm action
+echo "Transferring contents of $SOURCE_PATH to $USER@$IP_ADDRESS:$REMOTE_PATH using tar over ssh with compression"
 
-  echo "File transfer complete."
-}
-
-# Prompt for user input
-echo "Welcome to the file transfer script!"
-read -p "Enter the remote username: " USER
-read -p "Enter the remote IP address: " IP_ADDRESS
-read -p "Enter the source folder path (local): " SOURCE_FOLDER
-read -p "Enter the destination folder path (remote): " DESTINATION_FOLDER
-
-# Validate inputs
-if [[ -z "$USER" || -z "$IP_ADDRESS" || -z "$SOURCE_FOLDER" || -z "$DESTINATION_FOLDER" ]]; then
-  echo "Error: All inputs are required."
+# Test SSH connectivity
+if ! ssh "$USER@$IP_ADDRESS" "echo 'SSH connection successful'"; then
+  echo "SSH connection failed to $USER@$IP_ADDRESS. Exiting."
   exit 1
 fi
 
-# Confirm with the user before proceeding
-echo ""
-echo "You are about to execute the following actions:"
-echo "  - Remote Username: $USER"
-echo "  - Remote IP Address: $IP_ADDRESS"
-echo "  - Source Folder: $SOURCE_FOLDER"
-echo "  - Destination Folder: $DESTINATION_FOLDER"
-echo ""
-read -p "Do you want to continue? (y/n): " CONFIRM
+# Perform tar transfer with gzip compression
+cd "$SOURCE_PATH" || { echo "Source path $SOURCE_PATH not found. Exiting."; exit 1; }
 
-if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
-  echo "Operation canceled."
-  exit 0
-fi
+COPYFILE_DISABLE=1 tar -czf - . | ssh "$USER@$IP_ADDRESS" "mkdir -p \"$REMOTE_PATH\" && cd \"$REMOTE_PATH\" && tar -xzf -" || {
+  echo "Tar transfer failed."
+  exit 1
+}
 
-# Execute the operations
-create_directories
-copy_files
-
-echo "All operations completed successfully!"
+echo "Transfer complete."
