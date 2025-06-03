@@ -1,23 +1,37 @@
 #!/bin/bash
 
-# Prompt for missing inputs
-if [ -z "$1" ]; then read -p "Enter SSH username: " USERNAME; else USERNAME=$1; fi
-if [ -z "$2" ]; then read -p "Enter SSH IP address: " IPADDR; else IPADDR=$2; fi
-if [ -z "$3" ]; then read -p "Enter SOURCE folder path: " SOURCE_PATH; else SOURCE_PATH=$3; fi
-if [ -z "$4" ]; then read -p "Enter DESTINATION path on remote host: " DEST_PATH; else DEST_PATH=$4; fi
+# Safely exit on error
+set -e
 
-START_TIME=$(date +%s)
+# Prompt for parameters if not passed
+USERNAME="$1"
+IPADDR="$2"
+SOURCE_PATH="$3"
+DEST_PATH="$4"
 
-echo "🔐 Connecting to $USERNAME@$IPADDR..."
-echo "📦 Compressing and copying files from '$SOURCE_PATH' to '$DEST_PATH'..."
+if [ -z "$USERNAME" ]; then
+  read -rp "Enter SSH username: " USERNAME
+fi
+if [ -z "$IPADDR" ]; then
+  read -rp "Enter remote IP address: " IPADDR
+fi
+if [ -z "$SOURCE_PATH" ]; then
+  read -rp "Enter local source path (absolute or relative): " SOURCE_PATH
+fi
+if [ -z "$DEST_PATH" ]; then
+  read -rp "Enter remote destination path: " DEST_PATH
+fi
 
-# Perform compressed tar-over-ssh transfer with exclusions
+echo "Starting transfer from '$SOURCE_PATH' to '$USERNAME@$IPADDR:$DEST_PATH'..."
+
+# Ensure compatibility by disabling extended attributes and Apple metadata
+export COPYFILE_DISABLE=1
+
+# Start timing
+start_time=$(date +%s)
+
+# Run transfer using BSD tar with exclusions and compression
 tar -czf - \
-  --exclude='.TemporaryItems' \
-  --exclude='.Trashes' \
-  --exclude='.Spotlight-V100' \
-  --exclude='.fseventsd' \
-  --exclude='.DS_Store' \
   --exclude='.PreviousSystemInformation' \
   --exclude='.DocumentRevisions-V100' \
   --exclude='.vol' \
@@ -34,22 +48,18 @@ tar -czf - \
   --exclude='.com.apple.timemachine.donotpresent' \
   --exclude='lost+found' \
   --exclude='Library' \
-  --exclude='*.sock' \
   "$SOURCE_PATH" 2> skipped_files.log | \
 ssh "$USERNAME@$IPADDR" "mkdir -p '$DEST_PATH' && cd '$DEST_PATH' && tar -xzf -"
 
-END_TIME=$(date +%s)
-DURATION=$((END_TIME - START_TIME))
+# Timing summary
+end_time=$(date +%s)
+duration=$((end_time - start_time))
 
-echo "✅ Transfer complete in $DURATION seconds."
-
-# Show skipped files if any
+# Summary output
+echo "✅ Transfer complete in ${duration}s."
 if [ -s skipped_files.log ]; then
-  echo ""
-  echo "⚠️ Some files were skipped during transfer:"
-  grep -E '^tar:' skipped_files.log | sed 's/^/   /'
-  echo "📄 Full log saved to skipped_files.log"
+  echo "⚠️  Some files were skipped. See 'skipped_files.log' for details."
 else
-  rm -f skipped_files.log
   echo "✅ No files were skipped."
+  rm skipped_files.log
 fi
