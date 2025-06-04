@@ -28,7 +28,7 @@ if [ "$ARCH" = "x86_64" ]; then
     echo "Detected Intel architecture. Using Intel gtar and pv binaries."
 elif [ "$ARCH" = "arm64" ]; then
     TAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/tar_arm64"
-    PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/pv_arm"
+    PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/pv_arm64"
     echo "Detected ARM (Apple Silicon) architecture. Using ARM gtar and pv binaries."
 else
     echo "Unsupported architecture: $ARCH"
