@@ -23,12 +23,12 @@ echo "Detecting machine architecture..."
 
 ARCH=$(uname -m)
 if [ "$ARCH" = "x86_64" ]; then
-    TAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/tar_x86_64"
-    PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/pv_x86_64"
+    TAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/gtarintel"
+    PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/pvintel"
     echo "Detected Intel architecture. Using Intel gtar and pv binaries."
 elif [ "$ARCH" = "arm64" ]; then
-    TAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/tar_arm64"
-    PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/pv_arm64"
+    TAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/gtararm"
+    PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/pvarm"
     echo "Detected ARM (Apple Silicon) architecture. Using ARM gtar and pv binaries."
 else
     echo "Unsupported architecture: $ARCH"
@@ -50,24 +50,35 @@ curl -L -o "$PV_PATH" "$PV_URL"
 chmod +x "$PV_PATH"
 
 # Test SSH connection
-if ! ssh "$USER@$IP_ADDRESS" "echo 'SSH connection successful'"; then
+if ! ssh "$USER@$IP_ADDRESS" "echo 'SSH connection successful'" >/dev/null 2>&1; then
     echo "SSH connection failed to $USER@$IP_ADDRESS. Exiting."
     exit 1
 fi
 
-# Count files to transfer
-echo "Counting files to transfer..."
-FILE_COUNT=$(find "$SOURCE_PATH" -type f \
-    -not -path '*/.Trashes*' \
-    -not -path '*/.Spotlight-V100*' \
-    -not -path '*/.fseventsd*' \
-    -not -path '*/.TemporaryItems*' \
-    -not -path '*/.PreviousSystemInformation*' \
-    -not -path '*/.DocumentRevisions-V100*' \
-    | wc -l)
-echo "📦 Total files to transfer: $FILE_COUNT"
+# Inform user of exact command that will be run
+echo ""
+echo "🚀 The following command will be executed:"
+echo ""
+echo "cd \"$SOURCE_PATH\" && COPYFILE_DISABLE=1 \"$GTAR_PATH\" -czvf - --totals \\"
+echo "  --ignore-failed-read \\"
+echo "  --exclude='*.sock' --exclude='.DS_Store' --exclude='.TemporaryItems' --exclude='.Trashes' \\"
+echo "  --exclude='.Spotlight-V100' --exclude='.fseventsd' --exclude='.PreviousSystemInformation' \\"
+echo "  --exclude='.DocumentRevisions-V100' --exclude='.vol' --exclude='.VolumeIcon.icns' \\"
+echo "  --exclude='.PKInstallSandboxManager-SystemSoftware' --exclude='.MobileBackups' \\"
+echo "  --exclude='.com.apple.TimeMachine' --exclude='.AppleDB' --exclude='.AppleDesktop' \\"
+echo "  --exclude='.AppleDouble' --exclude='.CFUserTextEncoding' --exclude='.hotfiles.btree' \\"
+echo "  --exclude='.metadata_never_index' --exclude='.com.apple.timemachine.donotpresent' \\"
+echo "  --exclude='lost+found' --exclude='Library' . 2> \"$LOG_FILE\" | \\"
+echo "\"$PV_PATH\" -p -t -e -b -r | ssh \"$USER@$IP_ADDRESS\" \"mkdir -p \\\"$REMOTE_PATH\\\" && cd \\\"$REMOTE_PATH\\\" && tar -xzf -\""
+echo ""
 
-# Perform tar transfer with comprehensive exclusions, logging, verbose, and pv progress
+read -rp "⚠️  Do you want to proceed? [y/N]: " CONFIRM
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    echo "Aborted by user."
+    exit 0
+fi
+
+# Change into source directory and run transfer
 cd "$SOURCE_PATH" || { echo "Source path $SOURCE_PATH not found. Exiting."; exit 1; }
 
 COPYFILE_DISABLE=1 "$GTAR_PATH" -czvf - --totals \
@@ -94,29 +105,26 @@ COPYFILE_DISABLE=1 "$GTAR_PATH" -czvf - --totals \
     --exclude='.com.apple.timemachine.donotpresent' \
     --exclude='lost+found' \
     --exclude='Library' \
-    . 2> "$LOG_FILE" | "$PV_PATH" -p -t -e -b -r | ssh "$USER@$IP_ADDRESS" "mkdir -p \"$REMOTE_PATH\" && cd \"$REMOTE_PATH\" && tar -xzf -" || {
-    echo "Tar transfer failed."
-    exit 1
-}
+    . 2> "$LOG_FILE" | "$PV_PATH" -p -t -e -b -r | ssh "$USER@$IP_ADDRESS" "mkdir -p \"$REMOTE_PATH\" && cd \"$REMOTE_PATH\" && tar -xzf -"
 
-echo "Transfer complete."
+echo "✅ Transfer complete."
 
 # Summarize skipped files
 SKIPPED_COUNT=$(grep -c "Cannot" "$LOG_FILE" || true)
 if [ "$SKIPPED_COUNT" -gt 0 ]; then
     echo ""
-    echo "⚠️ Transfer skipped $SKIPPED_COUNT files or directories:"
+    echo "⚠️  Transfer skipped $SKIPPED_COUNT files or directories:"
     grep "Cannot" "$LOG_FILE"
-    echo "Full log of skipped files saved to $LOG_FILE"
+    echo "📄 Full log of skipped files saved to: $LOG_FILE"
 else
     echo "✅ No files were skipped."
 fi
 
-# Display timing summary
+# Timing summary
 ELAPSED_TIME=$((SECONDS - START_TIME))
 echo ""
 echo "⏱ Transfer completed in $(($ELAPSED_TIME / 60)) minutes and $(($ELAPSED_TIME % 60)) seconds."
 
-# Clean up
-echo "Cleaning up temporary files..."
-rm -rf "$TMP_DIR"
+# DO NOT DELETE TEMP DIRECTORY (for diagnostics)
+echo ""
+echo "🛠 Temporary files kept in: $TMP_DIR"
