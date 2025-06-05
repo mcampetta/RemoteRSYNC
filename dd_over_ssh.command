@@ -1,6 +1,18 @@
 #!/bin/bash
 
+# Ontrack Data Ferry - Version V1.102
 # Usage: ./tar_transfer.sh username ipaddress source_path remote_path
+
+# ┌─────────────────────────────────────────────┐
+# │   🚢 Welcome to Ontrack Tar over SSH script │
+# │               Version: V1.102               │
+# └─────────────────────────────────────────────┘
+
+echo ""
+echo "🚢 Welcome to Ontrack Tar over SSH script"
+echo "🔧 Version: V1.102"
+echo "-----------------------------------------"
+echo ""
 
 # Start timing
 START_TIME=$SECONDS
