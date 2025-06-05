@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Tar Transfer Utility - V1.106 ===
+# === Ontrack Tar Transfer Utility - V1.107 ===
 # Automates remote detection and data transfer over SSH using GNU tar and pv.
 
 clear
@@ -13,7 +13,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔═══╝ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║     ██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝     ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo "              TAR TRANSFER SENDER UTILITY V1.106"
+echo "                TAR TRANSFER UTILITY V1.107"
 echo ""
 echo "🔍 Scanning for Ontrack Receiver..."
 
@@ -54,9 +54,9 @@ else
   exit 1
 fi
 
-# Auto-suggest source path
-DEFAULT_SOURCE=$(mount | grep -i "Macintosh HD Data" | awk '{print $3}' | head -n 1)
-DEFAULT_SOURCE=${DEFAULT_SOURCE:-/Volumes/Macintosh\ HD\ Data}
+# Improved auto-suggest source path
+DEFAULT_SOURCE=$(mount | grep -iE "/Volumes/(Data|Macintosh HD Data)" | awk '{print $3}' | head -n 1)
+DEFAULT_SOURCE=${DEFAULT_SOURCE:-/Volumes/Data}
 read -rp "📂 Source directory [${DEFAULT_SOURCE}]: " SOURCE_OVERRIDE
 SOURCE_PATH="${SOURCE_OVERRIDE:-$DEFAULT_SOURCE}"
 
@@ -80,6 +80,8 @@ fi
 GTAR_PATH="$TMP_DIR/gtar"
 PV_PATH="$TMP_DIR/pv"
 LOG_FILE="$TMP_DIR/skipped_files.log"
+CONTROL_PATH="$TMP_DIR/ssh-ctl"
+SSH_OPTIONS="-o ControlMaster=auto -o ControlPath=$CONTROL_PATH -o ControlPersist=10m"
 
 # Download binaries
 curl -s -L -o "$GTAR_PATH" "$TAR_URL"
@@ -88,13 +90,13 @@ curl -s -L -o "$PV_PATH" "$PV_URL"
 chmod +x "$PV_PATH"
 
 # Validate SSH connection
-if ! ssh "$REMOTE_USER@$REMOTE_IP" "echo OK" >/dev/null 2>&1; then
+if ! ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "echo OK" >/dev/null 2>&1; then
     echo "❌ SSH failed to connect to $REMOTE_USER@$REMOTE_IP"
     exit 1
 fi
 
 # Confirm remote path is writable
-if ! ssh "$REMOTE_USER@$REMOTE_IP" "mkdir -p \"$REMOTE_DEST\" && test -w \"$REMOTE_DEST\""; then
+if ! ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "mkdir -p \"$REMOTE_DEST\" && test -w \"$REMOTE_DEST\""; then
     echo "❌ Remote path $REMOTE_DEST not writable"
     exit 1
 fi
@@ -128,7 +130,7 @@ COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - --totals \
     --exclude='lost+found' \
     --exclude='Library' \
     . 2> "$LOG_FILE" | "$PV_PATH" -p -t -e -b -r | \
-    ssh "$REMOTE_USER@$REMOTE_IP" "cd \"$REMOTE_DEST\" && tar -xvf -"
+    ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "cd \"$REMOTE_DEST\" && tar -xvf -"
 
 # Transfer complete
 ELAPSED_TIME=$((SECONDS - START_TIME))
@@ -149,6 +151,9 @@ if [ "$ELAPSED_TIME" -lt 300 ]; then
     echo "\n⚠️  Transfer ended quickly. Diagnostic command was:"
     echo "cd \"$SOURCE_PATH\" && COPYFILE_DISABLE=1 \"$GTAR_PATH\" -cvf - [...] | \"$PV_PATH\" | ssh \"$REMOTE_USER@$REMOTE_IP\" \"cd \"$REMOTE_DEST\" && tar -xvf -\""
 fi
+
+# Close SSH control socket
+ssh -O exit -o ControlPath="$CONTROL_PATH" "$REMOTE_USER@$REMOTE_IP" 2>/dev/null
 
 # Keep temp dir
 echo "\n🛠 Temp files retained in $TMP_DIR"
