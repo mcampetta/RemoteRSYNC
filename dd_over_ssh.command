@@ -1,87 +1,108 @@
 #!/bin/bash
 
-# Ontrack Tar Transfer Utility - V1.106
-# Description: Transfers files over SSH using GNU tar and pv, with exclusions and diagnostics.
-# Author: Ontrack Engineering
+# === Ontrack Tar Transfer Utility - V1.106 ===
+# Automates remote detection and data transfer over SSH using GNU tar and pv.
 
-# Start timing
-START_TIME=$SECONDS
-
-# Welcome message
 clear
-echo "===== ONTRACK TAR TRANSFER UTILITY ======"
-     "     File Copy & Backup Automation
-     "      (SSH + TAR + PV + EXCLUDES)
-echo "========================================="
-echo "📁 Efficiently transfer files over SSH with built-in exclusions, progress, and error logging."
+
+# Display ASCII welcome art and header
 echo ""
+echo "██████╗ ███╗   ██╗████████╗██████╗  █████╗  ██████╗██╗  ██╗"
+echo "██╔═══██╗████╗  ██║╚══██╔══╝██╔══██╗██╔══██╗██╔════╝██║ ██╔╝"
+echo "██║   ██║██╔██╗ ██║   ██║   ██████╔╝███████║██║     █████╔╝ "
+echo "██║   ██║██║╚██╗██║   ██║   ██╔═══╝ ██╔══██║██║     ██╔═██╗ "
+echo "╚██████╔╝██║ ╚████║   ██║   ██║     ██║  ██║╚██████╗██║  ██╗"
+echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝     ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
+echo "              TAR TRANSFER SENDER UTILITY V1.106"
+echo ""
+echo "🔍 Scanning for Ontrack Receiver..."
 
-USER="$1"
-IP_ADDRESS="$2"
-SOURCE_PATH="$3"
-REMOTE_PATH="$4"
+# Auto-detect subnet and scan for listener
+MY_IP=$(ipconfig getifaddr en0 || ipconfig getifaddr en1)
+SUBNET=$(echo "$MY_IP" | awk -F. '{print $1"."$2"."$3}')
+PORT=12345
+TMP_DIR=$(mktemp -d)
 
-# Prompt for missing parameters
-[ -z "$USER" ] && read -rp "Enter remote username: " USER
-[ -z "$IP_ADDRESS" ] && read -rp "Enter remote IP address: " IP_ADDRESS
-[ -z "$SOURCE_PATH" ] && read -rp "Enter local source path: " SOURCE_PATH
-[ -z "$REMOTE_PATH" ] && read -rp "Enter remote destination path: " REMOTE_PATH
+# Parallel scan
+for i in {1..254}; do
+  (
+    TARGET="$SUBNET.$i"
+    RESPONSE=$(nc -G 1 "$TARGET" $PORT 2>/dev/null)
+    if [ -n "$RESPONSE" ]; then
+      echo "$TARGET:$RESPONSE" >> "$TMP_DIR/listeners.txt"
+    fi
+  ) &
+done
+wait
 
-# Normalize SOURCE_PATH
-SOURCE_PATH="${SOURCE_PATH%/}"
+# Process results
+if [ -f "$TMP_DIR/listeners.txt" ]; then
+  while IFS= read -r LINE; do
+    TARGET=$(echo "$LINE" | cut -d':' -f1)
+    PAYLOAD=$(echo "$LINE" | cut -d':' -f2-)
+    IFS=':' read -r REMOTE_USER REMOTE_IP REMOTE_DEST <<< "$PAYLOAD"
+    echo "✅ Found listener at $TARGET"
+    echo "👤 User: $REMOTE_USER"
+    echo "📁 Path: $REMOTE_DEST"
+    read -rp "Connect to this receiver? [y/N]: " CONFIRM
+    if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+      break
+    fi
+  done < "$TMP_DIR/listeners.txt"
+else
+  echo "❌ Failed to detect remote listener. Ensure the receiver script is running."
+  exit 1
+fi
 
-# Setup SSH multiplexing
-CONTROL_PATH="$HOME/.ssh/ontrack_mux_%r@%h:%p"
-SSH_CMD="ssh -o ControlMaster=auto -o ControlPath=$CONTROL_PATH -o ControlPersist=24h"
+# Auto-suggest source path
+DEFAULT_SOURCE=$(mount | grep -i "Macintosh HD Data" | awk '{print $3}' | head -n 1)
+DEFAULT_SOURCE=${DEFAULT_SOURCE:-/Volumes/Macintosh\ HD\ Data}
+read -rp "📂 Source directory [${DEFAULT_SOURCE}]: " SOURCE_OVERRIDE
+SOURCE_PATH="${SOURCE_OVERRIDE:-$DEFAULT_SOURCE}"
 
-# Start master connection early to cache credentials
-echo -e "\n🔌 Establishing master SSH connection for multiplexing..."
-$SSH_CMD -Nf "$USER@$IP_ADDRESS"
+# Unescape any drag-and-dropped path if wrapped in quotes
+SOURCE_PATH=$(eval echo "$SOURCE_PATH")
 
-# Detect architecture
-echo "\n🔍 Detecting machine architecture..."
+# Detect architecture and download matching tar + pv
 ARCH=$(uname -m)
+echo "\n🔧 Architecture: $ARCH"
 if [ "$ARCH" = "x86_64" ]; then
     TAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/tar_x86_64"
     PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/pv_x86_64"
-    echo "Detected Intel architecture."
 elif [ "$ARCH" = "arm64" ]; then
     TAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/tar_arm64"
     PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/pv_arm64"
-    echo "Detected Apple Silicon architecture."
 else
     echo "Unsupported architecture: $ARCH"
     exit 1
 fi
 
-# Prepare temporary directory for gtar, pv, and logs
-TMP_DIR=$(mktemp -d)
 GTAR_PATH="$TMP_DIR/gtar"
 PV_PATH="$TMP_DIR/pv"
 LOG_FILE="$TMP_DIR/skipped_files.log"
 
 # Download binaries
-echo "\n🔽  Downloading GNU tar and pv binaries..."
-curl -L -o "$GTAR_PATH" "$TAR_URL"
+curl -s -L -o "$GTAR_PATH" "$TAR_URL"
 chmod +x "$GTAR_PATH"
-curl -L -o "$PV_PATH" "$PV_URL"
+curl -s -L -o "$PV_PATH" "$PV_URL"
 chmod +x "$PV_PATH"
 
-# Test remote path validity
-echo "\n🔗 Validating remote path on $IP_ADDRESS..."
-if ! $SSH_CMD "$USER@$IP_ADDRESS" "mkdir -p \"$REMOTE_PATH\" && test -w \"$REMOTE_PATH\""; then
-    echo "❌ Remote path $REMOTE_PATH is not writable or accessible. Exiting."
+# Validate SSH connection
+if ! ssh "$REMOTE_USER@$REMOTE_IP" "echo OK" >/dev/null 2>&1; then
+    echo "❌ SSH failed to connect to $REMOTE_USER@$REMOTE_IP"
     exit 1
 fi
 
-# Check remote disk space
-REMOTE_SPACE=$($SSH_CMD "$USER@$IP_ADDRESS" "df -h \"$REMOTE_PATH\" | tail -1 | awk '{print \$4}'")
-echo "✅ Remote path is accessible. Free space: $REMOTE_SPACE"
+# Confirm remote path is writable
+if ! ssh "$REMOTE_USER@$REMOTE_IP" "mkdir -p \"$REMOTE_DEST\" && test -w \"$REMOTE_DEST\""; then
+    echo "❌ Remote path $REMOTE_DEST not writable"
+    exit 1
+fi
 
-# Change into source directory
-cd "$SOURCE_PATH" || { echo "❌ Source path $SOURCE_PATH not found. Exiting."; exit 1; }
+# Change to source dir
+cd "$SOURCE_PATH" || { echo "❌ Source path not found: $SOURCE_PATH"; exit 1; }
 
-# Perform tar transfer
+# Run tar transfer (no compression)
 COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - --totals \
     --ignore-failed-read \
     --exclude='*.sock' \
@@ -106,30 +127,28 @@ COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - --totals \
     --exclude='.com.apple.timemachine.donotpresent' \
     --exclude='lost+found' \
     --exclude='Library' \
-    . 2> "$LOG_FILE" | "$PV_PATH" -p -t -e -b -r | $SSH_CMD "$USER@$IP_ADDRESS" "cd \"$REMOTE_PATH\" && tar -xvf -"
+    . 2> "$LOG_FILE" | "$PV_PATH" -p -t -e -b -r | \
+    ssh "$REMOTE_USER@$REMOTE_IP" "cd \"$REMOTE_DEST\" && tar -xvf -"
 
-# Completion message
-echo "\n📅 Transfer complete."
+# Transfer complete
+ELAPSED_TIME=$((SECONDS - START_TIME))
+echo "\n✅ Transfer complete in $((ELAPSED_TIME / 60))m $((ELAPSED_TIME % 60))s."
 
-# Summarize skipped files
+# Check for skipped files
 SKIPPED_COUNT=$(grep -c "Cannot" "$LOG_FILE" || true)
 if [ "$SKIPPED_COUNT" -gt 0 ]; then
-    echo "\n⚠️ Transfer skipped $SKIPPED_COUNT files or directories:"
+    echo "⚠️  Skipped $SKIPPED_COUNT files:"
     grep "Cannot" "$LOG_FILE"
-    echo "📄 Full log of skipped files saved to: $LOG_FILE"
+    echo "📄 Skipped log: $LOG_FILE"
 else
     echo "✅ No files were skipped."
 fi
 
-# Timing summary
-ELAPSED_TIME=$((SECONDS - START_TIME))
-echo "\n🕒 Transfer completed in $((ELAPSED_TIME / 60)) minutes and $((ELAPSED_TIME % 60)) seconds."
-
-# Diagnostic output if unexpectedly fast
+# Diagnostic command if transfer too quick
 if [ "$ELAPSED_TIME" -lt 300 ]; then
-    echo "\n⚠️ Transfer completed too quickly. Displaying executed command for diagnostics:"
-    echo "cd \"$SOURCE_PATH\" && COPYFILE_DISABLE=1 \"$GTAR_PATH\" -cvf - --totals [..excludes..] | \"$PV_PATH\" | ssh -o ControlPath=$CONTROL_PATH \"$USER@$IP_ADDRESS\" 'cd \"$REMOTE_PATH\" && tar -xvf -'"
+    echo "\n⚠️  Transfer ended quickly. Diagnostic command was:"
+    echo "cd \"$SOURCE_PATH\" && COPYFILE_DISABLE=1 \"$GTAR_PATH\" -cvf - [...] | \"$PV_PATH\" | ssh \"$REMOTE_USER@$REMOTE_IP\" \"cd \"$REMOTE_DEST\" && tar -xvf -\""
 fi
 
-# Show where temp files are kept
-echo "\n🛠 Temporary files retained at: $TMP_DIR"
+# Keep temp dir
+echo "\n🛠 Temp files retained in $TMP_DIR"
