@@ -75,7 +75,7 @@ echo "✅ Remote path is accessible. Free space: $REMOTE_SPACE"
 # Perform tar transfer with exclusions and progress
 cd "$SOURCE_PATH" || { echo "❌ Source path $SOURCE_PATH not found. Exiting."; exit 1; }
 
-COPYFILE_DISABLE=1 "$GTAR_PATH" -czvf - --totals \
+COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - --totals \
     --ignore-failed-read \
     --exclude='*.sock' \
     --exclude='.DS_Store' \
