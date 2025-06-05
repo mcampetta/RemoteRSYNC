@@ -8,7 +8,10 @@
 START_TIME=$SECONDS
 
 # Welcome message
-echo "\n🚀  Ontrack Tar Transfer Utility - V1.106"
+clear
+echo "===== ONTRACK TAR TRANSFER UTILITY ======"
+     "     File Copy & Backup Automation
+     "      (SSH + TAR + PV + EXCLUDES)
 echo "========================================="
 echo "📁 Efficiently transfer files over SSH with built-in exclusions, progress, and error logging."
 echo ""
