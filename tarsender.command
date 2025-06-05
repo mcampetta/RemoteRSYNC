@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# === Ontrack Tar Transfer Utility - V1.108 ===
-# Automates remote detection and data transfer over SSH using GNU tar and pv.
+# === Ontrack Transfer Utility - V1.109 ===
+# Adds optional rsync support alongside tar transfer
 
 clear
 
@@ -13,7 +13,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔═══╝ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║     ██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝     ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo "                TAR TRANSFER UTILITY V1.108"
+echo "         TRANSFER UTILITY V1.109 (tar or rsync supported)"
 echo ""
 echo "🔍 Scanning for Ontrack Receiver..."
 
@@ -60,18 +60,28 @@ DEFAULT_SOURCE=${DEFAULT_SOURCE:-/Volumes/Data}
 read -rp "📂 Source directory [${DEFAULT_SOURCE}]: " SOURCE_OVERRIDE
 SOURCE_PATH="${SOURCE_OVERRIDE:-$DEFAULT_SOURCE}"
 
-# Unescape any drag-and-dropped path if wrapped in quotes
+# Unescape drag/drop paths
 SOURCE_PATH=$(eval echo "$SOURCE_PATH")
 
-# Detect architecture and download matching tar + pv
+# Ask user for transfer method
+echo ""
+echo "Select transfer method:"
+echo "1) tar (default)"
+echo "2) rsync"
+read -rp "Enter 1 or 2: " METHOD_CHOICE
+TRANSFER_METHOD=${METHOD_CHOICE:-1}
+
+# Detect architecture and download tools
 ARCH=$(uname -m)
 echo "\n🔧 Architecture: $ARCH"
 if [ "$ARCH" = "x86_64" ]; then
     TAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/tar_x86_64"
     PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/pv_x86_64"
+    RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/rsync"
 elif [ "$ARCH" = "arm64" ]; then
     TAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/tar_arm64"
     PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/pv_arm64"
+    RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/rsync_arm"
 else
     echo "Unsupported architecture: $ARCH"
     exit 1
@@ -79,15 +89,15 @@ fi
 
 GTAR_PATH="$TMP_DIR/gtar"
 PV_PATH="$TMP_DIR/pv"
+RSYNC_PATH="$TMP_DIR/rsync"
 LOG_FILE="$TMP_DIR/skipped_files.log"
 CONTROL_PATH="$TMP_DIR/ssh-ctl"
 SSH_OPTIONS="-o ControlMaster=auto -o ControlPath=$CONTROL_PATH -o ControlPersist=10m"
 
 # Download binaries
-curl -s -L -o "$GTAR_PATH" "$TAR_URL"
-chmod +x "$GTAR_PATH"
-curl -s -L -o "$PV_PATH" "$PV_URL"
-chmod +x "$PV_PATH"
+curl -s -L -o "$GTAR_PATH" "$TAR_URL" && chmod +x "$GTAR_PATH"
+curl -s -L -o "$PV_PATH" "$PV_URL" && chmod +x "$PV_PATH"
+curl -s -L -o "$RSYNC_PATH" "$RSYNC_URL" && chmod +x "$RSYNC_PATH"
 
 # Validate SSH connection
 if ! ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "echo OK" >/dev/null 2>&1; then
@@ -104,11 +114,40 @@ fi
 # Change to source dir
 cd "$SOURCE_PATH" || { echo "❌ Source path not found: $SOURCE_PATH"; exit 1; }
 
-# Disable script exit on non-zero
 set +e
+START_TIME=$SECONDS
 
-# Run tar transfer (no compression)
-COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - --totals \
+if [ "$TRANSFER_METHOD" = "2" ]; then
+  echo "🔁 Running rsync..."
+  "$RSYNC_PATH" -av --progress \
+    --exclude='*.sock' \
+    --exclude='.DS_Store' \
+    --exclude='.TemporaryItems' \
+    --exclude='.Trashes' \
+    --exclude='.Spotlight-V100' \
+    --exclude='.fseventsd' \
+    --exclude='.PreviousSystemInformation' \
+    --exclude='.DocumentRevisions-V100' \
+    --exclude='.vol' \
+    --exclude='.VolumeIcon.icns' \
+    --exclude='.PKInstallSandboxManager-SystemSoftware' \
+    --exclude='.MobileBackups' \
+    --exclude='.com.apple.TimeMachine' \
+    --exclude='.AppleDB' \
+    --exclude='.AppleDesktop' \
+    --exclude='.AppleDouble' \
+    --exclude='.CFUserTextEncoding' \
+    --exclude='.hotfiles.btree' \
+    --exclude='.metadata_never_index' \
+    --exclude='.com.apple.timemachine.donotpresent' \
+    --exclude='lost+found' \
+    --exclude='Library' \
+    --exclude='Volumes' \
+    . "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
+  TRANSFER_STATUS=$?
+else
+  echo "🔁 Running tar..."
+  COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - --totals \
     --ignore-failed-read \
     --exclude='*.sock' \
     --exclude='.DS_Store' \
@@ -132,38 +171,36 @@ COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - --totals \
     --exclude='.com.apple.timemachine.donotpresent' \
     --exclude='lost+found' \
     --exclude='Library' \
+    --exclude='Volumes' \
     . 2> "$LOG_FILE" | "$PV_PATH" -p -t -e -b -r | \
     ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "cd \"$REMOTE_DEST\" && tar -xvf -"
+  TRANSFER_STATUS=$?
+fi
 
-TRANSFER_STATUS=$?
-
-# Transfer complete
+# Report
 ELAPSED_TIME=$((SECONDS - START_TIME))
 echo "\n✅ Transfer complete in $((ELAPSED_TIME / 60))m $((ELAPSED_TIME % 60))s."
 
-# Check for skipped files
-SKIPPED_COUNT=$(grep -c "Cannot" "$LOG_FILE" || true)
-if [ "$SKIPPED_COUNT" -gt 0 ]; then
-    echo "⚠️  Skipped $SKIPPED_COUNT files:"
-    grep "Cannot" "$LOG_FILE"
-    echo "📄 Skipped log: $LOG_FILE"
-else
-    echo "✅ No files were skipped."
+if [ "$TRANSFER_METHOD" = "1" ]; then
+  SKIPPED_COUNT=$(grep -c "Cannot" "$LOG_FILE" || true)
+  if [ "$SKIPPED_COUNT" -gt 0 ]; then
+      echo "⚠️  Skipped $SKIPPED_COUNT files:"
+      grep "Cannot" "$LOG_FILE"
+      echo "📄 Skipped log: $LOG_FILE"
+  else
+      echo "✅ No files were skipped."
+  fi
 fi
 
-# Report tar exit code if not zero
 if [ "$TRANSFER_STATUS" -ne 0 ]; then
-    echo "⚠️ Warning: tar exited with status code $TRANSFER_STATUS. Some errors may have occurred."
+    echo "⚠️ Warning: Transfer exited with code $TRANSFER_STATUS."
 fi
 
-# Diagnostic command if transfer too quick
 if [ "$ELAPSED_TIME" -lt 300 ]; then
-    echo "\n⚠️  Transfer ended quickly. Diagnostic command was:"
-    echo "cd \"$SOURCE_PATH\" && COPYFILE_DISABLE=1 \"$GTAR_PATH\" -cvf - [...] | \"$PV_PATH\" | ssh \"$REMOTE_USER@$REMOTE_IP\" \"cd \"$REMOTE_DEST\" && tar -xvf -\""
+    echo "\n⚠️  Transfer ended quickly. Diagnostic mode:"
+    echo "cd \"$SOURCE_PATH\" && [...]"
 fi
 
-# Close SSH control socket
 ssh -O exit -o ControlPath="$CONTROL_PATH" "$REMOTE_USER@$REMOTE_IP" 2>/dev/null
 
-# Keep temp dir
 echo "\n🛠 Temp files retained in $TMP_DIR"
