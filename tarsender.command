@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Tar Transfer Utility - V1.107 ===
+# === Ontrack Tar Transfer Utility - V1.108 ===
 # Automates remote detection and data transfer over SSH using GNU tar and pv.
 
 clear
@@ -13,7 +13,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔═══╝ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║     ██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝     ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo "                TAR TRANSFER UTILITY V1.107"
+echo "                TAR TRANSFER UTILITY V1.108"
 echo ""
 echo "🔍 Scanning for Ontrack Receiver..."
 
@@ -55,7 +55,7 @@ else
 fi
 
 # Improved auto-suggest source path
-DEFAULT_SOURCE=$(mount | grep -iE "/Volumes/(Data|Macintosh HD Data)" | awk '{print $3}' | head -n 1)
+DEFAULT_SOURCE=$(mount | grep -iE "/Volumes/(^Data$|^Macintosh HD Data$)" | awk '{print $3}' | head -n 1)
 DEFAULT_SOURCE=${DEFAULT_SOURCE:-/Volumes/Data}
 read -rp "📂 Source directory [${DEFAULT_SOURCE}]: " SOURCE_OVERRIDE
 SOURCE_PATH="${SOURCE_OVERRIDE:-$DEFAULT_SOURCE}"
@@ -104,6 +104,9 @@ fi
 # Change to source dir
 cd "$SOURCE_PATH" || { echo "❌ Source path not found: $SOURCE_PATH"; exit 1; }
 
+# Disable script exit on non-zero
+set +e
+
 # Run tar transfer (no compression)
 COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - --totals \
     --ignore-failed-read \
@@ -132,6 +135,8 @@ COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - --totals \
     . 2> "$LOG_FILE" | "$PV_PATH" -p -t -e -b -r | \
     ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "cd \"$REMOTE_DEST\" && tar -xvf -"
 
+TRANSFER_STATUS=$?
+
 # Transfer complete
 ELAPSED_TIME=$((SECONDS - START_TIME))
 echo "\n✅ Transfer complete in $((ELAPSED_TIME / 60))m $((ELAPSED_TIME % 60))s."
@@ -144,6 +149,11 @@ if [ "$SKIPPED_COUNT" -gt 0 ]; then
     echo "📄 Skipped log: $LOG_FILE"
 else
     echo "✅ No files were skipped."
+fi
+
+# Report tar exit code if not zero
+if [ "$TRANSFER_STATUS" -ne 0 ]; then
+    echo "⚠️ Warning: tar exited with status code $TRANSFER_STATUS. Some errors may have occurred."
 fi
 
 # Diagnostic command if transfer too quick
