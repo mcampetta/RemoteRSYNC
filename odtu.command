@@ -29,7 +29,8 @@ for i in {1..254}; do
     TARGET="$SUBNET.$i"
     RESPONSE=$(nc -G 1 "$TARGET" $PORT 2>/dev/null)
     if [ -n "$RESPONSE" ]; then
-      echo "$TARGET:$RESPONSE" >> "$TMP_DIR/listeners.txt"
+      IFACE=$(route get "$TARGET" 2>/dev/null | awk '/interface: /{print $2}')
+      echo "$TARGET:$RESPONSE:$IFACE" >> "$TMP_DIR/listeners.txt"
     fi
   ) &
 done
@@ -42,9 +43,13 @@ if [ -f "$TMP_DIR/listeners.txt" ]; then
   while IFS= read -r LINE; do
     TARGET=$(echo "$LINE" | cut -d':' -f1)
     PAYLOAD=$(echo "$LINE" | cut -d':' -f2-)
-    IFS=':' read -r R_USER R_IP R_DEST <<< "$PAYLOAD"
+    R_USER=$(echo "$PAYLOAD" | cut -d':' -f1)
+    R_IP=$(echo "$PAYLOAD" | cut -d':' -f2)
+    R_DEST=$(echo "$PAYLOAD" | cut -d':' -f3)
+    R_IFACE=$(echo "$PAYLOAD" | cut -d':' -f4)
+    IF_TYPE="($R_IFACE)"
     LISTENERS+=("$R_USER:$R_IP:$R_DEST")
-    echo "$INDEX) $R_USER@$R_IP -> $R_DEST"
+    echo "$INDEX) $R_USER@$R_IP -> $R_DEST $IF_TYPE"
     ((INDEX++))
   done < "$TMP_DIR/listeners.txt"
 
