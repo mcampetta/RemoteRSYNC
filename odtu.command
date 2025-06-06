@@ -67,4 +67,22 @@ else
   exit 1
 fi
 
+# Validate likely source path candidates
+VALID_PATHS=(/Volumes/Data "/Volumes/Macintosh HD Data" "/Volumes/Macintosh HD")
+DEFAULT_SOURCE=""
+
+for CANDIDATE in "${VALID_PATHS[@]}"; do
+  if [ -d "$CANDIDATE/Users" ] || [ -d "$CANDIDATE/home" ]; then
+    DEFAULT_SOURCE="$CANDIDATE"
+    break
+  fi
+done
+
+DEFAULT_SOURCE=${DEFAULT_SOURCE:-/Volumes/Data}
+echo ""
+echo "📂 Suggested source directory: $DEFAULT_SOURCE"
+read -rp "Override source directory? (Leave blank to use default): " SOURCE_OVERRIDE
+SOURCE_PATH="${SOURCE_OVERRIDE:-$DEFAULT_SOURCE}"
+SOURCE_PATH=$(eval echo "$SOURCE_PATH")
+
 # (rest of the script remains unchanged)
