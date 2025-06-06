@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.109 ===
-# Adds optional rsync support alongside tar transfer
+# === Ontrack Transfer Utility - V1.110 ===
+# Adds optional rsync and dd (hybrid) support alongside tar transfer
 
 clear
 
@@ -13,7 +13,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔═══╝ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║     ██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝     ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo "         TRANSFER UTILITY V1.109 (tar or rsync supported)"
+echo "      TRANSFER UTILITY V1.110 (tar, rsync, or dd-hybrid)"
 echo ""
 echo "🔍 Scanning for Ontrack Receiver..."
 
@@ -54,24 +54,27 @@ else
   exit 1
 fi
 
-# Improved auto-suggest source path
-DEFAULT_SOURCE=$(mount | grep -iE "/Volumes/(^Data$|^Macintosh HD Data$)" | awk '{print $3}' | head -n 1)
+# Auto-detect main data volume with priority: /Volumes/Data > /Volumes/Macintosh HD > /Volumes/Macintosh HD Data
+DEFAULT_SOURCE=""
+for VOLUME in "/Volumes/Data" "/Volumes/Macintosh HD Data" "/Volumes/Macintosh HD"; do
+  if mount | grep -q "$VOLUME"; then
+    DEFAULT_SOURCE="$VOLUME"
+    break
+  fi
+done
 DEFAULT_SOURCE=${DEFAULT_SOURCE:-/Volumes/Data}
 read -rp "📂 Source directory [${DEFAULT_SOURCE}]: " SOURCE_OVERRIDE
 SOURCE_PATH="${SOURCE_OVERRIDE:-$DEFAULT_SOURCE}"
-
-# Unescape drag/drop paths
 SOURCE_PATH=$(eval echo "$SOURCE_PATH")
 
-# Ask user for transfer method
 echo ""
 echo "Select transfer method:"
 echo "1) tar (default)"
 echo "2) rsync"
-read -rp "Enter 1 or 2: " METHOD_CHOICE
+echo "3) hybrid (rsync directory tree + dd files)"
+read -rp "Enter 1, 2, or 3: " METHOD_CHOICE
 TRANSFER_METHOD=${METHOD_CHOICE:-1}
 
-# Detect architecture and download tools
 ARCH=$(uname -m)
 echo "\n🔧 Architecture: $ARCH"
 if [ "$ARCH" = "x86_64" ]; then
@@ -94,111 +97,92 @@ LOG_FILE="$TMP_DIR/skipped_files.log"
 CONTROL_PATH="$TMP_DIR/ssh-ctl"
 SSH_OPTIONS="-o ControlMaster=auto -o ControlPath=$CONTROL_PATH -o ControlPersist=10m"
 
-# Download binaries
 curl -s -L -o "$GTAR_PATH" "$TAR_URL" && chmod +x "$GTAR_PATH"
 curl -s -L -o "$PV_PATH" "$PV_URL" && chmod +x "$PV_PATH"
 curl -s -L -o "$RSYNC_PATH" "$RSYNC_URL" && chmod +x "$RSYNC_PATH"
 
-# Validate SSH connection
 if ! ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "echo OK" >/dev/null 2>&1; then
     echo "❌ SSH failed to connect to $REMOTE_USER@$REMOTE_IP"
     exit 1
 fi
 
-# Confirm remote path is writable
 if ! ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "mkdir -p \"$REMOTE_DEST\" && test -w \"$REMOTE_DEST\""; then
     echo "❌ Remote path $REMOTE_DEST not writable"
     exit 1
 fi
 
-# Change to source dir
 cd "$SOURCE_PATH" || { echo "❌ Source path not found: $SOURCE_PATH"; exit 1; }
 
 set +e
 START_TIME=$SECONDS
 
-if [ "$TRANSFER_METHOD" = "2" ]; then
-  echo "🔁 Running rsync..."
-  "$RSYNC_PATH" -av --progress \
-    --exclude='*.sock' \
-    --exclude='.DS_Store' \
-    --exclude='.TemporaryItems' \
-    --exclude='.Trashes' \
-    --exclude='.Spotlight-V100' \
-    --exclude='.fseventsd' \
-    --exclude='.PreviousSystemInformation' \
-    --exclude='.DocumentRevisions-V100' \
-    --exclude='.vol' \
-    --exclude='.VolumeIcon.icns' \
-    --exclude='.PKInstallSandboxManager-SystemSoftware' \
-    --exclude='.MobileBackups' \
-    --exclude='.com.apple.TimeMachine' \
-    --exclude='.AppleDB' \
-    --exclude='.AppleDesktop' \
-    --exclude='.AppleDouble' \
-    --exclude='.CFUserTextEncoding' \
-    --exclude='.hotfiles.btree' \
-    --exclude='.metadata_never_index' \
-    --exclude='.com.apple.timemachine.donotpresent' \
-    --exclude='lost+found' \
-    --exclude='Library' \
-    --exclude='Volumes' \
-    . "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
-  TRANSFER_STATUS=$?
-else
-  echo "🔁 Running tar..."
-  COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - --totals \
-    --ignore-failed-read \
-    --exclude='*.sock' \
-    --exclude='.DS_Store' \
-    --exclude='.TemporaryItems' \
-    --exclude='.Trashes' \
-    --exclude='.Spotlight-V100' \
-    --exclude='.fseventsd' \
-    --exclude='.PreviousSystemInformation' \
-    --exclude='.DocumentRevisions-V100' \
-    --exclude='.vol' \
-    --exclude='.VolumeIcon.icns' \
-    --exclude='.PKInstallSandboxManager-SystemSoftware' \
-    --exclude='.MobileBackups' \
-    --exclude='.com.apple.TimeMachine' \
-    --exclude='.AppleDB' \
-    --exclude='.AppleDesktop' \
-    --exclude='.AppleDouble' \
-    --exclude='.CFUserTextEncoding' \
-    --exclude='.hotfiles.btree' \
-    --exclude='.metadata_never_index' \
-    --exclude='.com.apple.timemachine.donotpresent' \
-    --exclude='lost+found' \
-    --exclude='Library' \
-    --exclude='Volumes' \
-    . 2> "$LOG_FILE" | "$PV_PATH" -p -t -e -b -r | \
-    ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "cd \"$REMOTE_DEST\" && tar -xvf -"
-  TRANSFER_STATUS=$?
-fi
+EXCLUDES=(
+  '*.sock' '.DS_Store' '.TemporaryItems' '.Trashes' '.Spotlight-V100'
+  '.fseventsd' '.PreviousSystemInformation' '.DocumentRevisions-V100'
+  '.vol' '.VolumeIcon.icns' '.PKInstallSandboxManager-SystemSoftware'
+  '.MobileBackups' '.com.apple.TimeMachine' '.AppleDB' '.AppleDesktop'
+  '.AppleDouble' '.CFUserTextEncoding' '.hotfiles.btree' '.metadata_never_index'
+  '.com.apple.timemachine.donotpresent' 'lost+found' 'Library' 'Volumes'
+  'Dropbox' 'OneDrive' 'Google Drive' 'Box' 'iCloud Drive' 'Creative Cloud Files'
+)
 
-# Report
+case "$TRANSFER_METHOD" in
+  2)
+    echo "🔁 Running rsync..."
+    RSYNC_EXCLUDES=( )
+    for EXCL in "${EXCLUDES[@]}"; do RSYNC_EXCLUDES+=(--exclude="$EXCL"); done
+    "$RSYNC_PATH" -av --progress "${RSYNC_EXCLUDES[@]}" . "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
+    TRANSFER_STATUS=$?
+    ;;
+  3)
+    echo "🔁 Running hybrid rsync + dd..."
+    RSYNC_EXCLUDES=( )
+    for EXCL in "${EXCLUDES[@]}"; do RSYNC_EXCLUDES+=(--exclude="$EXCL"); done
+    "$RSYNC_PATH" -av -f "+ */" -f "- *" "${RSYNC_EXCLUDES[@]}" . "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
+    find . -type f | while read -r FILE; do
+      SKIP=false
+      for EXCL in "${EXCLUDES[@]}"; do
+        [[ "$FILE" == *"$EXCL"* ]] && SKIP=true && break
+      done
+      if [ "$SKIP" = false ]; then
+        echo "📤 Sending: $FILE"
+        dd if="$FILE" bs=1M 2>/dev/null | ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "dd of=\"$REMOTE_DEST/$FILE\" bs=1M 2>/dev/null"
+      fi
+    done
+    TRANSFER_STATUS=$?
+    ;;
+  *)
+    echo "🔁 Running tar..."
+    TAR_EXCLUDES=( )
+    for EXCL in "${EXCLUDES[@]}"; do TAR_EXCLUDES+=(--exclude="$EXCL"); done
+    COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - --totals --ignore-failed-read "${TAR_EXCLUDES[@]}" . 2> "$LOG_FILE" |
+      "$PV_PATH" -p -t -e -b -r |
+      ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "cd \"$REMOTE_DEST\" && tar -xvf -"
+    TRANSFER_STATUS=$?
+    ;;
+esac
+
 ELAPSED_TIME=$((SECONDS - START_TIME))
 echo "\n✅ Transfer complete in $((ELAPSED_TIME / 60))m $((ELAPSED_TIME % 60))s."
 
 if [ "$TRANSFER_METHOD" = "1" ]; then
   SKIPPED_COUNT=$(grep -c "Cannot" "$LOG_FILE" || true)
   if [ "$SKIPPED_COUNT" -gt 0 ]; then
-      echo "⚠️  Skipped $SKIPPED_COUNT files:"
-      grep "Cannot" "$LOG_FILE"
-      echo "📄 Skipped log: $LOG_FILE"
+    echo "⚠️  Skipped $SKIPPED_COUNT files:"
+    grep "Cannot" "$LOG_FILE"
+    echo "📄 Skipped log: $LOG_FILE"
   else
-      echo "✅ No files were skipped."
+    echo "✅ No files were skipped."
   fi
 fi
 
 if [ "$TRANSFER_STATUS" -ne 0 ]; then
-    echo "⚠️ Warning: Transfer exited with code $TRANSFER_STATUS."
+  echo "⚠️ Warning: Transfer exited with code $TRANSFER_STATUS."
 fi
 
 if [ "$ELAPSED_TIME" -lt 300 ]; then
-    echo "\n⚠️  Transfer ended quickly. Diagnostic mode:"
-    echo "cd \"$SOURCE_PATH\" && [...]"
+  echo "\n⚠️  Transfer ended quickly. Diagnostic mode:"
+  echo "cd \"$SOURCE_PATH\" && [...]"
 fi
 
 ssh -O exit -o ControlPath="$CONTROL_PATH" "$REMOTE_USER@$REMOTE_IP" 2>/dev/null
