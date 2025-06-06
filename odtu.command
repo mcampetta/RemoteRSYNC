@@ -13,7 +13,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.111 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.112 (tar, rsync, or dd-hybrid)"
 echo ""
 echo "🔍 Scanning for Ontrack Receiver..."
 
@@ -38,8 +38,8 @@ wait
 
 # Process results
 if [ -f "$TMP_DIR/listeners.txt" ]; then
-  declare -A UNIQUE_LISTENERS
   LISTENERS=()
+  LISTENER_KEYS=""
   INDEX=1
   while IFS= read -r LINE; do
     TARGET=$(echo "$LINE" | cut -d':' -f1)
@@ -49,12 +49,11 @@ if [ -f "$TMP_DIR/listeners.txt" ]; then
     R_DEST=$(echo "$PAYLOAD" | cut -d':' -f3)
     R_IFACE=$(echo "$PAYLOAD" | cut -d':' -f4)
     KEY="$R_USER@$R_IP:$R_DEST"
-    if [[ -z "${UNIQUE_LISTENERS[$KEY]}" ]]; then
-      UNIQUE_LISTENERS[$KEY]="$R_IFACE"
-      IF_TYPE="(${R_IFACE})"
+    if ! echo "$LISTENER_KEYS" | grep -q "$KEY"; then
+      LISTENER_KEYS="$LISTENER_KEYS $KEY"
       LISTENERS+=("$R_USER:$R_IP:$R_DEST")
-      echo "$INDEX) $R_USER@$R_IP -> $R_DEST $IF_TYPE"
-      ((INDEX++))
+      echo "$INDEX) $R_USER@$R_IP -> $R_DEST ($R_IFACE)"
+      INDEX=$((INDEX + 1))
     fi
   done < "$TMP_DIR/listeners.txt"
 
