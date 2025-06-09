@@ -53,7 +53,7 @@ echo "  - Downloading pv..."
 curl -s -L -o "$PV_PATH" "$PV_URL" && chmod +x "$PV_PATH"
 
 # Validate binary downloads
-for BIN in "$GTAR_PATH" "$PV_PATH" "$RSYNC_PATH"; do
+for BIN in "$GTAR_PATH" "$PV_PATH" "$RSYNC_PATH" "$RSYNC_PATH2"; do
   if [ ! -x "$BIN" ]; then
     echo ""
     echo "❌ Failed to download required binary: $BIN"
