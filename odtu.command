@@ -28,8 +28,7 @@ if [[ "$ARCH" == "x86_64" ]]; then
   GTAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/tar_x86_64"
   PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/pv_x86_64"
 elif [[ "$ARCH" == "arm64" ]]; then
-  RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/rsync_arm"
-  RSYNCSAMBA_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/rsync.samba"
+  RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/rsync.samba"
   GTAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/tar_arm64"
   PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/pv_arm64"
 else
@@ -38,19 +37,12 @@ else
 fi
 
 RSYNC_PATH="$TMP_DIR/rsync"
-RSYNC_PATHSAMBA="$TMP_DIR/rsync.samba"
 GTAR_PATH="$TMP_DIR/gtar"
 PV_PATH="$TMP_DIR/pv"
 
 echo "⬇️  Downloading required binaries..."
 echo "  - Downloading rsync..."
 curl -s -L -o "$RSYNC_PATH" "$RSYNC_URL" && chmod +x "$RSYNC_PATH"
-
-if [[ "$ARCH" == "arm64" ]]; then
-  echo "  - Downloading rsync.samba..."
-  curl -s -L -o "$RSYNC_PATHSAMBA" "$RSYNCSAMBA_URL" && chmod +x "$RSYNC_PATHSAMBA"
-fi
-
 echo "  - Downloading gtar..."
 curl -s -L -o "$GTAR_PATH" "$GTAR_URL" && chmod +x "$GTAR_PATH"
 echo "  - Downloading pv..."
@@ -59,9 +51,6 @@ curl -s -L -o "$PV_PATH" "$PV_URL" && chmod +x "$PV_PATH"
 
 # Validate binary downloads
 REQUIRED_BINS=("$GTAR_PATH" "$PV_PATH" "$RSYNC_PATH")
-if [[ "$ARCH" == "arm64" ]]; then
-  REQUIRED_BINS+=("$RSYNC_PATHSAMBA")
-fi
 
 for BIN in "${REQUIRED_BINS[@]}"; do
   if [ ! -x "$BIN" ]; then
@@ -238,8 +227,7 @@ if [ "$ARCH" = "x86_64" ]; then
 elif [ "$ARCH" = "arm64" ]; then
     TAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/tar_arm64"
     PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/pv_arm64"
-    RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/rsync_arm"
-    RSYNC_URL2="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/rsync.samba"
+    RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/rsync.samba"
 else
     echo "Unsupported architecture: $ARCH"
     exit 1
@@ -248,7 +236,6 @@ fi
 GTAR_PATH="$TMP_DIR/gtar"
 PV_PATH="$TMP_DIR/pv"
 RSYNC_PATH="$TMP_DIR/rsync"
-RSYNC_PATH2="$TMP_DIR/rsync.samba"
 LOG_FILE="$TMP_DIR/skipped_files.log"
 CONTROL_PATH="$TMP_DIR/ssh-ctl"
 SSH_OPTIONS="-o ControlMaster=auto -o ControlPath=$CONTROL_PATH -o ControlPersist=10m"
@@ -256,7 +243,6 @@ SSH_OPTIONS="-o ControlMaster=auto -o ControlPath=$CONTROL_PATH -o ControlPersis
 curl -s -L -o "$GTAR_PATH" "$TAR_URL" && chmod +x "$GTAR_PATH"
 curl -s -L -o "$PV_PATH" "$PV_URL" && chmod +x "$PV_PATH"
 curl -s -L -o "$RSYNC_PATH" "$RSYNC_URL" && chmod +x "$RSYNC_PATH"
-curl -s -L -o "$RSYNC_PATH2" "$RSYNC_URL2" && chmod +x "$RSYNC_PATH2"
 
 if ! ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "echo OK" >/dev/null 2>&1; then
     echo "❌ SSH failed to connect to $REMOTE_USER@$REMOTE_IP"
