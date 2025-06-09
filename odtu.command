@@ -327,7 +327,6 @@ esac
 
 ELAPSED_TIME=$((SECONDS - START_TIME))
 echo "\n✅ Transfer complete in $((ELAPSED_TIME / 60))m $((ELAPSED_TIME % 60))s."
-stop_caffeinate
 
 if [ "$TRANSFER_METHOD" = "1" ]; then
   SKIPPED_COUNT=$(grep -c "Cannot" "$LOG_FILE" || true)
@@ -345,8 +344,37 @@ if [ "$TRANSFER_STATUS" -ne 0 ]; then
 fi
 
 if [ "$ELAPSED_TIME" -lt 300 ]; then
-  echo "\n⚠️  Transfer ended quickly. Diagnostic mode:"
-  echo "cd \"$SOURCE_PATH\" && [...]"
+  echo ""
+  echo "⚠️  Transfer ended quickly. Entering diagnostic mode."
+  echo "You can copy and modify the command below for manual testing:"
+  echo ""
+
+  case "$TRANSFER_METHOD" in
+    2)
+      RSYNC_EXCLUDES=()
+      for EXCL in "${EXCLUDES[@]}"; do RSYNC_EXCLUDES+=(--exclude="$EXCL"); done
+      echo "cd \"$SOURCE_PATH\" && \\"
+      echo "\"$RSYNC_PATH\" -av --progress ${RSYNC_EXCLUDES[*]} . \"$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST\""
+      ;;
+    3)
+      echo "cd \"$SOURCE_PATH\" && \\"
+      echo "\"$RSYNC_PATH\" -av -f \"+ */\" -f \"- *\" . \"$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST\""
+      echo "# Files copied individually with dd:"
+      echo "find . -type f | while read -r FILE; do"
+      echo "  dd if=\"\$FILE\" bs=1M 2>/dev/null | ssh $REMOTE_USER@$REMOTE_IP \"dd of=\\\"$REMOTE_DEST/\$FILE\\\" bs=1M 2>/dev/null\""
+      echo "done"
+      ;;
+    *)
+      TAR_EXCLUDES=()
+      for EXCL in "${EXCLUDES[@]}"; do TAR_EXCLUDES+=(--exclude="$EXCL"); done
+      echo "cd \"$SOURCE_PATH\" && \\"
+      echo "COPYFILE_DISABLE=1 \"$GTAR_PATH\" -cvf - --totals --ignore-failed-read ${TAR_EXCLUDES[*]} . | \\"
+      echo "\"$PV_PATH\" -p -t -e -b -r | \\"
+      echo "ssh $REMOTE_USER@$REMOTE_IP \"cd \\\"$REMOTE_DEST\\\" && tar -xvf -\""
+      ;;
+  esac
+
+  echo ""
 fi
 
 ssh -O exit -o ControlPath="$CONTROL_PATH" "$REMOTE_USER@$REMOTE_IP" 2>/dev/null
