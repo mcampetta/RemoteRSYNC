@@ -29,6 +29,7 @@ if [[ "$ARCH" == "x86_64" ]]; then
   PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/pv_x86_64"
 elif [[ "$ARCH" == "arm64" ]]; then
   RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/rsync_arm"
+  RSYNC_URL2="https://github.com/mcampetta/RemoteRSYNC/raw/main/rsync.samba"
   GTAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/tar_arm64"
   PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/pv_arm64"
 else
@@ -37,12 +38,15 @@ else
 fi
 
 RSYNC_PATH="$TMP_DIR/rsync"
+RSYNC_PATH2="$TMP_DIR/rsync.samba"
 GTAR_PATH="$TMP_DIR/gtar"
 PV_PATH="$TMP_DIR/pv"
 
 echo "⬇️  Downloading required binaries..."
 echo "  - Downloading rsync..."
 curl -s -L -o "$RSYNC_PATH" "$RSYNC_URL" && chmod +x "$RSYNC_PATH"
+echo "  - Downloading rsync.samba..."
+curl -s -L -o "$RSYNC_PATH2" "$RSYNC_URL2" && chmod +x "$RSYNC_PATH2"
 echo "  - Downloading gtar..."
 curl -s -L -o "$GTAR_PATH" "$GTAR_URL" && chmod +x "$GTAR_PATH"
 echo "  - Downloading pv..."
