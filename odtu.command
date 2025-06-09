@@ -20,7 +20,14 @@ echo ""
 
 
 TMP_DIR=$(mktemp -d)
-ARCH=$(uname -m)
+
+if command -v uname >/dev/null 2>&1; then
+  ARCH=$(uname -m)
+else
+  echo "⚠️  'uname' not found. Defaulting to x86_64 (Intel architecture)."
+  ARCH="x86_64"
+fi
+
 
 start_caffeinate() {
   caffeinate -dimsu &  # keep display, system, and idle sleep prevented
