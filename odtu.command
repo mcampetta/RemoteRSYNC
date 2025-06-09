@@ -123,8 +123,8 @@ if [[ "$SESSION_MODE" == "1" ]]; then
   fi
 
   echo "Select transfer method:"
-  echo "1) tar"
-  echo "2) rsync"
+  echo "1) rsync (default)"
+  echo "2) tar"
   echo "3) dd hybrid"
   read -rp "Enter choice [1-3]: " TRANSFER_METHOD
 
@@ -134,9 +134,9 @@ if [[ "$SESSION_MODE" == "1" ]]; then
 
   EXCLUDES=(--exclude="Dropbox" --exclude="Volumes" --exclude=".DocumentRevisions-V100" --exclude="Cloud Storage")
 
-  if [[ "$TRANSFER_METHOD" == "1" ]]; then
+  if [[ "$TRANSFER_METHOD" == "2" ]]; then
     COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - . "${EXCLUDES[@]}" | "$PV_PATH" | tar -xvf - -C "$DEST_PATH"
-  elif [[ "$TRANSFER_METHOD" == "2" ]]; then
+  elif [[ "$TRANSFER_METHOD" == "1" ]]; then
     "$RSYNC_PATH" -av "${EXCLUDES[@]}" "$SRC_VOL/" "$DEST_PATH"
   elif [[ "$TRANSFER_METHOD" == "3" ]]; then
     echo "Creating directory structure first..."
@@ -232,8 +232,8 @@ SOURCE_PATH=$(eval echo "$SOURCE_PATH")
 
 echo ""
 echo "Select transfer method:"
-echo "1) tar (default)"
-echo "2) rsync"
+echo "1) rsync (default)"
+echo "2) tar"
 echo "3) hybrid (rsync directory tree + dd files)"
 read -rp "Enter 1, 2, or 3: " METHOD_CHOICE
 TRANSFER_METHOD=${METHOD_CHOICE:-1}
@@ -291,7 +291,7 @@ EXCLUDES=(
 )
 
 case "$TRANSFER_METHOD" in
-  2)
+  1)
     #Starting caffeinate to keep sessions alive
     start_caffeinate
     echo "🔁 Running rsync..."
@@ -319,7 +319,7 @@ case "$TRANSFER_METHOD" in
     done
     TRANSFER_STATUS=$?
     ;;
-  *)
+  2)
     #Starting caffeinate to keep sessions alive
     start_caffeinate
     echo "🔁 Running tar..."
