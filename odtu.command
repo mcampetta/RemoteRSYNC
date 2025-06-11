@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.133 ===
+# === Ontrack Transfer Utility - V1.134 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.133 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.134 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -136,7 +136,7 @@ while IFS= read -r line; do
     largest_bytes="$used_bytes"
     #largest_mount="$mount_point"
     largest_used="$used"
-    largest_mount=$(df -Hl | grep -v "My Passport" | grep -v "$JOB_NUM" | tail -3 | grep "$largest_used" | rev | cut -d ' ' -f1 | rev)
+    largest_mount=$(df -Hl | grep -v "My Passport" | grep -v "$JOB_NUM" | tail -3 | grep "$largest_used" | awk '{for (i=9; i<=NF; i++) printf $i " "; print ""}' | sed 's/ *$//')
     largest_total="$total"
   fi
 done <<< "$df_output"
