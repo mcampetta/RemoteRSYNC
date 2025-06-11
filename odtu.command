@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.127 ===
+# === Ontrack Transfer Utility - V1.128 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.127 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.128 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -99,28 +99,45 @@ echo ""
 
 echo "🔍 Searching for customer source volume..."
 
-# Collect lines with GB-sized volumes (column 2 is total size, column 6 is mount path)
-df_output=$(df -Hl | grep -v "My Passport" | grep -v "$JOB_NUM" | grep 'G' | awk '{print $2, $NF}')
+# Get all mount points and their used space, skip headers, and avoid "My Passport" and job volume
+df_output=$(df -Hl | awk 'NR>1' | grep -v "My Passport" | grep -v "$JOB_NUM" | awk '{print $3, $NF}' | sed '/^Used /d')
 
-# echo "$df_output"
+#echo "$df_output"
 
-largest_size=0
+largest_bytes=0
 largest_mount=""
 
+convert_to_bytes() {
+  local val="$1"
+  local num="${val%[kMG]}"
+  local unit="${val: -1}"
+  # Ensure it's a number before converting
+  if ! [[ "$num" =~ ^[0-9.]+$ ]]; then
+    echo 0
+    return
+  fi
+  case "$unit" in
+    G) echo $((num * 1000000000)) ;;
+    M) echo $((num * 1000000)) ;;
+    K|k) echo $((num * 1000)) ;;
+    *) echo "$num" ;;
+  esac
+}
+
 while IFS= read -r line; do
-  size=$(echo "$line" | awk '{print $1}' | sed 's/G//')
+  used=$(echo "$line" | awk '{print $1}')
   mount_point=$(echo "$line" | awk '{print $2}')
-  echo "🔎 Inspecting: $mount_point ($size GB)"
-  
-  # Pure Bash comparison (convert to integer)
-  size_int=${size%.*}
-  if [ "$size_int" -gt "$largest_size" ]; then
-    largest_size="$size_int"
+  used_bytes=$(convert_to_bytes "$used")
+
+  echo "🔎 Inspecting: $mount_point ($used used → $used_bytes bytes)"
+
+  if [[ "$used_bytes" -gt "$largest_bytes" ]]; then
+    largest_bytes="$used_bytes"
     largest_mount="$mount_point"
   fi
 done <<< "$df_output"
 
-echo "📊 Filtered size + mount pairs:"
+echo "📊 Filtered used + mount pairs:"
 echo ""
 echo "💡 Suggested source volume: $largest_mount"
 read -rp "Press enter to confirm or drag a different volume: " custom_volume
