@@ -114,6 +114,7 @@ if [[ "$SESSION_MODE" == "1" ]]; then
             #retrieveLast2AttachedDevices=$(mount | tail -2)
             echo "Selecting Largest recently mounted storage volume by size"
             echo -e "Is this the correct drive?"
+            echo df -Hl | grep -v "My Passport" | grep -v "$jobnumber" | tail -3 | grep $largestStorageVolumeRecentlyMounted
             selectedVolume=$(df -Hl | grep -v "My Passport" | grep -v "$jobnumber" | tail -3 | grep $largestStorageVolumeRecentlyMounted)
             value=${selectedVolume#*%*%}
             value="$(echo -e "${value}" | sed -e 's/^[[:space:]]*//')"
