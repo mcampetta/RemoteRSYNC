@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.118 ===
+# === Ontrack Transfer Utility - V1.119 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.118 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.119 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -113,11 +113,24 @@ if [[ "$SESSION_MODE" == "1" ]]; then
     while [ ! -d /Volumes/My\ Passport ]; do sleep 1; done
     echo "✅ External drive detected. Formatting..."
 
-    DISK_ID=$(diskutil list | grep "My Passport" | awk '{print $NF}' | head -n1)
-    if [[ "$DISK_ID" == *s* ]]; then
-      DISK_ID="${DISK_ID%%s*}"
-    fi
-    diskutil eraseDisk JHFS+ "$JOB_NUM" "/dev/$DISK_ID"
+MP_DEV_ID=$(diskutil info -plist "/Volumes/My Passport" 2>/dev/null | \
+  plutil -extract DeviceIdentifier xml1 -o - - | \
+  grep -oE "disk[0-9]+s[0-9]+")
+
+if [ -z "$MP_DEV_ID" ]; then
+  echo "❌ Could not locate volume for 'My Passport'."
+  exit 1
+fi
+
+ROOT_DISK=$(echo "$MP_DEV_ID" | sed 's/s[0-9]*$//')
+if [ -z "$ROOT_DISK" ]; then
+  echo "❌ Failed to extract base disk ID."
+  exit 1
+fi
+
+echo "🧹 Erasing /dev/$ROOT_DISK as HFS+ with name '$JOB_NUM'..."
+diskutil eraseDisk JHFS+ "$JOB_NUM" "/dev/$ROOT_DISK"
+
 
     mkdir -p "$DEST_PATH"
   fi
