@@ -96,37 +96,28 @@ if [[ "$SESSION_MODE" == "1" ]]; then
   echo "🔧 Local Session Selected"
   read -rp "Enter job number: " JOB_NUM
 
-  echo "Searching for customer source volume..."
-            retrieveLast2AttachedDevices=$(mount | grep -v "My Passport" | grep -v "$jobnumber" | tail -3)
-            retrieveLast2AttachedDevicesMountedSize=$(df -Hl |  grep -v "My Passport" | grep -v "$jobnumber" | awk '{print $3}' | sed '/M/d' | sed '/k/d' | sed '/Used/d' | tail -3)
-            echo "$retrieveLast2AttachedDevicesMountedSize"
-            retrieveLast2AttachedDevicesMountedSizeArray=($retrieveLast2AttachedDevicesMountedSize)
-            IFS=$'\n'
-            #Device1String=${regtrieveLast2AttachedDevicesMountedSizeArray[0]}
-            #Device2String=${regtrieveLast2AttachedDevicesMountedSizeArray[1]}
-            #Gets rid of the storage type at the end to convert to int for our sort
-            #Device1StringTrimmed="${Device1String%?}"
-            #Device2StringTrimmed="${Device2String%?}"
-            largestStorageVolumeRecentlyMounted=$(echo "${retrieveLast2AttachedDevicesMountedSize[*]}" | sort -nr | head -n1)
-            echo "$largestStorageVolumeRecentlyMounted"
-            echo "Found a potential source customer drive.."
-            echo "Conducting initial checks.."
-            #retrieveLast2AttachedDevices=$(mount | tail -2)
-            echo "Selecting Largest recently mounted storage volume by size"
-            echo -e "Is this the correct drive?"
-            echo "df -Hl | grep -v "My Passport" | grep -v "$jobnumber" | tail -3 | grep $largestStorageVolumeRecentlyMounted"
-            selectedVolume=$(df -Hl | grep -v "My Passport" | grep -v "$jobnumber" | tail -3 | grep $largestStorageVolumeRecentlyMounted)
-            value=${selectedVolume#*%*%}
-            value="$(echo -e "${value}" | sed -e 's/^[[:space:]]*//')"
-            #value=$(echo "$value" | xargs)
-            #value=$(printf %q "$value")
-            echo "Selected $value"
-            Source_Volume=$value
-            Source_Volume=$(echo "$Source_Volume" | sed "s@\\\\@@g")
-            LARGEST_SRC=$Source_Volume
-  echo "Suggested source volume: $LARGEST_SRC"
-  read -rp "Press enter to confirm or drag a different volume: " CUSTOM_SRC
-  SRC_VOL="${CUSTOM_SRC:-$LARGEST_SRC}"
+echo "🔍 Searching for customer source volume..."
+
+# Get the last 3 mounted volumes, excluding 'My Passport' and any volume matching the job number
+recent_mounts=$(mount | grep -v "My Passport" | grep -v "$JOB_NUM" | tail -3)
+
+# Extract volume sizes (in GB only) and mount points from 'df -Hl'
+recent_sizes=$(df -Hl | grep -v "My Passport" | grep -v "$JOB_NUM" | awk '{print $3, $6}' | grep 'G')
+
+# Get the largest GB value
+readarray -t size_array < <(echo "$recent_sizes" | awk '{print $1}' | sed 's/G//' | sort -nr)
+largest_size="${size_array[0]}"
+
+# Find the mount point that corresponds to the largest size
+selected_volume=$(echo "$recent_sizes" | grep "${largest_size}G" | head -n1 | awk '{print $2}')
+
+# Prompt user for confirmation or override
+echo "💡 Suggested source volume: $selected_volume"
+read -rp "Press enter to confirm or drag a different volume: " custom_volume
+SRC_VOL="${custom_volume:-$selected_volume}"
+
+# Sanitize the path (in case of backslashes from drag-and-drop)
+SRC_VOL=$(echo "$SRC_VOL" | sed 's@\\\\@@g')
 
   DEST_PATH="/Volumes/$JOB_NUM/$JOB_NUM"
 
