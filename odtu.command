@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.126 ===
+# === Ontrack Transfer Utility - V1.127 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.126 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.127 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -95,13 +95,13 @@ read -rp "Enter 1 or 2: " SESSION_MODE
 if [[ "$SESSION_MODE" == "1" ]]; then
   echo "🔧 Local Session Selected"
   read -rp "Enter job number: " JOB_NUM
+echo ""
 
 echo "🔍 Searching for customer source volume..."
 
 # Collect lines with GB-sized volumes (column 2 is total size, column 6 is mount path)
 df_output=$(df -Hl | grep -v "My Passport" | grep -v "$JOB_NUM" | grep 'G' | awk '{print $2, $NF}')
 
-echo "📊 Filtered size + mount pairs:"
 # echo "$df_output"
 
 largest_size=0
@@ -120,6 +120,7 @@ while IFS= read -r line; do
   fi
 done <<< "$df_output"
 
+echo "📊 Filtered size + mount pairs:"
 echo ""
 echo "💡 Suggested source volume: $largest_mount"
 read -rp "Press enter to confirm or drag a different volume: " custom_volume
