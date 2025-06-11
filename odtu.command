@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.120 ===
+# === Ontrack Transfer Utility - V1.121 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.120 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.121 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -99,7 +99,7 @@ if [[ "$SESSION_MODE" == "1" ]]; then
   echo "Searching for customer source volume..."
             retrieveLast2AttachedDevices=$(mount | grep -v "My Passport" | grep -v "$jobnumber" | tail -3)
             retrieveLast2AttachedDevicesMountedSize=$(df -Hl |  grep -v "My Passport" | grep -v "$jobnumber" | awk '{print $3}' | sed '/M/d' | sed '/k/d' | sed '/Used/d' | tail -3)
-            #echo "$retrieveLast2AttachedDevicesMountedSize"
+            echo "$retrieveLast2AttachedDevicesMountedSize"
             retrieveLast2AttachedDevicesMountedSizeArray=($retrieveLast2AttachedDevicesMountedSize)
             IFS=$'\n'
             #Device1String=${regtrieveLast2AttachedDevicesMountedSizeArray[0]}
@@ -108,11 +108,11 @@ if [[ "$SESSION_MODE" == "1" ]]; then
             #Device1StringTrimmed="${Device1String%?}"
             #Device2StringTrimmed="${Device2String%?}"
             largestStorageVolumeRecentlyMounted=$(echo "${retrieveLast2AttachedDevicesMountedSize[*]}" | sort -nr | head -n1)
-            #echo "$largestStorageVolumeRecentlyMounted"
+            echo "$largestStorageVolumeRecentlyMounted"
             echo "Found a potential source customer drive.."
             echo "Conducting initial checks.."
             #retrieveLast2AttachedDevices=$(mount | tail -2)
-            #echo "Selecting Largest recently mounted storage volume by size"
+            echo "Selecting Largest recently mounted storage volume by size"
             echo -e "Is this the correct drive?"
             selectedVolume=$(df -Hl | grep -v "My Passport" | grep -v "$jobnumber" | tail -3 | grep $largestStorageVolumeRecentlyMounted)
             value=${selectedVolume#*%*%}
