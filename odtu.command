@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.124 ===
+# === Ontrack Transfer Utility - V1.125 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.124 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.125 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -98,25 +98,27 @@ if [[ "$SESSION_MODE" == "1" ]]; then
 
 echo "🔍 Searching for customer source volume..."
 
-# Get the last 3 mounted volumes, excluding 'My Passport' and any volume matching the job number
-recent_mounts=$(mount | grep -v "My Passport" | grep -v "$JOB_NUM" | tail -3)
-
-# Extract volume sizes (in GB only) and mount points from 'df -Hl'
+# Get recently mounted volumes (excluding known exclusions)
 recent_sizes=$(df -Hl | grep -v "My Passport" | grep -v "$JOB_NUM" | awk '{print $3, $6}' | grep 'G')
 
-# Get the largest GB value
-readarray -t size_array < <(echo "$recent_sizes" | awk '{print $1}' | sed 's/G//' | sort -nr)
-largest_size="${size_array[0]}"
-
-# Find the mount point that corresponds to the largest size
-selected_volume=$(echo "$recent_sizes" | grep "${largest_size}G" | head -n1 | awk '{print $2}')
+# Find the largest GB value manually
+largest_size=""
+largest_mount=""
+while IFS= read -r line; do
+  size=$(echo "$line" | awk '{print $1}' | sed 's/G//')
+  mount_point=$(echo "$line" | awk '{print $2}')
+  if [ -z "$largest_size" ] || [ "$(echo "$size > $largest_size" | bc)" -eq 1 ]; then
+    largest_size="$size"
+    largest_mount="$mount_point"
+  fi
+done <<< "$recent_sizes"
 
 # Prompt user for confirmation or override
-echo "💡 Suggested source volume: $selected_volume"
+echo "💡 Suggested source volume: $largest_mount"
 read -rp "Press enter to confirm or drag a different volume: " custom_volume
-SRC_VOL="${custom_volume:-$selected_volume}"
+SRC_VOL="${custom_volume:-$largest_mount}"
 
-# Sanitize the path (in case of backslashes from drag-and-drop)
+# Sanitize dragged path (remove escaped backslashes)
 SRC_VOL=$(echo "$SRC_VOL" | sed 's@\\\\@@g')
 
   DEST_PATH="/Volumes/$JOB_NUM/$JOB_NUM"
