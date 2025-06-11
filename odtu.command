@@ -102,7 +102,7 @@ echo "🔍 Searching for customer source volume..."
 df_output=$(df -Hl | grep -v "My Passport" | grep -v "$JOB_NUM" | grep 'G' | awk '{print $2, $NF}')
 
 echo "📊 Filtered size + mount pairs:"
-echo "$df_output"
+# echo "$df_output"
 
 largest_size=0
 largest_mount=""
