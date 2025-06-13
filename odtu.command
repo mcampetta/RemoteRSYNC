@@ -16,7 +16,6 @@ echo "██║   ██║██║╚██╗██║   ██║   ██�
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
 echo " ONTRACK DATA TRANSFER UTILITY V1.134 (tar, rsync, or dd-hybrid)"
-echo " for use with 2018 or newer Mac products and unix based systems"
 echo ""
 
 
@@ -191,7 +190,7 @@ diskutil eraseDisk JHFS+ "$JOB_NUM" "/dev/$ROOT_DISK"
   start_caffeinate
   cd "$SRC_VOL" || exit 1
 
-  EXCLUDES=(--exclude="Dropbox" --exclude="Volumes" --exclude=".DocumentRevisions-V100" --exclude="Cloud Storage" --exclude="CloudStorage")
+  EXCLUDES=(--exclude="Dropbox" --exclude="Volumes" --exclude=".DocumentRevisions-V100" --exclude="Cloud Storage")
 
   if [[ "$TRANSFER_METHOD" == "2" ]]; then
     COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - . "${EXCLUDES[@]}" | "$PV_PATH" | tar -xvf - -C "$DEST_PATH"
