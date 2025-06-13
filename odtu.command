@@ -305,7 +305,7 @@ if [ "$ARCH" = "x86_64" ]; then
 elif [ "$ARCH" = "arm64" ]; then
     TAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/tar_arm64"
     PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/pv_arm64"
-    RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/rsync.samba"
+    RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/rsync_arm64"
 else
     echo "Unsupported architecture: $ARCH"
     exit 1
