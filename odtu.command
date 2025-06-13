@@ -46,7 +46,7 @@ if [[ "$ARCH" == "x86_64" ]]; then
   GTAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/tar_x86_64"
   PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/pv_x86_64"
 elif [[ "$ARCH" == "arm64" ]]; then
-  RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/rsync.samba"
+  RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/rsync_arm64"
   GTAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/tar_arm64"
   PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/pv_arm64"
 else
