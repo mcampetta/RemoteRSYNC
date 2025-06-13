@@ -16,6 +16,7 @@ echo "██║   ██║██║╚██╗██║   ██║   ██�
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
 echo " ONTRACK DATA TRANSFER UTILITY V1.134 (tar, rsync, or dd-hybrid)"
+echo " for use with 2018 or newer Mac products and unix based systems"
 echo ""
 
 
