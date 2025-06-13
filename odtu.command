@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.135 ===
+# === Ontrack Transfer Utility - V1.134 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.135 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.134 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -190,7 +190,7 @@ diskutil eraseDisk JHFS+ "$JOB_NUM" "/dev/$ROOT_DISK"
   start_caffeinate
   cd "$SRC_VOL" || exit 1
 
-  EXCLUDES=(--exclude="Dropbox" --exclude="Volumes" --exclude=".DocumentRevisions-V100" --exclude="Cloud Storage" --exclude="CloudStorage" --exclude=".DS_Store" --exclude=".fseventsd" --exclude=".PreviousSystemInformation" --exclude=".DocumentRevisions-V100" --exclude=".vol" --exclude=".VolumeIcon.icns" --exclude=".PKInstallSandboxManager-SystemSoftware" --exclude="AppleDB" --exclude=".AppleDesktop" --exclude=".AppleDouble" --exclude=".CFUserTextEncoding" --exclude=".hotfiles.btree" --exclude=".metadata_never_index" --exclude=".com.apple.timemachine.donotpresent" --exclude="Library" --exclude="OneDrive" --exclude="Google Drive" --exclude="iCloud Drive" --exclude="Creative Cloud Files" --exclude=".Spotlight-V100")
+  EXCLUDES=(--exclude="Dropbox" --exclude="Volumes" --exclude=".DocumentRevisions-V100" --exclude="Cloud Storage" --exclude="CloudStorage")
 
   if [[ "$TRANSFER_METHOD" == "2" ]]; then
     COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - . "${EXCLUDES[@]}" | "$PV_PATH" | tar -xvf - -C "$DEST_PATH"
@@ -339,12 +339,13 @@ set +e
 START_TIME=$SECONDS
 
 EXCLUDES=(
-  '*.sock' '.DS_Store' '.Spotlight-V100'
+  '*.sock' '.DS_Store' '.TemporaryItems' '.Trashes' '.Spotlight-V100'
   '.fseventsd' '.PreviousSystemInformation' '.DocumentRevisions-V100'
   '.vol' '.VolumeIcon.icns' '.PKInstallSandboxManager-SystemSoftware'
-  '.AppleDB' '.AppleDesktop' '.AppleDouble' '.CFUserTextEncoding' '.hotfiles.btree'
-  '.metadata_never_index' '.com.apple.timemachine.donotpresent' 'lost+found' 
-  'Library' 'Volumes' 'Dropbox' 'OneDrive' 'Google Drive' 'Box' 'iCloud Drive' 'Creative Cloud Files'
+  '.MobileBackups' '.com.apple.TimeMachine' '.AppleDB' '.AppleDesktop'
+  '.AppleDouble' '.CFUserTextEncoding' '.hotfiles.btree' '.metadata_never_index'
+  '.com.apple.timemachine.donotpresent' 'lost+found' 'Library' 'Volumes'
+  'Dropbox' 'OneDrive' 'Google Drive' 'Box' 'iCloud Drive' 'Creative Cloud Files'
 )
 
 case "$TRANSFER_METHOD" in
