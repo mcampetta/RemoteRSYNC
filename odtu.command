@@ -190,7 +190,7 @@ diskutil eraseDisk JHFS+ "$JOB_NUM" "/dev/$ROOT_DISK"
   start_caffeinate
   cd "$SRC_VOL" || exit 1
 
-  EXCLUDES=(--exclude="Dropbox" --exclude="Volumes" --exclude=".DocumentRevisions-V100" --exclude="Cloud Storage")
+  EXCLUDES=(--exclude="Dropbox" --exclude="Volumes" --exclude=".DocumentRevisions-V100" --exclude="Cloud Storage" --exclude="CloudStorage")
 
   if [[ "$TRANSFER_METHOD" == "2" ]]; then
     COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - . "${EXCLUDES[@]}" | "$PV_PATH" | tar -xvf - -C "$DEST_PATH"
@@ -339,13 +339,12 @@ set +e
 START_TIME=$SECONDS
 
 EXCLUDES=(
-  '*.sock' '.DS_Store' '.TemporaryItems' '.Trashes' '.Spotlight-V100'
-  '.fseventsd' '.PreviousSystemInformation' '.DocumentRevisions-V100'
+  '*.sock' '.DS_Store' '.Spotlight-V100'
+  '.fseventsd' '.PreviousSystemInformation'
   '.vol' '.VolumeIcon.icns' '.PKInstallSandboxManager-SystemSoftware'
-  '.MobileBackups' '.com.apple.TimeMachine' '.AppleDB' '.AppleDesktop'
-  '.AppleDouble' '.CFUserTextEncoding' '.hotfiles.btree' '.metadata_never_index'
-  '.com.apple.timemachine.donotpresent' 'lost+found' 'Library' 'Volumes'
-  'Dropbox' 'OneDrive' 'Google Drive' 'Box' 'iCloud Drive' 'Creative Cloud Files'
+  '.AppleDB' '.AppleDesktop' '.AppleDouble' '.CFUserTextEncoding' '.hotfiles.btree'
+  '.metadata_never_index' '.com.apple.timemachine.donotpresent' 'lost+found' 
+  'Library' 'Volumes' 'Dropbox' 'OneDrive' 'Google Drive' 'Box' 'iCloud Drive' 'Creative Cloud Files'
 )
 
 case "$TRANSFER_METHOD" in
