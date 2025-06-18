@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.139 ===
+# === Ontrack Transfer Utility - V1.1391 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.139 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1391 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -58,15 +58,19 @@ RSYNC_PATH="$TMP_DIR/rsync"
 GTAR_PATH="$TMP_DIR/gtar"
 PV_PATH="$TMP_DIR/pv"
 
-#!/bin/bash
+set -e
+
+SCRIPT_PATH="$(realpath "$0")"
+MARKER_FILE="/tmp/$(basename "$SCRIPT_PATH").fda_granted"
 
 is_recovery_os() {
-  [[ "$(uname -a)" == *"Recovery"* ]] || [[ ! -d "/Users" ]]
+  # Detect RecoveryOS by checking for lack of /Users or unusual uname
+  [[ ! -d "/Users" ]] || [[ "$(uname -a)" == *"Recovery"* ]]
 }
 
 check_fda() {
-  local test_file="/Library/Application Support/com.apple.TCC/TCC.db"
-  if [ -r "$test_file" ]; then
+  local protected_file="/Library/Application Support/com.apple.TCC/TCC.db"
+  if [ -r "$protected_file" ]; then
     echo "✅ Full Disk Access is ENABLED."
     return 0
   else
@@ -82,21 +86,44 @@ display dialog "⚠️ Terminal needs Full Disk Access to continue.
 
 Please:
 1. In the window that just opened, click the '+' button.
-2. Navigate to /Applications/Utilities and select Terminal.app (or your script tool).
+2. Navigate to /Applications/Utilities and select Terminal.app.
 3. Toggle the switch ON.
 
-Once done, re-run this script." buttons {"OK"} default button 1
+Once done, click OK to relaunch the script." buttons {"OK"} default button 1
 EOF
 }
 
+relaunch_script() {
+  echo "🔄 Relaunching script in new Terminal window..."
+  osascript <<EOF
+tell application "Terminal"
+  activate
+  do script "bash '$SCRIPT_PATH'"
+end tell
+EOF
+}
+
+# -- Main Execution --
 if is_recovery_os; then
-  echo "🛠 Running in RecoveryOS — skipping Full Disk Access check."
+  echo "🛠 Detected RecoveryOS — skipping Full Disk Access check."
 else
-  if ! check_fda; then
-    prompt_fda_enable
-    exit 1
+  if [ ! -f "$MARKER_FILE" ]; then
+    if ! check_fda; then
+      prompt_fda_enable
+      relaunch_script
+      exit 0
+    else
+      touch "$MARKER_FILE"
+    fi
   fi
 fi
+
+# -- Script logic continues below --
+echo "🎯 Running with Full Disk Access or in RecoveryOS."
+# Your main script logic goes here...
+
+# Optionally clean up marker
+rm -f "$MARKER_FILE"
 
 
 echo "⬇️  Downloading required binaries..."
