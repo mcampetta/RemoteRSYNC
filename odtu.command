@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1392 ===
+# === Ontrack Transfer Utility - V1.1393 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1392 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1393 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -98,6 +98,7 @@ Please:
 1. In the window that just opened, click the '+' button.
 2. Navigate to /Applications/Utilities and select Terminal.app.
 3. Toggle the switch ON.
+4. When asked if you'd like to Quit terminal, click LATER!
 
 Once done, click OK to relaunch the script." buttons {"OK"} default button 1
 EOF
