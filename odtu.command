@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1391 ===
+# === Ontrack Transfer Utility - V1.1392 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1391 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1392 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -57,17 +57,27 @@ fi
 RSYNC_PATH="$TMP_DIR/rsync"
 GTAR_PATH="$TMP_DIR/gtar"
 PV_PATH="$TMP_DIR/pv"
-
 set -e
 
-SCRIPT_PATH="$(realpath "$0")"
-MARKER_FILE="/tmp/$(basename "$SCRIPT_PATH").fda_granted"
+# -- Path Detection Logic --
+# Try to determine if the script is being run from a file or piped via curl
+SCRIPT_REALPATH="$(realpath "$0" 2>/dev/null || true)"
 
+# Check if the resolved path is a readable file
+if [ -f "$SCRIPT_REALPATH" ]; then
+  RUN_MODE="local"
+  MARKER_FILE="/tmp/$(basename "$SCRIPT_REALPATH").fda_granted"
+else
+  RUN_MODE="remote"
+  MARKER_FILE="/tmp/odtu.fda_granted"
+fi
+
+# -- RecoveryOS Detection --
 is_recovery_os() {
-  # Detect RecoveryOS by checking for lack of /Users or unusual uname
   [[ ! -d "/Users" ]] || [[ "$(uname -a)" == *"Recovery"* ]]
 }
 
+# -- FDA Check Logic --
 check_fda() {
   local protected_file="/Library/Application Support/com.apple.TCC/TCC.db"
   if [ -r "$protected_file" ]; then
@@ -93,14 +103,25 @@ Once done, click OK to relaunch the script." buttons {"OK"} default button 1
 EOF
 }
 
+# -- Relaunch Logic --
 relaunch_script() {
   echo "🔄 Relaunching script in new Terminal window..."
-  osascript <<EOF
+
+  if [ "$RUN_MODE" = "local" ]; then
+    osascript <<EOF
 tell application "Terminal"
   activate
-  do script "bash '$SCRIPT_PATH'"
+  do script "bash '$SCRIPT_REALPATH'"
 end tell
 EOF
+  else
+    osascript <<EOF
+tell application "Terminal"
+  activate
+  do script "bash -c \\\"\$(curl -fsSLk http://ontrack.link/odtu)\\\""
+end tell
+EOF
+  fi
 }
 
 # -- Main Execution --
@@ -118,11 +139,11 @@ else
   fi
 fi
 
-# -- Script logic continues below --
-echo "🎯 Running with Full Disk Access or in RecoveryOS."
-# Your main script logic goes here...
+# -- Script logic goes here --
+echo "🎯 Running with Full Disk Access (or in RecoveryOS)."
+# ... your main script logic ...
 
-# Optionally clean up marker
+# -- Optional cleanup --
 rm -f "$MARKER_FILE"
 
 
