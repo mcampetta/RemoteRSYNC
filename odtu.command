@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1400 ===
+# === Ontrack Transfer Utility - V1.1401 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1400 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1401 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -102,6 +102,17 @@ EOF
 }
 
 spawn_new_terminal_and_close_self() {
+  # Step 1: Get current Terminal window number (1-based index)
+  local ORIGINAL_WINDOW_ID
+  ORIGINAL_WINDOW_ID=$(osascript <<EOF
+tell application "Terminal"
+  set winID to id of front window
+  return winID
+end tell
+EOF
+)
+
+# Step 2: Spawn the new Terminal window with the correct script
   if [ "$RUN_MODE" = "local" ]; then
     osascript <<EOF
 tell application "Terminal"
@@ -116,14 +127,18 @@ end tell
 EOF
   fi
 
-  # Defer closing this window until after it has had time to finish
+  # Step 3: Delay + close original window by ID (not front window)
   (
     sleep 2
     osascript <<EOF
 tell application "Terminal"
-  try
-    close front window
-  end try
+  repeat with w in windows
+    if (id of w) is equal to $ORIGINAL_WINDOW_ID then
+      try
+        close w
+      end try
+    end if
+  end repeat
 end tell
 EOF
   ) &
