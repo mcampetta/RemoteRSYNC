@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1401 ===
+# === Ontrack Transfer Utility - V1.1402 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1401 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1402 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -378,6 +378,10 @@ if [ -f "$TMP_DIR/listeners.txt" ]; then
   IFS=':' read -r REMOTE_USER REMOTE_IP REMOTE_DEST <<< "$SELECTED"
 else
   echo "❌ Failed to detect remote listener. Ensure the receiver script is running."
+  echo "⬇️ Remote listener can be downloaded on the machine you want to receive files"
+  echo "╭──────────────────────────────────────────────────────────────╮"
+  echo "│      bash -c \"\$( curl -fsSLk http://ontrack.link/odtu )\"      │"
+  echo "╰──────────────────────────────────────────────────────────────╯"
   exit 1
 fi
 
