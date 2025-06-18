@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1397 ===
+# === Ontrack Transfer Utility - V1.1398 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1397 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1398 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -105,19 +105,19 @@ spawn_new_terminal_and_close_self() {
   if [ "$RUN_MODE" = "local" ]; then
     osascript <<EOF
 tell application "Terminal"
-    activate
-    do script "echo '🔁 Relaunching with Full Disk Access...'; bash '$SCRIPT_REALPATH'"
-    delay 1
-    close front window
+  activate
+  do script "echo '🔁 Relaunching with Full Disk Access...'; bash '$SCRIPT_REALPATH'"
+  delay 1
+  close front window
 end tell
 EOF
   else
-    osascript <<EOF
+    osascript <<'EOF'
 tell application "Terminal"
-    activate
-    do script "echo '🔁 Relaunching with Full Disk Access...'; bash -c \\\\\"\\\$(curl -fsSLk http://ontrack.link/odtu)\\\\\""
-    delay 1
-    close front window
+  activate
+  do script "echo '🔁 Relaunching with Full Disk Access...'; bash -c \"$(curl -fsSLk http://ontrack.link/odtu)\""
+  delay 1
+  close front window
 end tell
 EOF
   fi
