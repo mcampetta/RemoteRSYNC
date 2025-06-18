@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1394 ===
+# === Ontrack Transfer Utility - V1.1395 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1394 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1395 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -110,18 +110,22 @@ else
   if [ ! -f "$MARKER_FILE" ]; then
     if ! check_fda; then
       prompt_fda_enable
+
       echo ""
       echo "🛑 Script will now exit. Please do the following:"
-      echo "   ➤ Quit Terminal manually."
-      echo "   ➤ Reopen Terminal and re-run the script."
+      echo "   1. Quit Terminal manually (do NOT click 'Quit Now' in the macOS dialog)."
+      echo "   2. Reopen Terminal."
+      echo "   3. Re-run this script to continue."
       echo ""
-      if [ "$RUN_MODE" = "remote" ]; then
-        echo "🔁 Re-run with:"
-        echo "   bash -c \"\$(curl -fsSLk http://ontrack.link/odtu)\""
-      else
-        echo "🔁 Re-run with:"
-        echo "   bash '$SCRIPT_REALPATH'"
-      fi
+      echo "💡 Tip: You may be able to press the ↑ (up arrow) key in Terminal to recall the last command and press Enter."
+      echo ""
+       if [ "$RUN_MODE" = "remote" ]; then
+         echo "🔁 Or manually re-run with:"
+         echo "    bash -c \"\$(curl -fsSLk http://ontrack.link/odtu)\""
+       else
+         echo "🔁 Or manually re-run with:"
+         echo "    bash '$SCRIPT_REALPATH'"
+       fi
       exit 1
     else
       touch "$MARKER_FILE"
