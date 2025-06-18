@@ -383,7 +383,7 @@ else
   echo "╭──────────────────────────────────────────────────────────────╮"
   echo "│      bash -c \"\$( curl -fsSLk http://ontrack.link/listener )\" │"
   echo "╰──────────────────────────────────────────────────────────────╯"
-  echo "↻ Restart script once the sender is running."
+  echo "↻ Restart this script and retry remote session once listener is running."
   exit 1
 fi
 
