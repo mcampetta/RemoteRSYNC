@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1395 ===
+# === Ontrack Transfer Utility - V1.1396 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1395 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1396 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -96,11 +96,31 @@ display dialog "⚠️ Terminal needs Full Disk Access to continue.
 Please:
 1. Click the '+' button and add Terminal (in /Applications/Utilities).
 2. When macOS asks to restart Terminal, click 'Later'.
-3. Then manually quit and reopen Terminal.
-4. Finally, re-run this script.
 
 Click OK to close this prompt." buttons {"OK"} default button 1
 EOF
+}
+
+spawn_new_terminal_and_close_self() {
+  if [ "$RUN_MODE" = "local" ]; then
+    osascript <<EOF
+tell application "Terminal"
+    activate
+    do script "echo '🔁 Relaunching script with Full Disk Access...'; bash '$SCRIPT_REALPATH'"
+    delay 1
+    close front window
+end tell
+EOF
+  else
+    osascript <<EOF
+tell application "Terminal"
+    activate
+    do script "echo '🔁 Relaunching script with Full Disk Access...'; bash -c \\\"\$(curl -fsSLk http://ontrack.link/odtu)\\\""
+    delay 1
+    close front window
+end tell
+EOF
+  fi
 }
 
 # -- Main Execution Block --
@@ -108,28 +128,12 @@ if is_recovery_os; then
   echo "🛠 Detected RecoveryOS — skipping Full Disk Access check."
 else
   if [ ! -f "$MARKER_FILE" ]; then
-    if ! check_fda; then
-      prompt_fda_enable
-
-      echo ""
-      echo "🛑 Script will now exit. Please do the following:"
-      echo "   1. Quit Terminal manually (do NOT click 'Quit Now' in the macOS dialog)."
-      echo "   2. Reopen Terminal."
-      echo "   3. Re-run this script to continue."
-      echo ""
-      echo "💡 Tip: You may be able to press the ↑ (up arrow) key in Terminal to recall the last command and press Enter."
-      echo ""
-       if [ "$RUN_MODE" = "remote" ]; then
-         echo "🔁 Or manually re-run with:"
-         echo "    bash -c \"\$(curl -fsSLk http://ontrack.link/odtu)\""
-       else
-         echo "🔁 Or manually re-run with:"
-         echo "    bash '$SCRIPT_REALPATH'"
-       fi
-      exit 1
-    else
-      touch "$MARKER_FILE"
-    fi
+      if ! check_fda; then
+         prompt_fda_enable
+         echo "🌀 Relaunching script with Full Disk Access..."
+         spawn_new_terminal_and_close_self
+         exit 0
+      fi
   fi
 fi
 
