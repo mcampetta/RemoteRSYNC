@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.138 ===
+# === Ontrack Transfer Utility - V1.139 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.138 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.139 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -57,6 +57,47 @@ fi
 RSYNC_PATH="$TMP_DIR/rsync"
 GTAR_PATH="$TMP_DIR/gtar"
 PV_PATH="$TMP_DIR/pv"
+
+#!/bin/bash
+
+is_recovery_os() {
+  [[ "$(uname -a)" == *"Recovery"* ]] || [[ ! -d "/Users" ]]
+}
+
+check_fda() {
+  local test_file="/Library/Application Support/com.apple.TCC/TCC.db"
+  if [ -r "$test_file" ]; then
+    echo "✅ Full Disk Access is ENABLED."
+    return 0
+  else
+    echo "⚠️  Full Disk Access is NOT enabled for Terminal."
+    return 1
+  fi
+}
+
+prompt_fda_enable() {
+  open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+  osascript <<EOF
+display dialog "⚠️ Terminal needs Full Disk Access to continue.
+
+Please:
+1. In the window that just opened, click the '+' button.
+2. Navigate to /Applications/Utilities and select Terminal.app (or your script tool).
+3. Toggle the switch ON.
+
+Once done, re-run this script." buttons {"OK"} default button 1
+EOF
+}
+
+if is_recovery_os; then
+  echo "🛠 Running in RecoveryOS — skipping Full Disk Access check."
+else
+  if ! check_fda; then
+    prompt_fda_enable
+    exit 1
+  fi
+fi
+
 
 echo "⬇️  Downloading required binaries..."
 echo "  - Downloading rsync..."
