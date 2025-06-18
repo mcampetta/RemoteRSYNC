@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1393 ===
+# === Ontrack Transfer Utility - V1.1394 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1393 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1394 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -57,13 +57,11 @@ fi
 RSYNC_PATH="$TMP_DIR/rsync"
 GTAR_PATH="$TMP_DIR/gtar"
 PV_PATH="$TMP_DIR/pv"
+
 set -e
 
-# -- Path Detection Logic --
-# Try to determine if the script is being run from a file or piped via curl
+# -- Determine Run Mode (local or curl-piped) --
 SCRIPT_REALPATH="$(realpath "$0" 2>/dev/null || true)"
-
-# Check if the resolved path is a readable file
 if [ -f "$SCRIPT_REALPATH" ]; then
   RUN_MODE="local"
   MARKER_FILE="/tmp/$(basename "$SCRIPT_REALPATH").fda_granted"
@@ -77,7 +75,7 @@ is_recovery_os() {
   [[ ! -d "/Users" ]] || [[ "$(uname -a)" == *"Recovery"* ]]
 }
 
-# -- FDA Check Logic --
+# -- FDA Check --
 check_fda() {
   local protected_file="/Library/Application Support/com.apple.TCC/TCC.db"
   if [ -r "$protected_file" ]; then
@@ -89,62 +87,53 @@ check_fda() {
   fi
 }
 
+# -- Prompt User to Enable FDA Manually --
 prompt_fda_enable() {
   open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
   osascript <<EOF
 display dialog "⚠️ Terminal needs Full Disk Access to continue.
 
 Please:
-1. In the window that just opened, click the '+' button.
-2. Navigate to /Applications/Utilities and select Terminal.app.
-3. Toggle the switch ON.
-4. When asked if you'd like to Quit terminal, click LATER!
+1. Click the '+' button and add Terminal (in /Applications/Utilities).
+2. When macOS asks to restart Terminal, click 'Later'.
+3. Then manually quit and reopen Terminal.
+4. Finally, re-run this script.
 
-Once done, click OK to relaunch the script." buttons {"OK"} default button 1
+Click OK to close this prompt." buttons {"OK"} default button 1
 EOF
 }
 
-# -- Relaunch Logic --
-relaunch_script() {
-  echo "🔄 Relaunching script in new Terminal window..."
-
-  if [ "$RUN_MODE" = "local" ]; then
-    osascript <<EOF
-tell application "Terminal"
-  activate
-  do script "bash '$SCRIPT_REALPATH'"
-end tell
-EOF
-  else
-    osascript <<EOF
-tell application "Terminal"
-  activate
-  do script "bash -c \\\"\$(curl -fsSLk http://ontrack.link/odtu)\\\""
-end tell
-EOF
-  fi
-}
-
-# -- Main Execution --
+# -- Main Execution Block --
 if is_recovery_os; then
   echo "🛠 Detected RecoveryOS — skipping Full Disk Access check."
 else
   if [ ! -f "$MARKER_FILE" ]; then
     if ! check_fda; then
       prompt_fda_enable
-      relaunch_script
-      exit 0
+      echo ""
+      echo "🛑 Script will now exit. Please do the following:"
+      echo "   ➤ Quit Terminal manually."
+      echo "   ➤ Reopen Terminal and re-run the script."
+      echo ""
+      if [ "$RUN_MODE" = "remote" ]; then
+        echo "🔁 Re-run with:"
+        echo "   bash -c \"\$(curl -fsSLk http://ontrack.link/odtu)\""
+      else
+        echo "🔁 Re-run with:"
+        echo "   bash '$SCRIPT_REALPATH'"
+      fi
+      exit 1
     else
       touch "$MARKER_FILE"
     fi
   fi
 fi
 
-# -- Script logic goes here --
+# -- Main Script Logic Below --
 echo "🎯 Running with Full Disk Access (or in RecoveryOS)."
-# ... your main script logic ...
+# Your script's main logic here...
 
-# -- Optional cleanup --
+# -- Clean up marker after run --
 rm -f "$MARKER_FILE"
 
 
