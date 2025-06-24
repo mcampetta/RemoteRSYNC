@@ -387,23 +387,55 @@ else
   exit 1
 fi
 
-# Validate likely source path candidates
-VALID_PATHS=(/Volumes/Data "/Volumes/Macintosh HD Data" "/Volumes/Macintosh HD")
-DEFAULT_SOURCE=""
+# Get all mount points with Used and Total size (skip header), excluding backup drives
+df_output=$(df -Hl | awk 'NR>1' | grep -v "My Passport" | awk '{print $2, $3, $NF}' | sed '/^Size /d')
 
-for CANDIDATE in "${VALID_PATHS[@]}"; do
-  if [ -d "$CANDIDATE/Users" ] || [ -d "$CANDIDATE/home" ]; then
-    DEFAULT_SOURCE="$CANDIDATE"
-    break
+#echo "$df_output"
+
+largest_bytes=0
+largest_mount=""
+largest_used=""
+largest_total=""
+
+convert_to_bytes() {
+  local val="$1"
+  local num="${val%[kMG]}"
+  local unit="${val: -1}"
+  if ! [[ "$num" =~ ^[0-9.]+$ ]]; then
+    echo 0
+    return
   fi
-done
+  case "$unit" in
+    G) echo $((num * 1000000000)) ;;
+    M) echo $((num * 1000000)) ;;
+    K|k) echo $((num * 1000)) ;;
+    *) echo "$num" ;;
+  esac
+}
 
-DEFAULT_SOURCE=${DEFAULT_SOURCE:-/Volumes/Data}
+while IFS= read -r line; do
+  total=$(echo "$line" | awk '{print $1}')
+  used=$(echo "$line" | awk '{print $2}')
+  mount_point=$(echo "$line" | awk '{print $3}')
+
+  used_bytes=$(convert_to_bytes "$used")
+
+  echo "🔎 Inspecting: $mount_point ($used used → $used_bytes bytes)"
+
+  if [[ "$used_bytes" -gt "$largest_bytes" ]]; then
+    largest_bytes="$used_bytes"
+    largest_mount="$mount_point"
+    largest_used="$used"
+    largest_mount=$(df -Hl | grep -v "My Passport" | tail -3 | grep "$largest_used" | awk '{for (i=9; i<=NF; i++) printf $i " "; print ""}' | sed 's/ *$//')
+    largest_total="$total"
+  fi
+done <<< "$df_output"
+echo "📊 Filtered used + mount pairs:"
 echo ""
-echo "📂 Suggested source directory: $DEFAULT_SOURCE"
-read -rp "Override source directory? (Leave blank to use default): " SOURCE_OVERRIDE
-SOURCE_PATH="${SOURCE_OVERRIDE:-$DEFAULT_SOURCE}"
-SOURCE_PATH=$(eval echo "$SOURCE_PATH")
+echo "💡 Suggested source volume: $largest_mount (Used $largest_used out of $largest_total)"
+read -rp "Press enter to confirm or drag a different volume: " custom_volume
+SOURCE_PATH="${custom_volume:-$largest_mount}"
+SOURCE_PATH=$(echo "$SRC_VOL" | sed 's@\\\\@@g')
 
 echo ""
 echo "Select transfer method:"
