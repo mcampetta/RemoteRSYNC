@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1404 ===
+# === Ontrack Transfer Utility - V1.1405 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1404 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1405 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -201,7 +201,8 @@ done
 echo "Please select copy mode:"
 echo "1) Local Session Copy - copy directly to an attached external drive"
 echo "2) Remote Session Copy - transfer over SSH to another Mac"
-read -rp "Enter 1 or 2: " SESSION_MODE
+echo "3) Setup Listener - sets this machine to recieve data over WIFI with ODTU"
+read -rp "Enter 1, 2, or 3: " SESSION_MODE
 
 if [[ "$SESSION_MODE" == "1" ]]; then
   echo "🔧 Local Session Selected"
@@ -327,7 +328,8 @@ fi
 
 # === Remote Session Logic Continues Here ===
 # Placeholder: Add your existing remote transfer logic here.
-
+if [[ "$SESSION_MODE" == "2" ]]; then
+  echo "🔧 Remote Session Selected"
 
 echo ""
 echo "🔍 Scanning for Ontrack Receiver..."
@@ -593,3 +595,90 @@ fi
 ssh -O exit -o ControlPath="$CONTROL_PATH" "$REMOTE_USER@$REMOTE_IP" 2>/dev/null
 
 echo "\n🛠 Temp files retained in $TMP_DIR"
+fi
+
+if [[ "$SESSION_MODE" == "3" ]]; then
+  echo "🔧 Listener Service Selected"
+  #logic for listener service goes here
+  PORT=12345
+USERNAME=$(whoami)
+IP=$(ipconfig getifaddr en0 || ipconfig getifaddr en1)
+
+# === Check if "My Passport" is connected and offer to format ===
+if [ -d "/Volumes/My Passport" ]; then
+  echo "💽 'My Passport' drive detected."
+  read -rp "📦 Enter job number to format drive as: " JOB_NUM
+
+  # Get the device identifier of the mounted volume
+  VOLUME_DEVICE=$(diskutil info -plist "/Volumes/My Passport" | \
+    plutil -extract DeviceIdentifier xml1 -o - - | \
+    grep -oE "disk[0-9]+s[0-9]+")
+
+  if [ -z "$VOLUME_DEVICE" ]; then
+    echo "❌ Could not get device identifier for 'My Passport'"
+    exit 1
+  fi
+
+  # Strip to root disk (e.g., disk2s1 → disk2)
+  ROOT_DISK=$(echo "$VOLUME_DEVICE" | sed 's/s[0-9]*$//')
+
+  echo "🧹 Erasing /dev/$ROOT_DISK as HFS+ with name '$JOB_NUM'..."
+  sudo diskutil eraseDisk JHFS+ "$JOB_NUM" "/dev/$ROOT_DISK" || {
+    echo "❌ Disk erase failed"
+    exit 1
+  }
+
+  DESTINATION_PATH="/Volumes/$JOB_NUM/$JOB_NUM"
+  echo "📁 Creating destination folder at: $DESTINATION_PATH"
+  sudo mkdir -p "$DESTINATION_PATH"
+  sudo chown "$USER" "$DESTINATION_PATH"
+else
+# DEFAULT_DESTINATION=$(mount | grep -E "/Volumes/.*" | awk '{print $3}' | head -n 1)
+DEFAULT_DESTINATION="/Users/$(stat -f%Su /dev/console)/Desktop/$(date +'%m-%d-%Y_%I-%M%p')_Files"
+# We will be replacing default destination logic here with autodetect logic
+echo "📁 Empty WD My Passport drive not found. Falling back to user set destination."
+
+while true; do
+  echo "📁 Destination directory [${DEFAULT_DESTINATION}]"
+  read -rp "Type enter to accept default or enter custom path (drag and drop supported): " DEST_OVERRIDE
+  DESTINATION_PATH="${DEST_OVERRIDE:-$DEFAULT_DESTINATION}"
+
+  if [[ -z "$DEST_OVERRIDE" ]]; then
+    # User pressed Enter — use default and create the directory
+    mkdir -p "$DEFAULT_DESTINATION"
+  fi
+
+  if [ -d "$DESTINATION_PATH" ]; then
+    break
+  else
+    echo "❌ Directory does not exist: $DESTINATION_PATH"
+    echo "Please enter a valid path."
+  fi
+done
+
+
+fi
+
+
+echo ""
+echo "📡 Ontrack Listener is active."
+echo "👤 Username: $USERNAME"
+echo "🌐 IP Address: $IP"
+echo "📁 Destination Path: $DESTINATION_PATH"
+echo "🔌 Listening on port $PORT..."
+echo "🚪 Press Ctrl+C to exit and stop listening"
+echo "📤 Deploy on source machine by running:"
+echo "╭──────────────────────────────────────────────────────────────╮"
+echo "│      bash -c \"\$( curl -fsSLk http://ontrack.link/odtu )\"      │"
+echo "╰──────────────────────────────────────────────────────────────╯"
+
+# Keep listening indefinitely
+# Trap Ctrl+C and exit
+trap 'echo "👋 Exiting listener."; exit 0' INT
+
+while true; do
+  {
+    echo "$USERNAME:$IP:$DESTINATION_PATH"
+  } | nc -l $PORT
+done
+fi
