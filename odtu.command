@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1409 ===
+# === Ontrack Transfer Utility - V1.1410 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1409 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1410 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -55,6 +55,7 @@ stop_caffeinate() {
       echo "⚙️ Attempt $(($retry + 1)) of $max_retries..."
 
       local start_time=$SECONDS
+      exec 3<&- 2>/dev/null || true
       run_with_timeout "$timeout_secs" "${cmd[@]}"
       local status=$?
       local duration=$((SECONDS - start_time))
@@ -82,6 +83,7 @@ stop_caffeinate() {
 
     echo "❌ All $max_retries attempts failed."
     return 1
+
   }
 
 
@@ -570,7 +572,7 @@ PV_PATH="$TMP_DIR/pv"
 RSYNC_PATH="$TMP_DIR/rsync"
 LOG_FILE="$TMP_DIR/skipped_files.log"
 CONTROL_PATH="$TMP_DIR/ssh-ctl"
-SSH_OPTIONS="-o ControlMaster=no -o ControlPath=none -o ControlPersist=10m"
+SSH_OPTIONS=" -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none"
 
 curl -s -L -o "$GTAR_PATH" "$TAR_URL" && chmod +x "$GTAR_PATH"
 curl -s -L -o "$PV_PATH" "$PV_URL" && chmod +x "$PV_PATH"
@@ -615,6 +617,7 @@ case "$TRANSFER_METHOD" in
     echo "🔁 Running rsync..."
     RSYNC_EXCLUDES=( )
     for EXCL in "${EXCLUDES[@]}"; do RSYNC_EXCLUDES+=(--exclude="$EXCL"); done
+    export RSYNC_CONNECT_PROG="ssh $SSH_OPTIONS"
     retry_rsync "$SSHPASS_PATH" -p "$SSH_PASSWORD" "$RSYNC_PATH" -e "ssh $SSH_OPTIONS" -av --progress "${RSYNC_EXCLUDES[@]}" "$SRC_VOL/" "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
     TRANSFER_STATUS=$?
     ;;
@@ -627,6 +630,7 @@ case "$TRANSFER_METHOD" in
   for EXCL in "${EXCLUDES[@]}"; do RSYNC_EXCLUDES+=(--exclude="$EXCL"); done
 
   # Use "$SRC_VOL/" instead of dot, just like in fix for rsync
+  export RSYNC_CONNECT_PROG="ssh $SSH_OPTIONS"
   retry_rsync "$SSHPASS_PATH" -p "$SSH_PASSWORD" "$RSYNC_PATH" -av -f "+ */" -f "- *" "${RSYNC_EXCLUDES[@]}" "$SRC_VOL/" "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
 
   # Walk real files under SRC_VOL, not current dir
