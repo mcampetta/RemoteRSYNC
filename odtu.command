@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1405 ===
+# === Ontrack Transfer Utility - V1.1406 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1405 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1406 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -495,7 +495,7 @@ EXCLUDES=(
   '.vol' '.VolumeIcon.icns' '.PKInstallSandboxManager-SystemSoftware'
   '.AppleDB' '.AppleDesktop' '.AppleDouble' '.CFUserTextEncoding' '.hotfiles.btree'
   '.metadata_never_index' '.com.apple.timemachine.donotpresent' 'lost+found' 
-  'Library' 'Volumes' 'Dropbox' 'OneDrive' 'Google Drive' 'Box' 'iCloud Drive' 'Creative Cloud Files'
+  'Volumes' 'Dropbox' 'OneDrive' 'Google Drive' 'Box' 'iCloud Drive' 'Creative Cloud Files'
 )
 
 case "$TRANSFER_METHOD" in
