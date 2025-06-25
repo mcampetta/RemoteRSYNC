@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1406 ===
+# === Ontrack Transfer Utility - V1.1408 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1406 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1408 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -28,6 +28,10 @@ else
   ARCH="x86_64"
 fi
 
+ ########################################################################################################
+ #All functions will go in this section, they help the script run correctly and operate like subroutines#
+ #Start of functions here                                                                               #
+ ########################################################################################################
 
 start_caffeinate() {
   caffeinate -dimsu &  # keep display, system, and idle sleep prevented
@@ -39,16 +43,112 @@ stop_caffeinate() {
   fi
 }
 
+  #Retry helper function for rsync
+  retry_rsync() {
+    local cmd=("$@")
+    local max_retries=1000000
+    local timeout_secs=600
+    local retry=0
+    local consistent_fail_count=0
+
+    while [ "$retry" -lt "$max_retries" ]; do
+      echo "⚙️ Attempt $(($retry + 1)) of $max_retries..."
+
+      local start_time=$SECONDS
+      run_with_timeout "$timeout_secs" "${cmd[@]}"
+      local status=$?
+      local duration=$((SECONDS - start_time))
+
+      if [ "$status" -eq 0 ]; then
+        echo "✅ rsync completed successfully."
+        return 0
+      else
+        echo "⏱ rsync failed or timed out after ${duration}s."
+        if (( duration >= timeout_secs - 2 && duration <= timeout_secs + 2 )); then
+          consistent_fail_count=$((consistent_fail_count + 1))
+        else
+          consistent_fail_count=0
+        fi
+
+        if (( consistent_fail_count >= 3 )); then
+          echo "❌ Detected repeated timeouts. Exiting to prevent infinite loop."
+          return 1
+        fi
+      fi
+
+      retry=$((retry + 1))
+      sleep 2
+    done
+
+    echo "❌ All $max_retries attempts failed."
+    return 1
+  }
+
+
+  run_with_timeout() {
+  local timeout_duration=$1
+  shift
+  local cmd=("$@")
+
+  # Start the command in the background
+  "${cmd[@]}" &
+  local cmd_pid=$!
+
+  # Start a watchdog timer in the background
+  (
+    sleep "$timeout_duration"
+    if kill -0 "$cmd_pid" 2> /dev/null; then
+      kill "$cmd_pid" 2> /dev/null
+      sleep 2
+      kill -9 "$cmd_pid" 2> /dev/null
+    fi
+  ) >/dev/null 2>&1 &
+
+
+  local watchdog_pid=$!
+
+  # Wait for command to finish
+  wait "$cmd_pid"
+  local cmd_exit_status=$?
+
+  # Kill watchdog if command finished on its own
+  kill "$watchdog_pid" 2>/dev/null
+
+  return "$cmd_exit_status"
+}
+
+verify_ssh_connection() {
+  local user_host="$1"
+  echo "🔐 Attempting SSH connection using sshpass..."
+  "$SSHPASS_PATH" -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$user_host" "echo OK" >/dev/null 2>&1
+}
+
+prompt_for_password() {
+  echo ""
+  read -rsp "🔑 Enter SSH password for $1: " SSH_PASSWORD
+  echo ""
+}
+
+
+ ########################################################################################################
+ #All functions will go in this section, they help the script run correctly and operate like subroutines#
+ #End of functions here                                                                               #
+ ########################################################################################################
+
+SSH_PASSWORD="ontrack123"
 
 # Define URLs for static binaries
 if [[ "$ARCH" == "x86_64" ]]; then
   RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/rsync"
   GTAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/tar_x86_64"
   PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/pv_x86_64"
+  SSHPASS_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/sshpass_x86_64"
+
 elif [[ "$ARCH" == "arm64" ]]; then
   RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/rsync_arm64"
   GTAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/tar_arm64"
   PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/pv_arm64"
+  SSHPASS_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/sshpass_arm"
 else
   echo "❌ Unsupported architecture"
   exit 1
@@ -57,6 +157,7 @@ fi
 RSYNC_PATH="$TMP_DIR/rsync"
 GTAR_PATH="$TMP_DIR/gtar"
 PV_PATH="$TMP_DIR/pv"
+SSHPASS_PATH="$TMP_DIR/sshpass"
 
 set -e
 
@@ -176,10 +277,12 @@ echo "  - Downloading gtar..."
 curl -s -L -o "$GTAR_PATH" "$GTAR_URL" && chmod +x "$GTAR_PATH"
 echo "  - Downloading pv..."
 curl -s -L -o "$PV_PATH" "$PV_URL" && chmod +x "$PV_PATH"
+echo "  - Downloading sshpass..."
+curl -s -L -o "$SSHPASS_PATH" "$SSHPASS_URL" && chmod +x "$SSHPASS_PATH"
 
 
 # Validate binary downloads
-REQUIRED_BINS=("$GTAR_PATH" "$PV_PATH" "$RSYNC_PATH")
+REQUIRED_BINS=("$GTAR_PATH" "$PV_PATH" "$RSYNC_PATH" "$SSHPASS_PATH")
 
 for BIN in "${REQUIRED_BINS[@]}"; do
   if [ ! -x "$BIN" ]; then
@@ -441,7 +544,7 @@ SOURCE_PATH=$(echo "$SRC_VOL" | sed 's@\\\\@@g')
 
 echo ""
 echo "Select transfer method:"
-echo "1) rsync (default)"
+echo "1) rsync (default with retry support)"
 echo "2) tar"
 echo "3) hybrid (rsync directory tree + dd files)"
 read -rp "Enter 1, 2, or 3: " METHOD_CHOICE
@@ -467,19 +570,26 @@ PV_PATH="$TMP_DIR/pv"
 RSYNC_PATH="$TMP_DIR/rsync"
 LOG_FILE="$TMP_DIR/skipped_files.log"
 CONTROL_PATH="$TMP_DIR/ssh-ctl"
-SSH_OPTIONS="-o ControlMaster=auto -o ControlPath=$CONTROL_PATH -o ControlPersist=10m"
+SSH_OPTIONS="-o ControlMaster=no -o ControlPath=none -o ControlPersist=10m"
 
 curl -s -L -o "$GTAR_PATH" "$TAR_URL" && chmod +x "$GTAR_PATH"
 curl -s -L -o "$PV_PATH" "$PV_URL" && chmod +x "$PV_PATH"
 curl -s -L -o "$RSYNC_PATH" "$RSYNC_URL" && chmod +x "$RSYNC_PATH"
 
 
-if ! ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "echo OK" >/dev/null 2>&1; then
-    echo "❌ SSH failed to connect to $REMOTE_USER@$REMOTE_IP"
+USER_HOST="$REMOTE_USER@$REMOTE_IP"
+
+if ! verify_ssh_connection "$USER_HOST"; then
+  echo "❌ SSH connection using default password failed."
+  prompt_for_password "$USER_HOST"
+  if ! verify_ssh_connection "$USER_HOST"; then
+    echo "❌ SSH failed with provided password. Aborting."
     exit 1
+  fi
 fi
 
-if ! ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "mkdir -p \"$REMOTE_DEST\" && test -w \"$REMOTE_DEST\""; then
+
+if ! "$SSHPASS_PATH" -p "$SSH_PASSWORD" ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "mkdir -p \"$REMOTE_DEST\" && test -w \"$REMOTE_DEST\""; then
     echo "❌ Remote path $REMOTE_DEST not writable"
     exit 1
 fi
@@ -505,7 +615,7 @@ case "$TRANSFER_METHOD" in
     echo "🔁 Running rsync..."
     RSYNC_EXCLUDES=( )
     for EXCL in "${EXCLUDES[@]}"; do RSYNC_EXCLUDES+=(--exclude="$EXCL"); done
-    "$RSYNC_PATH" -av --progress "${RSYNC_EXCLUDES[@]}" . "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
+    retry_rsync "$SSHPASS_PATH" -p "$SSH_PASSWORD" "$RSYNC_PATH" -e "ssh $SSH_OPTIONS" -av --progress "${RSYNC_EXCLUDES[@]}" . "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
     TRANSFER_STATUS=$?
     ;;
   3)
@@ -514,7 +624,7 @@ case "$TRANSFER_METHOD" in
     echo "🔁 Running hybrid rsync + dd..."
     RSYNC_EXCLUDES=( )
     for EXCL in "${EXCLUDES[@]}"; do RSYNC_EXCLUDES+=(--exclude="$EXCL"); done
-    "$RSYNC_PATH" -av -f "+ */" -f "- *" "${RSYNC_EXCLUDES[@]}" . "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
+    retry_rsync "$SSHPASS_PATH" -p "$SSH_PASSWORD" "$RSYNC_PATH" -av -f "+ */" -f "- *" "${RSYNC_EXCLUDES[@]}" . "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
     find . -type f | while read -r FILE; do
       SKIP=false
       for EXCL in "${EXCLUDES[@]}"; do
@@ -522,7 +632,7 @@ case "$TRANSFER_METHOD" in
       done
       if [ "$SKIP" = false ]; then
         echo "📤 Sending: $FILE"
-        dd if="$FILE" bs=1M 2>/dev/null | ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "dd of=\"$REMOTE_DEST/$FILE\" bs=1M 2>/dev/null"
+        dd if="$FILE" bs=1M 2>/dev/null | "$SSHPASS_PATH" -p "$SSH_PASSWORD" ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "dd of=\"$REMOTE_DEST/$FILE\" bs=1M 2>/dev/null"
       fi
     done
     TRANSFER_STATUS=$?
@@ -535,7 +645,7 @@ case "$TRANSFER_METHOD" in
     for EXCL in "${EXCLUDES[@]}"; do TAR_EXCLUDES+=(--exclude="$EXCL"); done
     COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - --totals --ignore-failed-read "${TAR_EXCLUDES[@]}" . 2> "$LOG_FILE" |
       "$PV_PATH" -p -t -e -b -r |
-      ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "cd \"$REMOTE_DEST\" && tar -xvf -"
+      "$SSHPASS_PATH" -p "$SSH_PASSWORD" ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "cd \"$REMOTE_DEST\" && tar -xvf -"
     TRANSFER_STATUS=$?
     ;;
 esac
