@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1410 ===
+# === Ontrack Transfer Utility - V1.1409 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1410 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1409 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -42,49 +42,6 @@ stop_caffeinate() {
     kill "$CAFFEINATE_PID" 2>/dev/null
   fi
 }
-
-  #Retry helper function for rsync
-  retry_rsync() {
-    local cmd=("$@")
-    local max_retries=1000000
-    local timeout_secs=600
-    local retry=0
-    local consistent_fail_count=0
-
-    while [ "$retry" -lt "$max_retries" ]; do
-      echo "⚙️ Attempt $(($retry + 1)) of $max_retries..."
-
-      local start_time=$SECONDS
-      exec 3<&- 2>/dev/null || true
-      run_with_timeout "$timeout_secs" "${cmd[@]}"
-      local status=$?
-      local duration=$((SECONDS - start_time))
-
-      if [ "$status" -eq 0 ]; then
-        echo "✅ rsync completed successfully."
-        return 0
-      else
-        echo "⏱ rsync failed or timed out after ${duration}s."
-        if (( duration >= timeout_secs - 2 && duration <= timeout_secs + 2 )); then
-          consistent_fail_count=$((consistent_fail_count + 1))
-        else
-          consistent_fail_count=0
-        fi
-
-        if (( consistent_fail_count >= 3 )); then
-          echo "❌ Detected repeated timeouts. Exiting to prevent infinite loop."
-          return 1
-        fi
-      fi
-
-      retry=$((retry + 1))
-      sleep 2
-    done
-
-    echo "❌ All $max_retries attempts failed."
-    return 1
-
-  }
 
 
   run_with_timeout() {
@@ -546,7 +503,7 @@ SOURCE_PATH=$(echo "$SRC_VOL" | sed 's@\\\\@@g')
 
 echo ""
 echo "Select transfer method:"
-echo "1) rsync (default with retry support)"
+echo "1) rsync (default)"
 echo "2) tar"
 echo "3) hybrid (rsync directory tree + dd files)"
 read -rp "Enter 1, 2, or 3: " METHOD_CHOICE
@@ -617,8 +574,7 @@ case "$TRANSFER_METHOD" in
     echo "🔁 Running rsync..."
     RSYNC_EXCLUDES=( )
     for EXCL in "${EXCLUDES[@]}"; do RSYNC_EXCLUDES+=(--exclude="$EXCL"); done
-    export RSYNC_CONNECT_PROG="ssh $SSH_OPTIONS"
-    retry_rsync "$SSHPASS_PATH" -p "$SSH_PASSWORD" "$RSYNC_PATH" -e "ssh $SSH_OPTIONS" -av --progress "${RSYNC_EXCLUDES[@]}" "$SRC_VOL/" "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
+    "$SSHPASS_PATH" -p "$SSH_PASSWORD" "$RSYNC_PATH" -e "ssh $SSH_OPTIONS" -av --progress "${RSYNC_EXCLUDES[@]}" "$SRC_VOL/" "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
     TRANSFER_STATUS=$?
     ;;
   3)
@@ -630,8 +586,7 @@ case "$TRANSFER_METHOD" in
   for EXCL in "${EXCLUDES[@]}"; do RSYNC_EXCLUDES+=(--exclude="$EXCL"); done
 
   # Use "$SRC_VOL/" instead of dot, just like in fix for rsync
-  export RSYNC_CONNECT_PROG="ssh $SSH_OPTIONS"
-  retry_rsync "$SSHPASS_PATH" -p "$SSH_PASSWORD" "$RSYNC_PATH" -av -f "+ */" -f "- *" "${RSYNC_EXCLUDES[@]}" "$SRC_VOL/" "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
+  "$SSHPASS_PATH" -p "$SSH_PASSWORD" "$RSYNC_PATH" -av -f "+ */" -f "- *" "${RSYNC_EXCLUDES[@]}" "$SRC_VOL/" "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
 
   # Walk real files under SRC_VOL, not current dir
   find "$SRC_VOL" -type f | while read -r FILE; do
