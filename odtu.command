@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1408 ===
+# === Ontrack Transfer Utility - V1.1409 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1408 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1409 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -615,35 +615,41 @@ case "$TRANSFER_METHOD" in
     echo "🔁 Running rsync..."
     RSYNC_EXCLUDES=( )
     for EXCL in "${EXCLUDES[@]}"; do RSYNC_EXCLUDES+=(--exclude="$EXCL"); done
-    retry_rsync "$SSHPASS_PATH" -p "$SSH_PASSWORD" "$RSYNC_PATH" -e "ssh $SSH_OPTIONS" -av --progress "${RSYNC_EXCLUDES[@]}" . "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
+    retry_rsync "$SSHPASS_PATH" -p "$SSH_PASSWORD" "$RSYNC_PATH" -e "ssh $SSH_OPTIONS" -av --progress "${RSYNC_EXCLUDES[@]}" "$SRC_VOL/" "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
     TRANSFER_STATUS=$?
     ;;
   3)
-    #Starting caffeinate to keep sessions alive
-    start_caffeinate
-    echo "🔁 Running hybrid rsync + dd..."
-    RSYNC_EXCLUDES=( )
-    for EXCL in "${EXCLUDES[@]}"; do RSYNC_EXCLUDES+=(--exclude="$EXCL"); done
-    retry_rsync "$SSHPASS_PATH" -p "$SSH_PASSWORD" "$RSYNC_PATH" -av -f "+ */" -f "- *" "${RSYNC_EXCLUDES[@]}" . "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
-    find . -type f | while read -r FILE; do
-      SKIP=false
-      for EXCL in "${EXCLUDES[@]}"; do
-        [[ "$FILE" == *"$EXCL"* ]] && SKIP=true && break
-      done
-      if [ "$SKIP" = false ]; then
-        echo "📤 Sending: $FILE"
-        dd if="$FILE" bs=1M 2>/dev/null | "$SSHPASS_PATH" -p "$SSH_PASSWORD" ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "dd of=\"$REMOTE_DEST/$FILE\" bs=1M 2>/dev/null"
-      fi
+  # Starting caffeinate to keep sessions alive
+  start_caffeinate
+  echo "🔁 Running hybrid rsync + dd..."
+
+  RSYNC_EXCLUDES=( )
+  for EXCL in "${EXCLUDES[@]}"; do RSYNC_EXCLUDES+=(--exclude="$EXCL"); done
+
+  # Use "$SRC_VOL/" instead of dot, just like in fix for rsync
+  retry_rsync "$SSHPASS_PATH" -p "$SSH_PASSWORD" "$RSYNC_PATH" -av -f "+ */" -f "- *" "${RSYNC_EXCLUDES[@]}" "$SRC_VOL/" "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
+
+  # Walk real files under SRC_VOL, not current dir
+  find "$SRC_VOL" -type f | while read -r FILE; do
+    REL_PATH="${FILE#$SRC_VOL/}"  # Strip source prefix for remote path
+    SKIP=false
+    for EXCL in "${EXCLUDES[@]}"; do
+      [[ "$REL_PATH" == *"$EXCL"* ]] && SKIP=true && break
     done
-    TRANSFER_STATUS=$?
-    ;;
+    if [ "$SKIP" = false ]; then
+      echo "📤 Sending: $REL_PATH"
+      dd if="$FILE" bs=1M 2>/dev/null | "$SSHPASS_PATH" -p "$SSH_PASSWORD" ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "dd of=\"$REMOTE_DEST/$REL_PATH\" bs=1M 2>/dev/null"
+    fi
+  done
+  TRANSFER_STATUS=$?
+  ;;
   2)
     #Starting caffeinate to keep sessions alive
     start_caffeinate
     echo "🔁 Running tar..."
     TAR_EXCLUDES=( )
     for EXCL in "${EXCLUDES[@]}"; do TAR_EXCLUDES+=(--exclude="$EXCL"); done
-    COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - --totals --ignore-failed-read "${TAR_EXCLUDES[@]}" . 2> "$LOG_FILE" |
+    COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - --totals --ignore-failed-read "${TAR_EXCLUDES[@]}" "$SRC_VOL/" 2> "$LOG_FILE" |
       "$PV_PATH" -p -t -e -b -r |
       "$SSHPASS_PATH" -p "$SSH_PASSWORD" ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "cd \"$REMOTE_DEST\" && tar -xvf -"
     TRANSFER_STATUS=$?
