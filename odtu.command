@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1411 ===
+# === Ontrack Transfer Utility - V1.1412 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1411 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1412 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -28,6 +28,10 @@ else
   ARCH="x86_64"
 fi
 
+ ########################################################################################################
+ #All functions will go in this section, they help the script run correctly and operate like subroutines#
+ #Start of functions here                                                                               #
+ ########################################################################################################
 
 start_caffeinate() {
   caffeinate -dimsu &  # keep display, system, and idle sleep prevented
@@ -39,16 +43,36 @@ stop_caffeinate() {
   fi
 }
 
+verify_ssh_connection() {
+  local user_host="$1"
+  echo "🔐 Attempting SSH connection using sshpass..."
+  "$SSHPASS_PATH" -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$user_host" "echo OK" >/dev/null 2>&1
+}
+
+prompt_for_password() {
+  echo ""
+  read -rsp "🔑 Enter SSH password for $1: " SSH_PASSWORD
+  echo ""
+}
+
+ ########################################################################################################
+ #All functions will go in this section, they help the script run correctly and operate like subroutines#
+ #End of functions here                                                                               #
+ ########################################################################################################
+
+SSH_PASSWORD="ontrack123"
 
 # Define URLs for static binaries
 if [[ "$ARCH" == "x86_64" ]]; then
   RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/rsync"
   GTAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/tar_x86_64"
   PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/pv_x86_64"
+  SSHPASS_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/sshpass_x86_64"
 elif [[ "$ARCH" == "arm64" ]]; then
   RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/rsync_arm64"
   GTAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/tar_arm64"
   PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/pv_arm64"
+  SSHPASS_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/sshpass_arm"
 else
   echo "❌ Unsupported architecture"
   exit 1
@@ -57,6 +81,7 @@ fi
 RSYNC_PATH="$TMP_DIR/rsync"
 GTAR_PATH="$TMP_DIR/gtar"
 PV_PATH="$TMP_DIR/pv"
+SSHPASS_PATH="$TMP_DIR/sshpass"
 
 set -e
 
@@ -176,10 +201,12 @@ echo "  - Downloading gtar..."
 curl -s -L -o "$GTAR_PATH" "$GTAR_URL" && chmod +x "$GTAR_PATH"
 echo "  - Downloading pv..."
 curl -s -L -o "$PV_PATH" "$PV_URL" && chmod +x "$PV_PATH"
+echo "  - Downloading sshpass..."
+curl -s -L -o "$SSHPASS_PATH" "$SSHPASS_URL" && chmod +x "$SSHPASS_PATH"
 
 
 # Validate binary downloads
-REQUIRED_BINS=("$GTAR_PATH" "$PV_PATH" "$RSYNC_PATH")
+REQUIRED_BINS=("$GTAR_PATH" "$PV_PATH" "$RSYNC_PATH" "$SSHPASS_PATH")
 
 for BIN in "${REQUIRED_BINS[@]}"; do
   if [ ! -x "$BIN" ]; then
@@ -436,8 +463,8 @@ echo "📊 Filtered used + mount pairs:"
 echo ""
 echo "💡 Suggested source volume: $largest_mount (Used $largest_used out of $largest_total)"
 read -rp "Press enter to confirm or drag a different volume: " custom_volume
-SOURCE_PATH="${custom_volume:-$largest_mount}"
-SOURCE_PATH=$(echo "$SRC_VOL" | sed 's@\\\\@@g')
+SRC_VOL="${custom_volume:-$largest_mount}"
+SRC_VOL=$(echo "$SRC_VOL" | sed 's@\\\\@@g')
 
 echo ""
 echo "Select transfer method:"
@@ -453,10 +480,12 @@ if [ "$ARCH" = "x86_64" ]; then
     TAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/tar_x86_64"
     PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/pv_x86_64"
     RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/rsync"
+    SSHPASS_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/sshpass_x86_64"
 elif [ "$ARCH" = "arm64" ]; then
     TAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/tar_arm64"
     PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/pv_arm64"
     RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/rsync_arm64"
+    SSHPASS_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/sshpass_arm"
 else
     echo "Unsupported architecture: $ARCH"
     exit 1
@@ -465,6 +494,7 @@ fi
 GTAR_PATH="$TMP_DIR/gtar"
 PV_PATH="$TMP_DIR/pv"
 RSYNC_PATH="$TMP_DIR/rsync"
+SSHPASS_PATH="$TMP_DIR/sshpass"
 LOG_FILE="$TMP_DIR/skipped_files.log"
 CONTROL_PATH="$TMP_DIR/ssh-ctl"
 SSH_OPTIONS="-o ControlMaster=auto -o ControlPath=$CONTROL_PATH -o ControlPersist=10m"
@@ -472,19 +502,27 @@ SSH_OPTIONS="-o ControlMaster=auto -o ControlPath=$CONTROL_PATH -o ControlPersis
 curl -s -L -o "$GTAR_PATH" "$TAR_URL" && chmod +x "$GTAR_PATH"
 curl -s -L -o "$PV_PATH" "$PV_URL" && chmod +x "$PV_PATH"
 curl -s -L -o "$RSYNC_PATH" "$RSYNC_URL" && chmod +x "$RSYNC_PATH"
+curl -s -L -o "$SSHPASS_PATH" "$SSHPASS_URL" && chmod +x "$SSHPASS_PATH"
 
 
-if ! ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "echo OK" >/dev/null 2>&1; then
-    echo "❌ SSH failed to connect to $REMOTE_USER@$REMOTE_IP"
+USER_HOST="$REMOTE_USER@$REMOTE_IP"
+
+if ! verify_ssh_connection "$USER_HOST"; then
+  echo "❌ SSH connection using default password failed."
+  prompt_for_password "$USER_HOST"
+  if ! verify_ssh_connection "$USER_HOST"; then
+    echo "❌ SSH failed with provided password. Aborting."
     exit 1
+  fi
 fi
 
-if ! ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "mkdir -p \"$REMOTE_DEST\" && test -w \"$REMOTE_DEST\""; then
+
+if ! "$SSHPASS_PATH" -p "$SSH_PASSWORD" ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "mkdir -p \"$REMOTE_DEST\" && test -w \"$REMOTE_DEST\""; then
     echo "❌ Remote path $REMOTE_DEST not writable"
     exit 1
 fi
 
-cd "$SOURCE_PATH" || { echo "❌ Source path not found: $SOURCE_PATH"; exit 1; }
+cd "$SRC_VOL" || { echo "❌ Source path not found: $SRC_VOL"; exit 1; }
 
 set +e
 START_TIME=$SECONDS
@@ -500,34 +538,43 @@ EXCLUDES=(
 
 case "$TRANSFER_METHOD" in
   1)
+    cd "$SRC_VOL"
     #Starting caffeinate to keep sessions alive
     start_caffeinate
     echo "🔁 Running rsync..."
     RSYNC_EXCLUDES=( )
     for EXCL in "${EXCLUDES[@]}"; do RSYNC_EXCLUDES+=(--exclude="$EXCL"); done
-    "$RSYNC_PATH" -av --progress "${RSYNC_EXCLUDES[@]}" . "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
+    "$SSHPASS_PATH" -p "$SSH_PASSWORD" "$RSYNC_PATH" -e "ssh $SSH_OPTIONS" -av --progress "${RSYNC_EXCLUDES[@]}" "$SRC_VOL" "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
     TRANSFER_STATUS=$?
     ;;
   3)
-    #Starting caffeinate to keep sessions alive
-    start_caffeinate
-    echo "🔁 Running hybrid rsync + dd..."
-    RSYNC_EXCLUDES=( )
-    for EXCL in "${EXCLUDES[@]}"; do RSYNC_EXCLUDES+=(--exclude="$EXCL"); done
-    "$RSYNC_PATH" -av -f "+ */" -f "- *" "${RSYNC_EXCLUDES[@]}" . "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
-    find . -type f | while read -r FILE; do
-      SKIP=false
-      for EXCL in "${EXCLUDES[@]}"; do
-        [[ "$FILE" == *"$EXCL"* ]] && SKIP=true && break
-      done
-      if [ "$SKIP" = false ]; then
-        echo "📤 Sending: $FILE"
-        dd if="$FILE" bs=1M 2>/dev/null | ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "dd of=\"$REMOTE_DEST/$FILE\" bs=1M 2>/dev/null"
-      fi
+    cd "$SRC_VOL"
+  # Starting caffeinate to keep sessions alive
+  start_caffeinate
+  echo "🔁 Running hybrid rsync + dd..."
+
+  RSYNC_EXCLUDES=( )
+  for EXCL in "${EXCLUDES[@]}"; do RSYNC_EXCLUDES+=(--exclude="$EXCL"); done
+
+  # Use "$SRC_VOL/" instead of dot, just like in fix for rsync
+  "$SSHPASS_PATH" -p "$SSH_PASSWORD" "$RSYNC_PATH" -av -f "+ */" -f "- *" "${RSYNC_EXCLUDES[@]}" "$SRC_VOL/" "$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST"
+
+  # Walk real files under SRC_VOL, not current dir
+  find "$SRC_VOL" -type f | while read -r FILE; do
+    REL_PATH="${FILE#$SRC_VOL/}"  # Strip source prefix for remote path
+    SKIP=false
+    for EXCL in "${EXCLUDES[@]}"; do
+      [[ "$REL_PATH" == *"$EXCL"* ]] && SKIP=true && break
     done
-    TRANSFER_STATUS=$?
-    ;;
+    if [ "$SKIP" = false ]; then
+      echo "📤 Sending: $REL_PATH"
+      dd if="$FILE" bs=1M 2>/dev/null | "$SSHPASS_PATH" -p "$SSH_PASSWORD" ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "dd of=\"$REMOTE_DEST/$REL_PATH\" bs=1M 2>/dev/null"
+    fi
+  done
+  TRANSFER_STATUS=$?
+  ;;
   2)
+    cd "$SRC_VOL"
     #Starting caffeinate to keep sessions alive
     start_caffeinate
     echo "🔁 Running tar..."
@@ -535,7 +582,7 @@ case "$TRANSFER_METHOD" in
     for EXCL in "${EXCLUDES[@]}"; do TAR_EXCLUDES+=(--exclude="$EXCL"); done
     COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - --totals --ignore-failed-read "${TAR_EXCLUDES[@]}" . 2> "$LOG_FILE" |
       "$PV_PATH" -p -t -e -b -r |
-      ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "cd \"$REMOTE_DEST\" && tar -xvf -"
+      "$SSHPASS_PATH" -p "$SSH_PASSWORD" ssh $SSH_OPTIONS "$REMOTE_USER@$REMOTE_IP" "cd \"$REMOTE_DEST\" && tar -xvf -"
     TRANSFER_STATUS=$?
     ;;
 esac
@@ -564,25 +611,26 @@ if [ "$ELAPSED_TIME" -lt 300 ]; then
   echo "You can copy and modify the command below for manual testing:"
   echo ""
 
+  #this is log logic not dup of methods
   case "$TRANSFER_METHOD" in
-    2)
+    1)
       RSYNC_EXCLUDES=()
       for EXCL in "${EXCLUDES[@]}"; do RSYNC_EXCLUDES+=(--exclude="$EXCL"); done
-      echo "cd \"$SOURCE_PATH\" && \\"
+      echo "cd \"$SRC_VOL\" && \\"
       echo "\"$RSYNC_PATH\" -av --progress ${RSYNC_EXCLUDES[*]} . \"$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST\""
       ;;
     3)
-      echo "cd \"$SOURCE_PATH\" && \\"
+      echo "cd \"$SRC_VOL\" && \\"
       echo "\"$RSYNC_PATH\" -av -f \"+ */\" -f \"- *\" . \"$REMOTE_USER@$REMOTE_IP:$REMOTE_DEST\""
       echo "# Files copied individually with dd:"
       echo "find . -type f | while read -r FILE; do"
       echo "  dd if=\"\$FILE\" bs=1M 2>/dev/null | ssh $REMOTE_USER@$REMOTE_IP \"dd of=\\\"$REMOTE_DEST/\$FILE\\\" bs=1M 2>/dev/null\""
       echo "done"
       ;;
-    *)
+    2)
       TAR_EXCLUDES=()
       for EXCL in "${EXCLUDES[@]}"; do TAR_EXCLUDES+=(--exclude="$EXCL"); done
-      echo "cd \"$SOURCE_PATH\" && \\"
+      echo "cd \"$SRC_VOL\" && \\"
       echo "COPYFILE_DISABLE=1 \"$GTAR_PATH\" -cvf - --totals --ignore-failed-read ${TAR_EXCLUDES[*]} . | \\"
       echo "\"$PV_PATH\" -p -t -e -b -r | \\"
       echo "ssh $REMOTE_USER@$REMOTE_IP \"cd \\\"$REMOTE_DEST\\\" && tar -xvf -\""
