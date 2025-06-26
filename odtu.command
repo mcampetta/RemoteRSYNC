@@ -336,20 +336,23 @@ diskutil eraseDisk JHFS+ "$JOB_NUM" "/dev/$ROOT_DISK"
   echo "Starting local transfer using method $TRANSFER_METHOD..."
   start_caffeinate
   cd "$SRC_VOL" || exit 1
-
+  VOL_NAME=$(basename "$SRC_VOL")
+  FINAL_DEST="$DEST_PATH/$VOL_NAME"
+  mkdir -p "$FINAL_DEST"
+  
   EXCLUDES=(--exclude="Dropbox" --exclude="Volumes" --exclude=".DocumentRevisions-V100" --exclude="Cloud Storage" --exclude="CloudStorage")
 
   if [[ "$TRANSFER_METHOD" == "2" ]]; then
-    COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - . "${EXCLUDES[@]}" | "$PV_PATH" | tar -xvf - -C "$DEST_PATH"
+    COPYFILE_DISABLE=1 "$GTAR_PATH" -cvf - . "${EXCLUDES[@]}" | "$PV_PATH" | tar -xvf - -C "$FINAL_DEST"
   elif [[ "$TRANSFER_METHOD" == "1" ]]; then
-    "$RSYNC_PATH" -av "${EXCLUDES[@]}" "$SRC_VOL/" "$DEST_PATH"
+    "$RSYNC_PATH" -av "${EXCLUDES[@]}" "$SRC_VOL/" "$FINAL_DEST"
   elif [[ "$TRANSFER_METHOD" == "3" ]]; then
-    echo "Creating directory structure first..."
-    "$RSYNC_PATH" -av --dirs "${EXCLUDES[@]}" "$SRC_VOL/" "$DEST_PATH"
+  echo "Creating directory structure first..."
+    "$RSYNC_PATH" -av --dirs "${EXCLUDES[@]}" "$SRC_VOL/" "$FINAL_DEST"
     echo "Copying file contents using dd..."
     find . -type f \( ! -path "*/Dropbox/*" ! -path "*/Volumes/*" ! -path "*/.DocumentRevisions-V100/*" ! -path "*/Cloud Storage/*" \) | while read -r FILE; do
       SRC_FULL="$SRC_VOL/$FILE"
-      DST_FULL="$DEST_PATH/$FILE"
+      DST_FULL="$FINAL_DEST/$FILE"
       mkdir -p "$(dirname "$DST_FULL")"
       dd if="$SRC_FULL" of="$DST_FULL" bs=1m status=progress
     done
