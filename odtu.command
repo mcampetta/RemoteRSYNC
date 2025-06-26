@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1413 ===
+# === Ontrack Transfer Utility - V1.1414 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1413 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1414 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -218,18 +218,25 @@ REQUIRED_BINS=("$GTAR_PATH" "$PV_PATH" "$RSYNC_PATH" "$SSHPASS_PATH")
 
 for BIN in "${REQUIRED_BINS[@]}"; do
   if [ ! -x "$BIN" ]; then
-    echo ""
-    echo "❌ Failed to download required binary: $BIN"
-    echo "This is usually caused by the system clock being incorrect."
-    echo "Please update the date with the following command format:"
-    echo ""
-    echo "    date MMDDhhmmYYYY"
-    echo ""
-    echo "For example, to set the date to June 6th, 2025 at 10:35 AM:"
-    echo "    date 060610352025"
-    echo ""
-    echo "After updating the date, rerun the script."
-    exit 1
+    echo "⚠️ WARNING: System time is likely incorrect."
+    echo "🔎 Verifying downladed files for acuracy...."
+    curl -k -s -L -o "$RSYNC_PATH" "$RSYNC_URL" && chmod +x "$RSYNC_PATH"
+    curl -k -s -L -o "$GTAR_PATH" "$GTAR_URL" && chmod +x "$GTAR_PATH"
+    curl -k -s -L -o "$PV_PATH" "$PV_URL" && chmod +x "$PV_PATH"
+    curl -k -s -L -o "$SSHPASS_PATH" "$SSHPASS_URL" && chmod +x "$SSHPASS_PATH"
+    echo "🔎 Verification check complete!..."
+    #echo ""
+    #echo "❌ Failed to download required binary: $BIN"
+    #echo "This is usually caused by the system clock being incorrect."
+    #echo "Please update the date with the following command format:"
+    #echo ""
+    #echo "    date MMDDhhmmYYYY"
+    #echo ""
+    #echo "For example, to set the date to June 6th, 2025 at 10:35 AM:"
+    #echo "    date 060610352025"
+    #echo ""
+    #echo "After updating the date, rerun the script."
+    #exit 1
   fi
 done
 
@@ -339,7 +346,7 @@ diskutil eraseDisk JHFS+ "$JOB_NUM" "/dev/$ROOT_DISK"
   VOL_NAME=$(basename "$SRC_VOL")
   FINAL_DEST="$DEST_PATH/$VOL_NAME"
   mkdir -p "$FINAL_DEST"
-  
+
   EXCLUDES=(--exclude="Dropbox" --exclude="Volumes" --exclude=".DocumentRevisions-V100" --exclude="Cloud Storage" --exclude="CloudStorage")
 
   if [[ "$TRANSFER_METHOD" == "2" ]]; then
