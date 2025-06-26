@@ -21,12 +21,20 @@ echo ""
 
 TMP_DIR=$(mktemp -d)
 
+# Try local uname first
 if command -v uname >/dev/null 2>&1; then
   ARCH=$(uname -m)
 else
-  echo "⚠️  'uname' not found. Defaulting to x86_64 (Intel architecture)."
-  ARCH="x86_64"
+  # Fallback to `arch` in Recovery
+  ARCH=$(arch)
+
+  # Normalize i386 to x86_64 (common in RecoveryOS)
+  if [ "$ARCH" = "i386" ]; then
+    ARCH="x86_64"
+  fi
 fi
+
+
 
  ########################################################################################################
  #All functions will go in this section, they help the script run correctly and operate like subroutines#
@@ -97,7 +105,7 @@ fi
 
 # -- RecoveryOS Detection --
 is_recovery_os() {
-  [[ ! -d "/Users" ]] || [[ "$(uname -a)" == *"Recovery"* ]]
+  [[ ! -d "/Users" ]]
 }
 
 # -- FDA Check --
@@ -474,7 +482,18 @@ echo "3) hybrid (rsync directory tree + dd files)"
 read -rp "Enter 1, 2, or 3: " METHOD_CHOICE
 TRANSFER_METHOD=${METHOD_CHOICE:-1}
 
-ARCH=$(uname -m)
+# Try local uname first
+if command -v uname >/dev/null 2>&1; then
+  ARCH=$(uname -m)
+else
+  # Fallback to `arch` in Recovery
+  ARCH=$(arch)
+
+  # Normalize i386 to x86_64 (common in RecoveryOS)
+  if [ "$ARCH" = "i386" ]; then
+    ARCH="x86_64"
+  fi
+fi
 echo "\n🔧 Architecture: $ARCH"
 if [ "$ARCH" = "x86_64" ]; then
     TAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/tar_x86_64"
