@@ -254,7 +254,7 @@ echo "🔍 Searching for customer source volume..."
 # Get all mount points with Used and Total size (skip header), excluding backup drives
 df_output=$(df -Hl | awk 'NR>1' | grep -v "My Passport" | grep -v "$JOB_NUM" | awk '{print $2, $3, $NF}' | sed '/^Size /d')
 
-#echo "$df_output"
+# echo "$df_output"
 
 largest_bytes=0
 largest_mount=""
@@ -263,17 +263,19 @@ largest_total=""
 
 convert_to_bytes() {
   local val="$1"
-  local num="${val%[kMG]}"
+  local num="${val%[kMGk]}"
   local unit="${val: -1}"
+
   if ! [[ "$num" =~ ^[0-9.]+$ ]]; then
     echo 0
     return
   fi
+
   case "$unit" in
-    G) echo $((num * 1000000000)) ;;
-    M) echo $((num * 1000000)) ;;
-    K|k) echo $((num * 1000)) ;;
-    *) echo "$num" ;;
+    G) awk "BEGIN { printf \"%0.f\", $num * 1000000000 }" ;;
+    M) awk "BEGIN { printf \"%0.f\", $num * 1000000 }" ;;
+    K|k) awk "BEGIN { printf \"%0.f\", $num * 1000 }" ;;
+    *)  awk "BEGIN { printf \"%0.f\", $num }" ;;
   esac
 }
 
@@ -285,6 +287,7 @@ while IFS= read -r line; do
   used_bytes=$(convert_to_bytes "$used")
 
   echo "🔎 Inspecting: $mount_point ($used used → $used_bytes bytes)"
+done <<< "$df_output"
 
   if [[ "$used_bytes" -gt "$largest_bytes" ]]; then
     largest_bytes="$used_bytes"
