@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1415 ===
+# === Ontrack Transfer Utility - V1.1416 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1415 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1416 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -287,7 +287,6 @@ while IFS= read -r line; do
   used_bytes=$(convert_to_bytes "$used")
 
   echo "🔎 Inspecting: $mount_point ($used used → $used_bytes bytes)"
-done <<< "$df_output"
 
   if [[ "$used_bytes" -gt "$largest_bytes" ]]; then
     largest_bytes="$used_bytes"
