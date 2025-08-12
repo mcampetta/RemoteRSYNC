@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1418 ===
+# === Ontrack Transfer Utility - V1.1419 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1418 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1419 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -61,6 +61,37 @@ prompt_for_password() {
   echo ""
   read -rsp "🔑 Enter SSH password for $1: " SSH_PASSWORD
   echo ""
+}
+
+# Normalize user-provided paths from typing or Finder drag-and-drop.
+# - Trims whitespace
+# - Strips surrounding single/double quotes
+# - Interprets common backslash escapes (e.g., spaces, parentheses)
+normalize_path() {
+  local p="$1"
+  # Trim leading/trailing whitespace
+  p="${p#${p%%[![:space:]]*}}"
+  p="${p%${p##*[![:space:]]}}"
+  # Strip matching surrounding quotes
+  if [[ "$p" =~ ^\".*\"$ || "$p" =~ ^'.*'$ ]]; then
+    p="${p:1:${#p}-2}"
+  fi
+  # If it contains backslashes, interpret escapes via printf %b
+  if [[ "$p" == *\\* ]]; then
+    p="$(printf '%b' "${p//%/%%}")"
+  fi
+  echo "$p"
+}
+
+# Enable readline-based filename completion for read prompts (Tab works).
+# Only binds when running in an interactive TTY to avoid weirdness in pipes.
+enable_readline_path_completion() {
+  if [[ -t 0 && -t 1 ]]; then
+    bind 'set completion-ignore-case on'
+    bind 'set show-all-if-ambiguous on'
+    bind 'set mark-symlinked-directories on'
+    bind '"\t": complete'
+  fi
 }
 
 edit_excludes() {
@@ -258,6 +289,8 @@ fi
 
 # -- Main Script Logic Below --
 echo "🎯 Running with Full Disk Access (or in RecoveryOS)."
+enable_readline_path_completion
+
 # Your script's main logic here...
 
 # -- Clean up marker after run --
@@ -361,9 +394,9 @@ done <<< "$df_output"
 echo "📊 Filtered used + mount pairs:"
 echo ""
 echo "💡 Suggested source volume: $largest_mount (Used $largest_used out of $largest_total)"
-read -rp "Press enter to confirm or drag a different volume: " custom_volume
+read -e -r -p "Press Enter to accept, or type/drag a different path (Tab to autocomplete): " custom_volume
 SRC_VOL="${custom_volume:-$largest_mount}"
-SRC_VOL=$(echo "$SRC_VOL" | sed 's@\\\\@@g')
+SRC_VOL="$(normalize_path "$SRC_VOL")"
 
   DEST_PATH="/Volumes/$JOB_NUM/$JOB_NUM"
 
@@ -564,9 +597,9 @@ df_output=$(df -Hl | awk 'NR>1' | grep -v "My Passport" | grep -vi "ontrack" | a
   done <<< "$df_output"
 
   echo "💡 Suggested source volume: $largest_mount (Used $largest_used)"
-  read -rp "Press enter to confirm or drag a different volume: " custom_volume
+  read -e -r -p "Press Enter to accept, or type/drag a different path (Tab to autocomplete): " custom_volume
   SRC_VOL="${custom_volume:-$largest_mount}"
-  SRC_VOL=$(echo "$SRC_VOL" | sed 's@\\@@g')
+  SRC_VOL="$(normalize_path "$SRC_VOL")"
 
   EXCLUDES=(
     "Dropbox" "Volumes" ".DocumentRevisions-V100"
@@ -710,8 +743,8 @@ echo "📁 Empty WD My Passport drive not found. Falling back to user set destin
 
 while true; do
   echo "📁 Destination directory [${DEFAULT_DESTINATION}]"
-  read -rp "Type enter to accept default or enter custom path (drag and drop supported): " DEST_OVERRIDE
-  DESTINATION_PATH="${DEST_OVERRIDE:-$DEFAULT_DESTINATION}"
+  read -e -r -p "Press Enter for default, or type/drag a custom path (Tab to autocomplete): " DEST_OVERRIDE
+  DESTINATION_PATH="$(normalize_path "${DEST_OVERRIDE:-$DEFAULT_DESTINATION}")"
 
   if [[ -z "$DEST_OVERRIDE" ]]; then
     # User pressed Enter — use default and create the directory
