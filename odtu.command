@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1417 ===
+# === Ontrack Transfer Utility - V1.1418 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1417 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1418 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -314,7 +314,7 @@ if [[ "$SESSION_MODE" == "1" ]]; then
 echo "🔍 Searching for customer source volume..."
 
 # Get all mount points with Used and Total size (skip header), excluding backup drives
-df_output=$(df -Hl | awk 'NR>1' | grep -v "My Passport" | grep -v "$JOB_NUM" | awk '{print $2, $3, $NF}' | sed '/^Size /d')
+df_output=$(df -Hl | awk 'NR>1' | grep -v "My Passport" | grep -v "$JOB_NUM" | grep -vi "ontrack" | awk '{print $2, $3, $NF}' | sed '/^Size /d')
 
 # echo "$df_output"
 
@@ -528,7 +528,7 @@ if [[ "$SESSION_MODE" == "2" ]]; then
     exit 1
   fi
 
-  df_output=$(df -Hl | awk 'NR>1' | grep -v "My Passport" | awk '{print $2, $3, $NF}' | sed '/^Size /d')
+df_output=$(df -Hl | awk 'NR>1' | grep -v "My Passport" | grep -vi "ontrack" | awk '{print $2, $3, $NF}' | sed '/^Size /d')
 
   largest_bytes=0
   largest_mount=""
