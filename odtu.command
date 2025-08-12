@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Ontrack Transfer Utility - V1.1419 ===
+# === Ontrack Transfer Utility - V1.1420 ===
 # Adds optional rsync and dd (hybrid) support alongside tar transfer
 # Now supports both local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
@@ -15,7 +15,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1419 (tar, rsync, or dd-hybrid)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1420 (tar, rsync, or dd-hybrid)"
 echo ""
 
 
@@ -86,13 +86,21 @@ normalize_path() {
 # Enable readline-based filename completion for read prompts (Tab works).
 # Only binds when running in an interactive TTY to avoid weirdness in pipes.
 enable_readline_path_completion() {
-  if [[ -t 0 && -t 1 ]]; then
-    bind 'set completion-ignore-case on'
-    bind 'set show-all-if-ambiguous on'
-    bind 'set mark-symlinked-directories on'
-    bind '"\t": complete'
-  fi
+  [[ -t 0 && -t 1 ]] || return 0
+
+  local had_errexit=0
+  case $- in
+    *e*) had_errexit=1; set +e ;;
+  esac
+
+  bind 'set completion-ignore-case on'      2>/dev/null || true
+  bind 'set show-all-if-ambiguous on'       2>/dev/null || true
+  bind 'set mark-symlinked-directories on'  2>/dev/null || true
+  bind '"\t": complete'                     2>/dev/null || true
+
+  (( had_errexit )) && set -e
 }
+
 
 edit_excludes() {
   EXCLUDES=(
@@ -289,7 +297,7 @@ fi
 
 # -- Main Script Logic Below --
 echo "🎯 Running with Full Disk Access (or in RecoveryOS)."
-enable_readline_path_completion
+enable_readline_path_completion || true
 
 # Your script's main logic here...
 
