@@ -54,7 +54,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1422-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1424-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
@@ -369,7 +369,26 @@ find_largest_volume() {
   if [[ -n "${job_filter}" ]]; then
     df_output=$(echo "${df_output}" | grep -v "${job_filter}")
   fi
-  df_output=$(echo "${df_output}" | grep -vi "ontrack" | sed '/^$/d')
+
+  # Check for Ontrack-named volumes before filtering them out
+  local ontrack_volumes=""
+  ontrack_volumes=$(echo "${df_output}" | grep -i "ontrack" || true)
+  if [[ -n "${ontrack_volumes}" ]]; then
+    echo ""
+    echo "⚠️  The following volume(s) contain 'Ontrack' in their name and were filtered:"
+    echo "${ontrack_volumes}" | while IFS= read -r ov; do
+      local ov_mount
+      ov_mount=$(echo "${ov}" | awk '{for(i=3;i<=NF;i++) printf "%s%s", $i, (i<NF?" ":""); print ""}')
+      echo "    - ${ov_mount}"
+    done
+    read -rp "Include Ontrack volume(s) anyway? (y/N): " include_ontrack
+    if [[ "${include_ontrack}" =~ ^[Yy]$ ]]; then
+      echo "✅ Including Ontrack volume(s) in detection."
+    else
+      df_output=$(echo "${df_output}" | grep -vi "ontrack")
+    fi
+  fi
+  df_output=$(echo "${df_output}" | sed '/^$/d')
 
   local largest_bytes=0
   local largest_mount=""
@@ -424,10 +443,37 @@ select_source_volume() {
     fi
   fi
 
+  # If we're in RecoveryOS and couldn't find a real data volume, warn the user.
+  # A missing/empty suggestion or a very small volume (< 1GB) likely means the
+  # customer data volume hasn't been mounted yet.
+  if is_recovery_os && [[ -z "${suggested}" || ! -d "${suggested}" ]]; then
+    echo ""
+    echo "⚠️  No suitable data volume was detected."
+    echo "   In RecoveryOS, the customer data volume must be mounted manually"
+    echo "   before running this script."
+    echo ""
+    echo "   To mount it:"
+    echo "   1. Open Disk Utility (Menu bar → Utilities → Disk Utility)"
+    echo "   2. Select the customer's Data volume in the sidebar"
+    echo "   3. Click 'Mount'"
+    echo "   4. Note the mount path shown (e.g. /Volumes/Macintosh HD - Data)"
+    echo ""
+    read -rp "Press Enter to continue and manually specify the path, or Ctrl+C to exit and mount first: " _
+  fi
+
   echo "📝 Detection method: ${method}"
   read -e -r -p "Press Enter to accept [${suggested}], or type/drag a different path (Tab to autocomplete): " custom_volume
   SRC_VOL="${custom_volume:-${suggested}}"
   SRC_VOL="$(normalize_path "${SRC_VOL}")"
+
+  # Validate the selected source path exists
+  if [[ ! -d "${SRC_VOL}" ]]; then
+    echo "❌ Source path does not exist: ${SRC_VOL}"
+    if is_recovery_os; then
+      echo "   Ensure the data volume is mounted in Disk Utility and try again."
+    fi
+    exit 1
+  fi
 
   if [[ -n "${LOG_FILE}" ]]; then
     log_msg "Source volume: ${SRC_VOL} (detected via: ${method})"
@@ -442,18 +488,19 @@ build_rsync_flags() {
   # Base flags: archive, hard links, one-filesystem
   RSYNC_FLAGS=(-a -H -x)
 
-  # -E means DIFFERENT things depending on the rsync build:
-  #   - Apple's rsync 2.6.9:  -E = --extended-attributes (resource forks, HFS metadata)
-  #   - Standard rsync 3.x:   -E = --executability (preserve execute bit only)
-  # When a local rsync 3.x talks to a remote Apple 2.6.9, -E causes a protocol
-  # mismatch that can stall/hang on files with resource forks.
-  # For local transfers (both sides use our downloaded binary) -E is safe.
-  # For remote transfers (receiver is likely Apple 2.6.9) we skip it.
+  # In this rsync 3.x binary:
+  #   -E = --executability  (preserve execute bit only)
+  #   -X = --xattrs         (preserve extended attributes / resource forks)
+  # Apple's system rsync 2.6.9 uses -E for extended attributes, which is
+  # incompatible.  For local transfers (single process, no remote rsync)
+  # we enable both -E and -X for full metadata fidelity.  For remote
+  # transfers the receiver is likely Apple 2.6.9, so we skip both to
+  # avoid protocol mismatch.
   if [[ "${mode}" != "remote" ]]; then
-    RSYNC_FLAGS+=(-E)
-    echo "✅ Extended attributes (-E) enabled for local transfer."
+    RSYNC_FLAGS+=(-E -X)
+    echo "✅ Executability (-E) and extended attributes (-X) enabled for local transfer."
   else
-    echo "ℹ️  Skipping -E for remote transfer (avoids protocol mismatch with Apple rsync)."
+    echo "ℹ️  Skipping -E/-X for remote transfer (avoids protocol mismatch with Apple rsync)."
   fi
 
   # --protect-args (-s) requires rsync 3.0+ on BOTH sides.
