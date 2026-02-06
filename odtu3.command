@@ -1,5 +1,5 @@
 #!/bin/bash
-# === Ontrack Transfer Utility - V1.1420-hardened ===
+# === Ontrack Transfer Utility - V1.1421-hardened ===
 # Adds optional rsync and tar support alongside local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
 # Hardened: strict mode, quoting, APFS detection, logging, integrity checks
@@ -46,7 +46,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ── Banner ───────────────────────────────────────────────────────────────────
-clear
+clear 2>/dev/null || true
 echo ""
 echo "██████╗ ███╗   ██╗████████╗██████╗  █████╗  ██████╗██╗  ██╗"
 echo "██╔═══██╗████╗  ██║╚══██╔══╝██╔══██╗██╔══██╗██╔════╝██║ ██╔╝"
