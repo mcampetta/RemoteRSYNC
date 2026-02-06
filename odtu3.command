@@ -1,5 +1,5 @@
 #!/bin/bash
-# === Ontrack Transfer Utility - V1.1421-hardened ===
+# === Ontrack Transfer Utility - V1.1420-hardened ===
 # Adds optional rsync and tar support alongside local and remote copy sessions
 # Uses downloaded binaries to avoid RecoveryOS tool limitations
 # Hardened: strict mode, quoting, APFS detection, logging, integrity checks
@@ -54,7 +54,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1420-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1422-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
@@ -259,10 +259,10 @@ choose_rsync_runtime_mode() {
 
   if [[ "${RSYNC_MODE}" == "2" ]]; then
     RSYNC_RUNTIME_OPTS+=(--partial --partial-dir=.rsync-partial --ignore-errors)
-    # --timeout is an I/O timeout (safe over SSH and daemon).
-    # --contimeout is daemon-only, so we skip it; SSH connection timeout
-    # is already handled via SSH_OPTIONS (-o ConnectTimeout=10).
-    RSYNC_RUNTIME_OPTS+=(--timeout=30)
+    # No --timeout here: in best-effort mode we want resilience over speed.
+    # RecoveryOS volumes and damaged drives can stall reads well beyond 30s.
+    # SSH keepalives (ServerAliveInterval in SSH_OPTIONS) already detect
+    # dead connections without killing slow-but-progressing transfers.
 
     # Prefer progress2 if supported (rsync 3.x). Otherwise fallback to --progress.
     if "${RSYNC_PATH}" --help 2>&1 | grep -q -- 'progress2'; then
@@ -271,7 +271,10 @@ choose_rsync_runtime_mode() {
       RSYNC_RUNTIME_OPTS+=(--progress)
     fi
   else
-    # Strict: keep default behavior but still show progress
+    # Strict: fail on errors but add a generous safety timeout so rsync
+    # can never hang indefinitely (e.g. protocol mismatch, stuck read).
+    # 5 minutes of zero I/O is well beyond any normal disk stall.
+    RSYNC_RUNTIME_OPTS+=(--timeout=300)
     if "${RSYNC_PATH}" --help 2>&1 | grep -q -- 'progress2'; then
       RSYNC_RUNTIME_OPTS+=(--info=progress2)
     else
@@ -436,8 +439,22 @@ select_source_volume() {
 # remote rsync to also support them (e.g. --protect-args / -s).
 build_rsync_flags() {
   local mode="${1:-local}"
-  # Base flags: archive, extended attrs, hard links, one-filesystem
-  RSYNC_FLAGS=(-a -E -H -x)
+  # Base flags: archive, hard links, one-filesystem
+  RSYNC_FLAGS=(-a -H -x)
+
+  # -E means DIFFERENT things depending on the rsync build:
+  #   - Apple's rsync 2.6.9:  -E = --extended-attributes (resource forks, HFS metadata)
+  #   - Standard rsync 3.x:   -E = --executability (preserve execute bit only)
+  # When a local rsync 3.x talks to a remote Apple 2.6.9, -E causes a protocol
+  # mismatch that can stall/hang on files with resource forks.
+  # For local transfers (both sides use our downloaded binary) -E is safe.
+  # For remote transfers (receiver is likely Apple 2.6.9) we skip it.
+  if [[ "${mode}" != "remote" ]]; then
+    RSYNC_FLAGS+=(-E)
+    echo "✅ Extended attributes (-E) enabled for local transfer."
+  else
+    echo "ℹ️  Skipping -E for remote transfer (avoids protocol mismatch with Apple rsync)."
+  fi
 
   # --protect-args (-s) requires rsync 3.0+ on BOTH sides.
   # The remote Mac may only have the old system rsync 2.6.9, so we only
@@ -452,11 +469,16 @@ build_rsync_flags() {
   fi
 
   # Check if rsync supports ACLs (-A)
-  if "${RSYNC_PATH}" --help 2>&1 | grep -q -- '-A.*ACLs\|--acls'; then
-    RSYNC_FLAGS+=(-A)
-    echo "✅ rsync supports ACLs (-A), enabled."
+  # ACLs also require both sides to agree, so skip for remote.
+  if [[ "${mode}" != "remote" ]]; then
+    if "${RSYNC_PATH}" --help 2>&1 | grep -q -- '-A.*ACLs\|--acls'; then
+      RSYNC_FLAGS+=(-A)
+      echo "✅ rsync supports ACLs (-A), enabled."
+    else
+      echo "⚠️  rsync does not support ACLs (-A), skipping. Metadata may be incomplete."
+    fi
   else
-    echo "⚠️  rsync does not support ACLs (-A), skipping. Metadata may be incomplete."
+    echo "ℹ️  Skipping ACLs (-A) for remote transfer (remote rsync may not support it)."
   fi
 }
 
