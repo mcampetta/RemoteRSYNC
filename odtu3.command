@@ -54,7 +54,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1424-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1425-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
@@ -104,8 +104,12 @@ log_tool_versions() {
 
 # ── Caffeinate ───────────────────────────────────────────────────────────────
 start_caffeinate() {
-  caffeinate -dimsu &
-  CAFFEINATE_PID=$!
+  if command -v caffeinate >/dev/null 2>&1; then
+    caffeinate -dimsu &
+    CAFFEINATE_PID=$!
+  else
+    echo "ℹ️  caffeinate not available (RecoveryOS) — skipping sleep prevention."
+  fi
 }
 
 stop_caffeinate() {
@@ -217,7 +221,7 @@ edit_excludes() {
         if [[ ${idx} -ge 0 && ${idx} -lt ${#EXCLUDES[@]} ]]; then
           echo "❌ Removed: ${EXCLUDES[$idx]}"
           unset 'EXCLUDES[idx]'
-          EXCLUDES=("${EXCLUDES[@]}")
+          EXCLUDES=(${EXCLUDES[@]+"${EXCLUDES[@]}"})
         else
           echo "⚠️ Invalid index."
         fi
@@ -236,7 +240,7 @@ edit_excludes() {
 compile_exclude_flags() {
   RSYNC_EXCLUDES=()
   TAR_EXCLUDES=()
-  for excl in "${EXCLUDES[@]}"; do
+  for excl in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do
     RSYNC_EXCLUDES+=(--exclude="${excl}")
     TAR_EXCLUDES+=(--exclude="${excl}")
   done
@@ -283,7 +287,7 @@ choose_rsync_runtime_mode() {
   fi
 
   if [[ -n "${LOG_FILE}" ]]; then
-    log_msg "Rsync runtime opts: ${RSYNC_RUNTIME_OPTS[*]}"
+    log_msg "Rsync runtime opts: ${RSYNC_RUNTIME_OPTS[*]+"${RSYNC_RUNTIME_OPTS[*]}"}"
   fi
 }
 
@@ -292,6 +296,31 @@ choose_rsync_runtime_mode() {
 # Returns 0 on success, 1 on failure.
 # NOTE: Must NOT be called inside a command substitution ($(...)) or the
 #       global variables will be lost in the subshell.
+
+# Sanity-check a candidate data volume.  A real customer data volume will
+# contain a /Users directory with at least one home folder.  The synthetic
+# /System/Volumes/Data scaffold that exists in RecoveryOS (~27 MB) does not.
+_validate_data_volume() {
+  local mount="$1"
+  [[ -d "${mount}" ]] || return 1
+
+  # Primary check: look for a Users directory with at least one subfolder
+  if [[ -d "${mount}/Users" ]]; then
+    local user_count
+    user_count=$(ls -1d "${mount}/Users"/*/ 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "${user_count}" -gt 0 ]]; then
+      return 0
+    fi
+  fi
+
+  # Secondary check: a /private/var directory is also a strong signal
+  if [[ -d "${mount}/private/var" ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
 detect_apfs_data_volume() {
   DATA_DETECT_METHOD=""
   DETECTED_APFS_MOUNT=""
@@ -319,17 +348,24 @@ detect_apfs_data_volume() {
     data_mount="${data_mount#"${data_mount%%[![:space:]]*}"}"
     data_mount="${data_mount%"${data_mount##*[![:space:]]}"}"
     if [[ -n "${data_mount}" && -d "${data_mount}" ]]; then
-      DATA_DETECT_METHOD="diskutil apfs list (Data role)"
-      DETECTED_APFS_MOUNT="${data_mount}"
-      return 0
+      if _validate_data_volume "${data_mount}"; then
+        DATA_DETECT_METHOD="diskutil apfs list (Data role)"
+        DETECTED_APFS_MOUNT="${data_mount}"
+        return 0
+      else
+        echo "⚠️  Found Data volume at ${data_mount} but it appears empty (no user data)."
+        echo "   This is likely the system scaffold, not the customer data volume."
+      fi
     fi
   fi
 
-  # Method 2: well-known path
+  # Method 2: well-known path — also validate it has real content
   if [[ -d "/System/Volumes/Data" ]]; then
-    DATA_DETECT_METHOD="/System/Volumes/Data fallback"
-    DETECTED_APFS_MOUNT="/System/Volumes/Data"
-    return 0
+    if _validate_data_volume "/System/Volumes/Data"; then
+      DATA_DETECT_METHOD="/System/Volumes/Data fallback"
+      DETECTED_APFS_MOUNT="/System/Volumes/Data"
+      return 0
+    fi
   fi
 
   DATA_DETECT_METHOD=""
@@ -726,16 +762,32 @@ download_binary "${GTAR_URL}"    "${GTAR_PATH}"     "gtar"
 download_binary "${PV_URL}"      "${PV_PATH}"       "pv"
 download_binary "${SSHPASS_URL}" "${SSHPASS_PATH}"   "sshpass"
 
-# Validate binary downloads
-REQUIRED_BINS=("${RSYNC_PATH}" "${GTAR_PATH}" "${PV_PATH}" "${SSHPASS_PATH}")
-for BIN in "${REQUIRED_BINS[@]}"; do
-  if [[ ! -x "${BIN}" ]]; then
-    echo "❌ Failed to download required binary: ${BIN}"
-    echo "This is usually caused by the system clock being incorrect."
-    echo "Please update the date with:  date MMDDhhmmYYYY"
+# Validate binary downloads — check they exist, are executable, and actually
+# run (catches HTML error pages, corrupt downloads, arch mismatches).
+smoke_test_binary() {
+  local bin_path="$1" label="$2"
+  if [[ ! -x "${bin_path}" ]]; then
+    echo "❌ Failed to download ${label}: file missing or not executable."
+    echo "   This is usually caused by the system clock being incorrect."
+    echo "   Please update the date with:  date MMDDhhmmYYYY"
     exit 1
   fi
-done
+  # Run a harmless flag to confirm it's a real binary, not an HTML error page.
+  # Redirect all output; we only care about the exit code.
+  if ! "${bin_path}" --version >/dev/null 2>&1 && \
+     ! "${bin_path}" --help >/dev/null 2>&1 && \
+     ! "${bin_path}" -V >/dev/null 2>&1; then
+    echo "❌ ${label} failed smoke test — downloaded file is not a valid binary."
+    echo "   Possible causes: GitHub rate limit, 404, or architecture mismatch."
+    echo "   Try again, or check your network connection / system clock."
+    exit 1
+  fi
+}
+
+smoke_test_binary "${RSYNC_PATH}"   "rsync"
+smoke_test_binary "${GTAR_PATH}"    "gtar"
+smoke_test_binary "${PV_PATH}"      "pv"
+smoke_test_binary "${SSHPASS_PATH}" "sshpass"
 
 # Verify SHA-256 integrity (warns on mismatch, logs actual hashes)
 echo "🔐 Verifying binary integrity..."
@@ -832,7 +884,7 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
   done
 
   log_msg "Transfer method: ${TRANSFER_METHOD}"
-  log_msg "Excludes: ${EXCLUDES[*]}"
+  log_msg "Excludes: ${EXCLUDES[*]+"${EXCLUDES[*]}"}"
 
   echo "Starting local transfer using method ${TRANSFER_METHOD}..."
   start_caffeinate
@@ -846,14 +898,14 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
   if [[ "${TRANSFER_METHOD}" == "2" ]]; then
     # Tar transfer — excludes BEFORE the path argument
     cd "${SRC_VOL}" || exit 1
-    COPYFILE_DISABLE=1 "${GTAR_PATH}" -cf - "${TAR_EXCLUDES[@]}" . \
+    COPYFILE_DISABLE=1 "${GTAR_PATH}" -cf - ${TAR_EXCLUDES[@]+"${TAR_EXCLUDES[@]}"} . \
       | "${PV_PATH}" \
       | "${GTAR_PATH}" -xf - -C "${FINAL_DEST}"
   elif [[ "${TRANSFER_METHOD}" == "1" ]]; then
     # Rsync transfer with detected flags
-    "${RSYNC_PATH}" "${RSYNC_FLAGS[@]}" -v \
-      "${RSYNC_RUNTIME_OPTS[@]}" \
-      "${RSYNC_EXCLUDES[@]}" \
+    "${RSYNC_PATH}" ${RSYNC_FLAGS[@]+"${RSYNC_FLAGS[@]}"} -v \
+      ${RSYNC_RUNTIME_OPTS[@]+"${RSYNC_RUNTIME_OPTS[@]}"} \
+      ${RSYNC_EXCLUDES[@]+"${RSYNC_EXCLUDES[@]}"} \
       "${SRC_VOL}/" "${FINAL_DEST}"
   fi
 
@@ -873,6 +925,13 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
 
   echo ""
   echo "🔍 Scanning for Ontrack Receiver..."
+
+  if ! command -v nc >/dev/null 2>&1; then
+    echo "❌ 'nc' (netcat) is not available in this environment."
+    echo "   The network scan requires nc to discover listeners."
+    echo "   If in RecoveryOS, you can manually specify the receiver instead."
+    exit 1
+  fi
 
   MY_IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo "")
   if [[ -z "${MY_IP}" ]]; then
@@ -957,10 +1016,14 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
   # Print final exclude list
   echo ""
   echo "📦 Final exclude list:"
-  printf " - %s\n" "${EXCLUDES[@]}"
+  if [[ ${#EXCLUDES[@]} -gt 0 ]]; then
+    printf " - %s\n" "${EXCLUDES[@]}"
+  else
+    echo "  (none)"
+  fi
 
   log_msg "Transfer method: ${TRANSFER_METHOD}"
-  log_msg "Excludes: ${EXCLUDES[*]}"
+  log_msg "Excludes: ${EXCLUDES[*]+"${EXCLUDES[*]}"}"
 
   cd "${SRC_VOL}" || { echo "❌ Source path not found: ${SRC_VOL}"; exit 1; }
   USER_HOST="${REMOTE_USER}@${REMOTE_IP}"
@@ -993,9 +1056,9 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
       # shellcheck disable=SC2086
       "${SSHPASS_PATH}" -p "${SSH_PASSWORD}" \
         "${RSYNC_PATH}" -e "ssh ${SSH_OPTIONS}" \
-        "${RSYNC_FLAGS[@]}" -v \
-        "${RSYNC_RUNTIME_OPTS[@]}" \
-        "${RSYNC_EXCLUDES[@]}" \
+        ${RSYNC_FLAGS[@]+"${RSYNC_FLAGS[@]}"} -v \
+        ${RSYNC_RUNTIME_OPTS[@]+"${RSYNC_RUNTIME_OPTS[@]}"} \
+        ${RSYNC_EXCLUDES[@]+"${RSYNC_EXCLUDES[@]}"} \
         "${SRC_VOL}/" "${REMOTE_USER}@${REMOTE_IP}:${REMOTE_DEST}"
       ;;
     2)
@@ -1003,7 +1066,7 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
       REMOTE_TAR_CMD=$(printf 'cd %q && tar -xf -' "${REMOTE_DEST}")
       # shellcheck disable=SC2086
       COPYFILE_DISABLE=1 "${GTAR_PATH}" -cf - --totals --ignore-failed-read \
-        "${TAR_EXCLUDES[@]}" . \
+        ${TAR_EXCLUDES[@]+"${TAR_EXCLUDES[@]}"} . \
         | "${PV_PATH}" -p -t -e -b -r \
         | "${SSHPASS_PATH}" -p "${SSH_PASSWORD}" \
           ssh ${SSH_OPTIONS} "${REMOTE_USER}@${REMOTE_IP}" "${REMOTE_TAR_CMD}"
