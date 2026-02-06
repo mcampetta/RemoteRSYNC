@@ -54,7 +54,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1426-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1427-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
@@ -298,24 +298,34 @@ choose_rsync_runtime_mode() {
 #       global variables will be lost in the subshell.
 
 # Sanity-check a candidate data volume.  A real customer data volume will
-# contain a /Users directory with at least one home folder.  The synthetic
-# /System/Volumes/Data scaffold that exists in RecoveryOS (~27 MB) does not.
+# contain a /Users directory with at least one real home folder.  The synthetic
+# /System/Volumes/Data scaffold that exists in RecoveryOS (~27 MB) has only
+# system dirs like Shared, Guest, .localized — no actual user homes.
 _validate_data_volume() {
   local mount="$1"
   [[ -d "${mount}" ]] || return 1
 
-  # Primary check: look for a Users directory with at least one subfolder
+  # Look for a Users directory with at least one REAL home folder.
+  # Exclude system-only directories that exist on the scaffold.
   if [[ -d "${mount}/Users" ]]; then
-    local user_count
-    user_count=$(ls -1d "${mount}/Users"/*/ 2>/dev/null | wc -l | tr -d ' ')
-    if [[ "${user_count}" -gt 0 ]]; then
+    local real_users=0
+    local entry
+    for entry in "${mount}/Users"/*/; do
+      [[ -d "${entry}" ]] || continue
+      local basename
+      basename="$(basename "${entry}")"
+      # Skip known system directories
+      case "${basename}" in
+        Shared|Guest|.localized|_*) continue ;;
+      esac
+      # A real home folder will have Library, Desktop, or Documents
+      if [[ -d "${entry}/Library" || -d "${entry}/Desktop" || -d "${entry}/Documents" ]]; then
+        real_users=$((real_users + 1))
+      fi
+    done
+    if [[ "${real_users}" -gt 0 ]]; then
       return 0
     fi
-  fi
-
-  # Secondary check: a /private/var directory is also a strong signal
-  if [[ -d "${mount}/private/var" ]]; then
-    return 0
   fi
 
   return 1
