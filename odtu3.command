@@ -54,7 +54,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1427-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1428-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
@@ -254,35 +254,48 @@ compile_exclude_flags() {
 choose_rsync_runtime_mode() {
   RSYNC_RUNTIME_OPTS=()
 
-  echo ""
-  echo "Rsync mode:"
-  echo "1) Strict (fail on read/permission errors)"
-  echo "2) Best-effort (resume + continue past unreadable files)"
-  read -rp "Enter 1 or 2 [2]: " RSYNC_MODE
-  RSYNC_MODE="${RSYNC_MODE:-2}"
-
-  if [[ "${RSYNC_MODE}" == "2" ]]; then
+  # In limited access mode, force best-effort — strict mode would fail
+  # on every permission-denied file and abort the transfer.
+  if [[ -n "${LIMITED_ACCESS_MODE}" ]]; then
+    echo ""
+    echo "ℹ️  Limited access mode: using best-effort rsync (skips unreadable files)."
     RSYNC_RUNTIME_OPTS+=(--partial --partial-dir=.rsync-partial --ignore-errors)
-    # No --timeout here: in best-effort mode we want resilience over speed.
-    # RecoveryOS volumes and damaged drives can stall reads well beyond 30s.
-    # SSH keepalives (ServerAliveInterval in SSH_OPTIONS) already detect
-    # dead connections without killing slow-but-progressing transfers.
-
-    # Prefer progress2 if supported (rsync 3.x). Otherwise fallback to --progress.
     if "${RSYNC_PATH}" --help 2>&1 | grep -q -- 'progress2'; then
       RSYNC_RUNTIME_OPTS+=(--info=progress2)
     else
       RSYNC_RUNTIME_OPTS+=(--progress)
     fi
   else
-    # Strict: fail on errors but add a generous safety timeout so rsync
-    # can never hang indefinitely (e.g. protocol mismatch, stuck read).
-    # 5 minutes of zero I/O is well beyond any normal disk stall.
-    RSYNC_RUNTIME_OPTS+=(--timeout=300)
-    if "${RSYNC_PATH}" --help 2>&1 | grep -q -- 'progress2'; then
-      RSYNC_RUNTIME_OPTS+=(--info=progress2)
+    echo ""
+    echo "Rsync mode:"
+    echo "1) Strict (fail on read/permission errors)"
+    echo "2) Best-effort (resume + continue past unreadable files)"
+    read -rp "Enter 1 or 2 [2]: " RSYNC_MODE
+    RSYNC_MODE="${RSYNC_MODE:-2}"
+
+    if [[ "${RSYNC_MODE}" == "2" ]]; then
+      RSYNC_RUNTIME_OPTS+=(--partial --partial-dir=.rsync-partial --ignore-errors)
+      # No --timeout here: in best-effort mode we want resilience over speed.
+      # RecoveryOS volumes and damaged drives can stall reads well beyond 30s.
+      # SSH keepalives (ServerAliveInterval in SSH_OPTIONS) already detect
+      # dead connections without killing slow-but-progressing transfers.
+
+      # Prefer progress2 if supported (rsync 3.x). Otherwise fallback to --progress.
+      if "${RSYNC_PATH}" --help 2>&1 | grep -q -- 'progress2'; then
+        RSYNC_RUNTIME_OPTS+=(--info=progress2)
+      else
+        RSYNC_RUNTIME_OPTS+=(--progress)
+      fi
     else
-      RSYNC_RUNTIME_OPTS+=(--progress)
+      # Strict: fail on errors but add a generous safety timeout so rsync
+      # can never hang indefinitely (e.g. protocol mismatch, stuck read).
+      # 5 minutes of zero I/O is well beyond any normal disk stall.
+      RSYNC_RUNTIME_OPTS+=(--timeout=300)
+      if "${RSYNC_PATH}" --help 2>&1 | grep -q -- 'progress2'; then
+        RSYNC_RUNTIME_OPTS+=(--info=progress2)
+      else
+        RSYNC_RUNTIME_OPTS+=(--progress)
+      fi
     fi
   fi
 
@@ -732,20 +745,50 @@ APPLESCRIPT
 }
 
 # ── FDA main check ───────────────────────────────────────────────────────────
+# LIMITED_ACCESS_MODE: when set, the script runs with whatever permissions the
+# current user has.  Some system-protected files will be unreadable, but the
+# user's own files (Desktop, Documents, Downloads, etc.) are still accessible.
+LIMITED_ACCESS_MODE=""
+
 if is_recovery_os; then
   echo "🛠 Detected RecoveryOS — skipping Full Disk Access check."
 else
   if [[ ! -f "${MARKER_FILE}" ]]; then
     if ! check_fda; then
-      prompt_fda_enable
-      echo "🌀 Relaunching script with Full Disk Access..."
-      spawn_new_terminal_and_close_self
-      exit 0
+      echo ""
+      echo "Options:"
+      echo "  1) Grant Full Disk Access (recommended — copies ALL files)"
+      echo "  2) Continue without FDA (limited — copies only user-accessible files)"
+      echo ""
+      echo "  Option 2 is useful when Full Disk Access cannot be granted"
+      echo "  (e.g. MDM-locked machines, no admin credentials)."
+      echo "  The transfer will skip files that require elevated permissions"
+      echo "  but will still capture the user's home folder data."
+      echo ""
+      read -rp "Enter 1 or 2 [1]: " fda_choice
+      fda_choice="${fda_choice:-1}"
+
+      if [[ "${fda_choice}" == "2" ]]; then
+        LIMITED_ACCESS_MODE="1"
+        echo ""
+        echo "⚠️  Running in LIMITED ACCESS mode."
+        echo "   Some system-protected files will be skipped."
+        echo "   User home folder data will still be transferred."
+      else
+        prompt_fda_enable
+        echo "🌀 Relaunching script with Full Disk Access..."
+        spawn_new_terminal_and_close_self
+        exit 0
+      fi
     fi
   fi
 fi
 
-echo "🎯 Running with Full Disk Access (or in RecoveryOS)."
+if [[ -n "${LIMITED_ACCESS_MODE}" ]]; then
+  echo "🔒 Running in LIMITED ACCESS mode (user-accessible files only)."
+else
+  echo "🎯 Running with Full Disk Access (or in RecoveryOS)."
+fi
 enable_readline_path_completion || true
 rm -f "${MARKER_FILE}"
 
@@ -862,7 +905,7 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
 
   # Initialize logging into the destination
   init_log "${DEST_PATH}"
-  log_msg "Mode: Local Session"
+  log_msg "Mode: Local Session${LIMITED_ACCESS_MODE:+ (LIMITED ACCESS)}"
   log_msg "Job number: ${JOB_NUM}"
   log_msg "Source: ${SRC_VOL}"
   log_msg "Destination: ${DEST_PATH}"
@@ -908,7 +951,12 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
   if [[ "${TRANSFER_METHOD}" == "2" ]]; then
     # Tar transfer — excludes BEFORE the path argument
     cd "${SRC_VOL}" || exit 1
-    COPYFILE_DISABLE=1 "${GTAR_PATH}" -cf - ${TAR_EXCLUDES[@]+"${TAR_EXCLUDES[@]}"} . \
+    local tar_extra_flags=""
+    if [[ -n "${LIMITED_ACCESS_MODE}" ]]; then
+      tar_extra_flags="--ignore-failed-read"
+    fi
+    # shellcheck disable=SC2086
+    COPYFILE_DISABLE=1 "${GTAR_PATH}" -cf - ${tar_extra_flags} ${TAR_EXCLUDES[@]+"${TAR_EXCLUDES[@]}"} . \
       | "${PV_PATH}" \
       | "${GTAR_PATH}" -xf - -C "${FINAL_DEST}"
   elif [[ "${TRANSFER_METHOD}" == "1" ]]; then
@@ -996,7 +1044,7 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
 
   # Initialize logging in TMP_DIR (will copy to dest later if accessible)
   init_log "${TMP_DIR}"
-  log_msg "Mode: Remote Session"
+  log_msg "Mode: Remote Session${LIMITED_ACCESS_MODE:+ (LIMITED ACCESS)}"
   log_msg "Source: ${SRC_VOL}"
   log_msg "Remote: ${REMOTE_USER}@${REMOTE_IP}:${REMOTE_DEST}"
   log_tool_versions
