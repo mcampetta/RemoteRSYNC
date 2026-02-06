@@ -54,7 +54,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1428-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1429-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
@@ -884,8 +884,8 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
     echo "✅ External drive detected. Formatting..."
 
     MP_DEV_ID=$(diskutil info -plist "/Volumes/My Passport" 2>/dev/null | \
-      plutil -extract DeviceIdentifier xml1 -o - - | \
-      grep -oE "disk[0-9]+s[0-9]+")
+      plutil -extract DeviceIdentifier xml1 -o - - 2>/dev/null | \
+      grep -oE "disk[0-9]+s[0-9]+" || true)
 
     if [[ -z "${MP_DEV_ID}" ]]; then
       echo "❌ Could not locate volume for 'My Passport'."
@@ -1160,9 +1160,9 @@ if [[ "${SESSION_MODE}" == "3" ]]; then
     echo "💽 'My Passport' drive detected."
     read -rp "📦 Enter job number to format drive as: " JOB_NUM
 
-    VOLUME_DEVICE=$(diskutil info -plist "/Volumes/My Passport" | \
-      plutil -extract DeviceIdentifier xml1 -o - - | \
-      grep -oE "disk[0-9]+s[0-9]+")
+    VOLUME_DEVICE=$(diskutil info -plist "/Volumes/My Passport" 2>/dev/null | \
+      plutil -extract DeviceIdentifier xml1 -o - - 2>/dev/null | \
+      grep -oE "disk[0-9]+s[0-9]+" || true)
 
     if [[ -z "${VOLUME_DEVICE}" ]]; then
       echo "❌ Could not get device identifier for 'My Passport'"
