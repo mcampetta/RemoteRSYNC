@@ -259,8 +259,10 @@ choose_rsync_runtime_mode() {
 
   if [[ "${RSYNC_MODE}" == "2" ]]; then
     RSYNC_RUNTIME_OPTS+=(--partial --partial-dir=.rsync-partial --ignore-errors)
-    # Useful on Wi-Fi/remote transfers; safe locally too
-    RSYNC_RUNTIME_OPTS+=(--timeout=30 --contimeout=10)
+    # --timeout is an I/O timeout (safe over SSH and daemon).
+    # --contimeout is daemon-only, so we skip it; SSH connection timeout
+    # is already handled via SSH_OPTIONS (-o ConnectTimeout=10).
+    RSYNC_RUNTIME_OPTS+=(--timeout=30)
 
     # Prefer progress2 if supported (rsync 3.x). Otherwise fallback to --progress.
     if "${RSYNC_PATH}" --help 2>&1 | grep -q -- 'progress2'; then
@@ -283,9 +285,13 @@ choose_rsync_runtime_mode() {
 }
 
 # ── APFS Data volume detection ───────────────────────────────────────────────
-# Returns the detected mount point on stdout.  Sets DATA_DETECT_METHOD.
+# Sets DETECTED_APFS_MOUNT and DATA_DETECT_METHOD as global variables.
+# Returns 0 on success, 1 on failure.
+# NOTE: Must NOT be called inside a command substitution ($(...)) or the
+#       global variables will be lost in the subshell.
 detect_apfs_data_volume() {
   DATA_DETECT_METHOD=""
+  DETECTED_APFS_MOUNT=""
 
   # Method 1: diskutil apfs list — look for the Data role volume
   if command -v diskutil >/dev/null 2>&1; then
@@ -311,7 +317,7 @@ detect_apfs_data_volume() {
     data_mount="${data_mount%"${data_mount##*[![:space:]]}"}"
     if [[ -n "${data_mount}" && -d "${data_mount}" ]]; then
       DATA_DETECT_METHOD="diskutil apfs list (Data role)"
-      echo "${data_mount}"
+      DETECTED_APFS_MOUNT="${data_mount}"
       return 0
     fi
   fi
@@ -319,7 +325,7 @@ detect_apfs_data_volume() {
   # Method 2: well-known path
   if [[ -d "/System/Volumes/Data" ]]; then
     DATA_DETECT_METHOD="/System/Volumes/Data fallback"
-    echo "/System/Volumes/Data"
+    DETECTED_APFS_MOUNT="/System/Volumes/Data"
     return 0
   fi
 
@@ -347,6 +353,9 @@ convert_to_bytes() {
 
 find_largest_volume() {
   local job_filter="${1:-}"
+  DETECTED_MOUNT=""
+  DETECTED_USED=""
+  DETECTED_TOTAL=""
   local df_output
   df_output=$(df -Hl | awk 'NR>1 {
     # Reconstruct mount point from field 9 onwards
@@ -396,10 +405,9 @@ select_source_volume() {
 
   echo "🔍 Searching for customer source volume..."
 
-  # Try APFS Data volume detection first
-  local apfs_mount=""
-  if apfs_mount=$(detect_apfs_data_volume); then
-    suggested="${apfs_mount}"
+  # Try APFS Data volume detection first (called directly, NOT in a subshell)
+  if detect_apfs_data_volume; then
+    suggested="${DETECTED_APFS_MOUNT}"
     method="${DATA_DETECT_METHOD}"
     echo "📀 Detected APFS Data volume: ${suggested} (via ${method})"
   else
@@ -424,9 +432,24 @@ select_source_volume() {
 }
 
 # ── Rsync feature detection ─────────────────────────────────────────────────
+# Accepts an optional argument: "remote" to skip flags that require the
+# remote rsync to also support them (e.g. --protect-args / -s).
 build_rsync_flags() {
-  # Base flags: archive, extended attrs, hard links, one-filesystem, protect-args
-  RSYNC_FLAGS=(-a -E -H -x --protect-args)
+  local mode="${1:-local}"
+  # Base flags: archive, extended attrs, hard links, one-filesystem
+  RSYNC_FLAGS=(-a -E -H -x)
+
+  # --protect-args (-s) requires rsync 3.0+ on BOTH sides.
+  # The remote Mac may only have the old system rsync 2.6.9, so we only
+  # enable it for local transfers where both sides use our downloaded binary.
+  if [[ "${mode}" != "remote" ]]; then
+    if "${RSYNC_PATH}" --help 2>&1 | grep -q -- '--protect-args\|-s'; then
+      RSYNC_FLAGS+=(--protect-args)
+      echo "✅ rsync supports --protect-args, enabled."
+    fi
+  else
+    echo "ℹ️  Skipping --protect-args for remote transfer (remote rsync may be older)."
+  fi
 
   # Check if rsync supports ACLs (-A)
   if "${RSYNC_PATH}" --help 2>&1 | grep -q -- '-A.*ACLs\|--acls'; then
@@ -441,16 +464,15 @@ build_rsync_flags() {
 # Expected SHA-256 hashes for downloaded binaries.
 # TODO: Populate these with actual hashes from verified release artifacts.
 # When empty, verification is skipped but actual hashes are still logged.
-declare -A EXPECTED_SHA256=(
-  [rsync_x86_64]=""
-  [rsync_arm64]=""
-  [gtar_x86_64]=""
-  [gtar_arm64]=""
-  [pv_x86_64]=""
-  [pv_arm64]=""
-  [sshpass_x86_64]=""
-  [sshpass_arm]=""
-)
+# NOTE: Using plain variables instead of associative arrays for bash 3.2 compat.
+HASH_RSYNC_X86_64=""
+HASH_RSYNC_ARM64=""
+HASH_GTAR_X86_64=""
+HASH_GTAR_ARM64=""
+HASH_PV_X86_64=""
+HASH_PV_ARM64=""
+HASH_SSHPASS_X86_64=""
+HASH_SSHPASS_ARM=""
 
 verify_sha256() {
   local file_path="$1" label="$2" expected_hash="${3:-}"
@@ -488,19 +510,19 @@ if [[ "${ARCH}" == "x86_64" ]]; then
   GTAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/tar_x86_64"
   PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/pv_x86_64"
   SSHPASS_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/sshpass_x86_64"
-  HASH_RSYNC="${EXPECTED_SHA256[rsync_x86_64]}"
-  HASH_GTAR="${EXPECTED_SHA256[gtar_x86_64]}"
-  HASH_PV="${EXPECTED_SHA256[pv_x86_64]}"
-  HASH_SSHPASS="${EXPECTED_SHA256[sshpass_x86_64]}"
+  HASH_RSYNC="${HASH_RSYNC_X86_64}"
+  HASH_GTAR="${HASH_GTAR_X86_64}"
+  HASH_PV="${HASH_PV_X86_64}"
+  HASH_SSHPASS="${HASH_SSHPASS_X86_64}"
 elif [[ "${ARCH}" == "arm64" ]]; then
   RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/rsync_arm64"
   GTAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/tar_arm64"
   PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/pv_arm64"
   SSHPASS_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/sshpass_arm"
-  HASH_RSYNC="${EXPECTED_SHA256[rsync_arm64]}"
-  HASH_GTAR="${EXPECTED_SHA256[gtar_arm64]}"
-  HASH_PV="${EXPECTED_SHA256[pv_arm64]}"
-  HASH_SSHPASS="${EXPECTED_SHA256[sshpass_arm]}"
+  HASH_RSYNC="${HASH_RSYNC_ARM64}"
+  HASH_GTAR="${HASH_GTAR_ARM64}"
+  HASH_PV="${HASH_PV_ARM64}"
+  HASH_SSHPASS="${HASH_SSHPASS_ARM}"
 else
   echo "❌ Unsupported architecture: ${ARCH}"
   exit 1
@@ -653,8 +675,8 @@ verify_sha256 "${GTAR_PATH}"    "gtar"    "${HASH_GTAR}"  || true
 verify_sha256 "${PV_PATH}"      "pv"      "${HASH_PV}"    || true
 verify_sha256 "${SSHPASS_PATH}" "sshpass"  "${HASH_SSHPASS}" || true
 
-# Detect rsync capabilities
-build_rsync_flags
+# NOTE: build_rsync_flags is called per-mode below (local vs remote)
+# to handle flag compatibility with the remote rsync version.
 
 ###############################################################################
 # Mode selection                                                              #
@@ -716,6 +738,7 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
   log_tool_versions
 
   init_default_excludes
+  build_rsync_flags "local"
 
   while true; do
     echo ""
@@ -841,6 +864,7 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
   log_tool_versions
 
   init_default_excludes
+  build_rsync_flags "remote"
 
   while true; do
     echo ""
