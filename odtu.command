@@ -44,6 +44,7 @@ cleanup() {
   exit "${ec}"
 }
 trap cleanup EXIT
+trap 'echo ""; echo "👋 Interrupted."; exit 130' INT
 
 # ── Banner ───────────────────────────────────────────────────────────────────
 clear 2>/dev/null || true
@@ -54,7 +55,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1434-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1435-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
