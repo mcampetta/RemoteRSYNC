@@ -55,7 +55,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1436-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1437-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
@@ -910,54 +910,55 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
 
     # Try multiple methods to get the device identifier — NTFS and other
     # non-native filesystems may not respond to all of these.
+    # Each result is validated: must match diskNsN or diskN pattern.
+    # (e.g. stat returns "???" for NTFS which must be rejected)
     MP_DEV_ID=""
+    _try_dev_id() {
+      local candidate="$1" method="$2"
+      candidate="${candidate#/dev/}"  # strip /dev/ prefix
+      if [[ "${candidate}" =~ ^disk[0-9]+(s[0-9]+)?$ ]]; then
+        echo "  ✅ ${method}: ${candidate}"
+        MP_DEV_ID="${candidate}"
+        return 0
+      elif [[ -n "${candidate}" ]]; then
+        echo "  ⚠️  ${method} returned '${candidate}' (not a valid disk ID, skipping)"
+      fi
+      return 1
+    }
 
     # Method 1: diskutil info (works for HFS+/APFS)
+    _try_dev_id "$(diskutil info "/Volumes/My Passport" 2>/dev/null | \
+      awk '/Device Identifier:/ {print $NF}' || true)" "diskutil info" || true
+
+    # Method 2: stat (queries the filesystem directly)
     if [[ -z "${MP_DEV_ID}" ]]; then
-      MP_DEV_ID=$(diskutil info "/Volumes/My Passport" 2>/dev/null | \
-        awk '/Device Identifier:/ {print $NF}' || true)
-      [[ -n "${MP_DEV_ID}" ]] && echo "  ℹ️  Method 1 (diskutil info): ${MP_DEV_ID}"
+      _try_dev_id "$(stat -f%Sd "/Volumes/My Passport" 2>/dev/null || true)" "stat" || true
     fi
 
-    # Method 2: stat (queries the filesystem directly — works for NTFS/exFAT)
+    # Method 3: df
     if [[ -z "${MP_DEV_ID}" ]]; then
-      MP_DEV_ID=$(stat -f%Sd "/Volumes/My Passport" 2>/dev/null || true)
-      [[ -n "${MP_DEV_ID}" ]] && echo "  ℹ️  Method 2 (stat): ${MP_DEV_ID}"
-    fi
-
-    # Method 3: df (most universal — any mounted filesystem)
-    if [[ -z "${MP_DEV_ID}" ]]; then
-      MP_DEV_ID=$(df "/Volumes/My Passport" 2>/dev/null | \
-        awk 'NR==2{print $1}' | sed 's|/dev/||' || true)
-      [[ -n "${MP_DEV_ID}" ]] && echo "  ℹ️  Method 3 (df): ${MP_DEV_ID}"
+      _try_dev_id "$(df "/Volumes/My Passport" 2>/dev/null | \
+        awk 'NR==2{print $1}' || true)" "df" || true
     fi
 
     # Method 4: diskutil list — search all disks for "My Passport" by name
     if [[ -z "${MP_DEV_ID}" ]]; then
-      MP_DEV_ID=$(diskutil list 2>/dev/null | \
-        awk '/My Passport/{print $NF}' | head -1 || true)
-      [[ -n "${MP_DEV_ID}" ]] && echo "  ℹ️  Method 4 (diskutil list): ${MP_DEV_ID}"
+      _try_dev_id "$(diskutil list 2>/dev/null | \
+        awk '/My Passport/{print $NF}' | head -1 || true)" "diskutil list" || true
     fi
 
     if [[ -z "${MP_DEV_ID}" ]]; then
       echo "❌ Could not locate device for 'My Passport'."
-      echo "   The drive is visible but its device identifier could not be determined."
-      echo "   Diagnostic info:"
-      echo "   diskutil info: $(diskutil info "/Volumes/My Passport" 2>&1 | head -5)"
-      echo "   stat: $(stat -f%Sd "/Volumes/My Passport" 2>&1)"
-      echo "   df: $(df "/Volumes/My Passport" 2>&1 | head -2)"
+      echo "   The drive is visible but no method returned a valid disk identifier."
       exit 1
     fi
 
-    # Normalize: strip /dev/ prefix if present
-    MP_DEV_ID="${MP_DEV_ID#/dev/}"
-    echo "  ✅ Found device: ${MP_DEV_ID}"
+    echo "  📀 Using device: ${MP_DEV_ID}"
 
-    # Extract the base disk (e.g. disk2s1 → disk2, disk2 → disk2)
+    # Extract the base disk (e.g. disk2s1 → disk2)
     ROOT_DISK=$(echo "${MP_DEV_ID}" | grep -oE '^disk[0-9]+' || true)
     if [[ -z "${ROOT_DISK}" ]]; then
       echo "❌ Failed to extract base disk ID from '${MP_DEV_ID}'."
-      echo "   Expected format like 'disk2s1' or 'disk2'."
       exit 1
     fi
 
@@ -1254,54 +1255,56 @@ if [[ "${SESSION_MODE}" == "3" ]]; then
       echo "⚠️ Job number cannot be empty. Please try again."
     done
 
-    # Try multiple methods to get the device identifier
+    # Try multiple methods to get the device identifier.
+    # Uses the same _try_dev_id helper defined above (validates diskNsN format).
     VOLUME_DEVICE=""
+    # Reuse _try_dev_id but write to VOLUME_DEVICE instead of MP_DEV_ID
+    _try_vol_id() {
+      local candidate="$1" method="$2"
+      candidate="${candidate#/dev/}"
+      if [[ "${candidate}" =~ ^disk[0-9]+(s[0-9]+)?$ ]]; then
+        echo "  ✅ ${method}: ${candidate}"
+        VOLUME_DEVICE="${candidate}"
+        return 0
+      elif [[ -n "${candidate}" ]]; then
+        echo "  ⚠️  ${method} returned '${candidate}' (not a valid disk ID, skipping)"
+      fi
+      return 1
+    }
 
-    # Method 1: diskutil info (works for HFS+/APFS)
+    # Method 1: diskutil info
+    _try_vol_id "$(diskutil info "/Volumes/My Passport" 2>/dev/null | \
+      awk '/Device Identifier:/ {print $NF}' || true)" "diskutil info" || true
+
+    # Method 2: stat
     if [[ -z "${VOLUME_DEVICE}" ]]; then
-      VOLUME_DEVICE=$(diskutil info "/Volumes/My Passport" 2>/dev/null | \
-        awk '/Device Identifier:/ {print $NF}' || true)
-      [[ -n "${VOLUME_DEVICE}" ]] && echo "  ℹ️  Method 1 (diskutil info): ${VOLUME_DEVICE}"
+      _try_vol_id "$(stat -f%Sd "/Volumes/My Passport" 2>/dev/null || true)" "stat" || true
     fi
 
-    # Method 2: stat (queries the filesystem directly — works for NTFS/exFAT)
+    # Method 3: df
     if [[ -z "${VOLUME_DEVICE}" ]]; then
-      VOLUME_DEVICE=$(stat -f%Sd "/Volumes/My Passport" 2>/dev/null || true)
-      [[ -n "${VOLUME_DEVICE}" ]] && echo "  ℹ️  Method 2 (stat): ${VOLUME_DEVICE}"
+      _try_vol_id "$(df "/Volumes/My Passport" 2>/dev/null | \
+        awk 'NR==2{print $1}' || true)" "df" || true
     fi
 
-    # Method 3: df (most universal — any mounted filesystem)
+    # Method 4: diskutil list — search by name
     if [[ -z "${VOLUME_DEVICE}" ]]; then
-      VOLUME_DEVICE=$(df "/Volumes/My Passport" 2>/dev/null | \
-        awk 'NR==2{print $1}' | sed 's|/dev/||' || true)
-      [[ -n "${VOLUME_DEVICE}" ]] && echo "  ℹ️  Method 3 (df): ${VOLUME_DEVICE}"
-    fi
-
-    # Method 4: diskutil list — search all disks for "My Passport" by name
-    if [[ -z "${VOLUME_DEVICE}" ]]; then
-      VOLUME_DEVICE=$(diskutil list 2>/dev/null | \
-        awk '/My Passport/{print $NF}' | head -1 || true)
-      [[ -n "${VOLUME_DEVICE}" ]] && echo "  ℹ️  Method 4 (diskutil list): ${VOLUME_DEVICE}"
+      _try_vol_id "$(diskutil list 2>/dev/null | \
+        awk '/My Passport/{print $NF}' | head -1 || true)" "diskutil list" || true
     fi
 
     if [[ -z "${VOLUME_DEVICE}" ]]; then
       echo "❌ Could not get device identifier for 'My Passport'"
-      echo "   Diagnostic info:"
-      echo "   diskutil info: $(diskutil info "/Volumes/My Passport" 2>&1 | head -5)"
-      echo "   stat: $(stat -f%Sd "/Volumes/My Passport" 2>&1)"
-      echo "   df: $(df "/Volumes/My Passport" 2>&1 | head -2)"
+      echo "   No method returned a valid disk identifier."
       exit 1
     fi
 
-    # Normalize: strip /dev/ prefix if present
-    VOLUME_DEVICE="${VOLUME_DEVICE#/dev/}"
-    echo "  ✅ Found device: ${VOLUME_DEVICE}"
+    echo "  📀 Using device: ${VOLUME_DEVICE}"
 
-    # Extract the base disk (e.g. disk2s1 → disk2, disk2 → disk2)
+    # Extract the base disk (e.g. disk2s1 → disk2)
     ROOT_DISK=$(echo "${VOLUME_DEVICE}" | grep -oE '^disk[0-9]+' || true)
     if [[ -z "${ROOT_DISK}" ]]; then
       echo "❌ Failed to extract base disk ID from '${VOLUME_DEVICE}'."
-      echo "   Expected format like 'disk2s1' or 'disk2'."
       exit 1
     fi
 
