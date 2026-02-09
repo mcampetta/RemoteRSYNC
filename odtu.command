@@ -55,7 +55,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1437-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1438-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
@@ -106,7 +106,7 @@ log_tool_versions() {
 # ── Caffeinate ───────────────────────────────────────────────────────────────
 start_caffeinate() {
   if command -v caffeinate >/dev/null 2>&1; then
-    caffeinate -dimsu &
+    caffeinate -d &
     CAFFEINATE_PID=$!
   else
     echo "ℹ️  caffeinate not available (RecoveryOS) — skipping sleep prevention."
@@ -332,10 +332,10 @@ _validate_data_volume() {
     local entry
     for entry in "${mount}/Users"/*/; do
       [[ -d "${entry}" ]] || continue
-      local basename
-      basename="$(basename "${entry}")"
+      local bname="${entry%/}"
+      bname="${bname##*/}"
       # Skip known system directories
-      case "${basename}" in
+      case "${bname}" in
         Shared|Guest|.localized|_*) continue ;;
       esac
       # A real home folder will have Library, Desktop, or Documents
@@ -675,7 +675,7 @@ SSHPASS_PATH="${TMP_DIR}/sshpass"
 SCRIPT_REALPATH="$(realpath "$0" 2>/dev/null || true)"
 if [[ -f "${SCRIPT_REALPATH}" ]]; then
   RUN_MODE="local"
-  MARKER_FILE="/tmp/$(basename "${SCRIPT_REALPATH}").fda_granted"
+  MARKER_FILE="/tmp/${SCRIPT_REALPATH##*/}.fda_granted"
 else
   RUN_MODE="remote"
   MARKER_FILE="/tmp/odtu.fda_granted"
@@ -1006,7 +1006,7 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
   echo "Starting local transfer using method ${TRANSFER_METHOD}..."
   start_caffeinate
 
-  VOL_NAME=$(basename "${SRC_VOL}")
+  VOL_NAME="${SRC_VOL##*/}"
   FINAL_DEST="${DEST_PATH}/${VOL_NAME}"
   mkdir -p "${FINAL_DEST}"
 
