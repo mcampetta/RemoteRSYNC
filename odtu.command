@@ -54,7 +54,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1431-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1432-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
@@ -883,14 +883,25 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
     while [[ ! -d "/Volumes/My Passport" ]]; do sleep 1; done
     echo "✅ External drive detected. Formatting..."
 
-    # Try diskutil first; fall back to mount table for NTFS/non-native volumes
-    MP_DEV_ID=$(diskutil info "/Volumes/My Passport" 2>/dev/null | \
-      awk '/Device Identifier:/ {print $NF}' || true)
+    # Try multiple methods to get the device identifier — NTFS and other
+    # non-native filesystems may not respond to all of these.
+    MP_DEV_ID=""
 
+    # Method 1: diskutil info (works for HFS+/APFS)
     if [[ -z "${MP_DEV_ID}" ]]; then
-      echo "  ℹ️  diskutil lookup failed, trying mount table..."
-      MP_DEV_ID=$(mount | grep "on /Volumes/My Passport " | \
-        awk '{print $1}' | sed 's|/dev/||' || true)
+      MP_DEV_ID=$(diskutil info "/Volumes/My Passport" 2>/dev/null | \
+        awk '/Device Identifier:/ {print $NF}' || true)
+    fi
+
+    # Method 2: stat (queries the filesystem directly — works for NTFS/exFAT)
+    if [[ -z "${MP_DEV_ID}" ]]; then
+      MP_DEV_ID=$(stat -f%Sd "/Volumes/My Passport" 2>/dev/null || true)
+    fi
+
+    # Method 3: df (most universal — any mounted filesystem)
+    if [[ -z "${MP_DEV_ID}" ]]; then
+      MP_DEV_ID=$(df "/Volumes/My Passport" 2>/dev/null | \
+        awk 'NR==2{print $1}' | sed 's|/dev/||' || true)
     fi
 
     if [[ -z "${MP_DEV_ID}" ]]; then
@@ -1169,14 +1180,24 @@ if [[ "${SESSION_MODE}" == "3" ]]; then
     echo "💽 'My Passport' drive detected."
     read -rp "📦 Enter job number to format drive as: " JOB_NUM
 
-    # Try diskutil first; fall back to mount table for NTFS/non-native volumes
-    VOLUME_DEVICE=$(diskutil info "/Volumes/My Passport" 2>/dev/null | \
-      awk '/Device Identifier:/ {print $NF}' || true)
+    # Try multiple methods to get the device identifier
+    VOLUME_DEVICE=""
 
+    # Method 1: diskutil info (works for HFS+/APFS)
     if [[ -z "${VOLUME_DEVICE}" ]]; then
-      echo "  ℹ️  diskutil lookup failed, trying mount table..."
-      VOLUME_DEVICE=$(mount | grep "on /Volumes/My Passport " | \
-        awk '{print $1}' | sed 's|/dev/||' || true)
+      VOLUME_DEVICE=$(diskutil info "/Volumes/My Passport" 2>/dev/null | \
+        awk '/Device Identifier:/ {print $NF}' || true)
+    fi
+
+    # Method 2: stat (queries the filesystem directly — works for NTFS/exFAT)
+    if [[ -z "${VOLUME_DEVICE}" ]]; then
+      VOLUME_DEVICE=$(stat -f%Sd "/Volumes/My Passport" 2>/dev/null || true)
+    fi
+
+    # Method 3: df (most universal — any mounted filesystem)
+    if [[ -z "${VOLUME_DEVICE}" ]]; then
+      VOLUME_DEVICE=$(df "/Volumes/My Passport" 2>/dev/null | \
+        awk 'NR==2{print $1}' | sed 's|/dev/||' || true)
     fi
 
     if [[ -z "${VOLUME_DEVICE}" ]]; then
