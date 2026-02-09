@@ -54,7 +54,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1430-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1431-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
@@ -883,13 +883,23 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
     while [[ ! -d "/Volumes/My Passport" ]]; do sleep 1; done
     echo "✅ External drive detected. Formatting..."
 
+    # Try diskutil first; fall back to mount table for NTFS/non-native volumes
     MP_DEV_ID=$(diskutil info "/Volumes/My Passport" 2>/dev/null | \
       awk '/Device Identifier:/ {print $NF}' || true)
 
     if [[ -z "${MP_DEV_ID}" ]]; then
-      echo "❌ Could not locate volume for 'My Passport'."
+      echo "  ℹ️  diskutil lookup failed, trying mount table..."
+      MP_DEV_ID=$(mount | grep "on /Volumes/My Passport " | \
+        awk '{print $1}' | sed 's|/dev/||' || true)
+    fi
+
+    if [[ -z "${MP_DEV_ID}" ]]; then
+      echo "❌ Could not locate device for 'My Passport'."
+      echo "   The drive is visible but its device identifier could not be determined."
       exit 1
     fi
+
+    echo "  ✅ Found device: ${MP_DEV_ID}"
 
     ROOT_DISK=$(echo "${MP_DEV_ID}" | sed 's/s[0-9]*$//')
     if [[ -z "${ROOT_DISK}" ]]; then
@@ -1159,8 +1169,15 @@ if [[ "${SESSION_MODE}" == "3" ]]; then
     echo "💽 'My Passport' drive detected."
     read -rp "📦 Enter job number to format drive as: " JOB_NUM
 
+    # Try diskutil first; fall back to mount table for NTFS/non-native volumes
     VOLUME_DEVICE=$(diskutil info "/Volumes/My Passport" 2>/dev/null | \
       awk '/Device Identifier:/ {print $NF}' || true)
+
+    if [[ -z "${VOLUME_DEVICE}" ]]; then
+      echo "  ℹ️  diskutil lookup failed, trying mount table..."
+      VOLUME_DEVICE=$(mount | grep "on /Volumes/My Passport " | \
+        awk '{print $1}' | sed 's|/dev/||' || true)
+    fi
 
     if [[ -z "${VOLUME_DEVICE}" ]]; then
       echo "❌ Could not get device identifier for 'My Passport'"
