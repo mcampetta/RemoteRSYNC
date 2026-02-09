@@ -55,7 +55,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1439-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1440-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
@@ -1461,26 +1461,45 @@ if [[ "${SESSION_MODE}" == "4" ]]; then
   if [[ -z "${TM_DEST}" ]]; then
     echo ""
     echo "Available volumes:"
-    # List mounted volumes excluding system ones
+    TM_VOL_LIST=()
+    TM_VOL_INDEX=1
     for vol in /Volumes/*/; do
       [[ -d "${vol}" ]] || continue
-      vol_name="${vol%/}"
-      vol_name="${vol_name##*/}"
+      vol_path="${vol%/}"
+      vol_name="${vol_path##*/}"
       case "${vol_name}" in
         Macintosh\ HD*|Recovery|Preboot|VM|Update) continue ;;
       esac
-      echo "  - ${vol_name}"
+      TM_VOL_LIST+=("${vol_path}")
+      echo "  ${TM_VOL_INDEX}) ${vol_name}"
+      TM_VOL_INDEX=$((TM_VOL_INDEX + 1))
     done
     echo ""
     while true; do
-      read -e -r -p "Enter Time Machine destination path (drag or type): " TM_DEST_INPUT
-      TM_DEST="$(normalize_path "${TM_DEST_INPUT}")"
-      if [[ -d "${TM_DEST}" ]]; then
+      read -e -r -p "Select a volume number, or drag/type a custom path: " TM_DEST_INPUT
+      # Check if input is a number matching a listed volume
+      if [[ "${TM_DEST_INPUT}" =~ ^[0-9]+$ ]] && \
+         [[ "${TM_DEST_INPUT}" -ge 1 ]] && \
+         [[ "${TM_DEST_INPUT}" -le ${#TM_VOL_LIST[@]} ]]; then
+        TM_DEST="${TM_VOL_LIST[$((TM_DEST_INPUT - 1))]}"
         break
+      elif [[ "${TM_DEST_INPUT}" =~ ^[0-9]+$ ]]; then
+        echo "⚠️ Invalid selection '${TM_DEST_INPUT}'. Please enter a number between 1 and ${#TM_VOL_LIST[@]}."
+      else
+        # Treat as a typed/dragged path
+        TM_DEST="$(normalize_path "${TM_DEST_INPUT}")"
+        if [[ -d "${TM_DEST}" ]]; then
+          break
+        fi
+        echo "⚠️ Directory does not exist: ${TM_DEST}. Please try again."
+        TM_DEST=""
       fi
-      echo "⚠️ Directory does not exist: ${TM_DEST}. Please try again."
     done
   fi
+
+  # Place Time Machine backup in a subfolder
+  TM_DEST="${TM_DEST}/Time Machine Backups"
+  mkdir -p "${TM_DEST}"
 
   # Verify the destination is writable
   if ! touch "${TM_DEST}/.tm_write_test" 2>/dev/null; then
