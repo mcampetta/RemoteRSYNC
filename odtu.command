@@ -54,7 +54,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1433-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1434-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
@@ -934,11 +934,15 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
       exit 1
     fi
 
+    # Normalize: strip /dev/ prefix if present
+    MP_DEV_ID="${MP_DEV_ID#/dev/}"
     echo "  ✅ Found device: ${MP_DEV_ID}"
 
-    ROOT_DISK=$(echo "${MP_DEV_ID}" | sed 's/s[0-9]*$//')
+    # Extract the base disk (e.g. disk2s1 → disk2, disk2 → disk2)
+    ROOT_DISK=$(echo "${MP_DEV_ID}" | grep -oE '^disk[0-9]+' || true)
     if [[ -z "${ROOT_DISK}" ]]; then
-      echo "❌ Failed to extract base disk ID."
+      echo "❌ Failed to extract base disk ID from '${MP_DEV_ID}'."
+      echo "   Expected format like 'disk2s1' or 'disk2'."
       exit 1
     fi
 
@@ -1260,7 +1264,17 @@ if [[ "${SESSION_MODE}" == "3" ]]; then
       exit 1
     fi
 
-    ROOT_DISK=$(echo "${VOLUME_DEVICE}" | sed 's/s[0-9]*$//')
+    # Normalize: strip /dev/ prefix if present
+    VOLUME_DEVICE="${VOLUME_DEVICE#/dev/}"
+    echo "  ✅ Found device: ${VOLUME_DEVICE}"
+
+    # Extract the base disk (e.g. disk2s1 → disk2, disk2 → disk2)
+    ROOT_DISK=$(echo "${VOLUME_DEVICE}" | grep -oE '^disk[0-9]+' || true)
+    if [[ -z "${ROOT_DISK}" ]]; then
+      echo "❌ Failed to extract base disk ID from '${VOLUME_DEVICE}'."
+      echo "   Expected format like 'disk2s1' or 'disk2'."
+      exit 1
+    fi
 
     echo "🧹 Erasing /dev/${ROOT_DISK} as HFS+ with name '${JOB_NUM}'..."
     sudo diskutil eraseDisk JHFS+ "${JOB_NUM}" "/dev/${ROOT_DISK}" || {
