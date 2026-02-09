@@ -55,7 +55,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1435-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1436-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
@@ -916,22 +916,36 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
     if [[ -z "${MP_DEV_ID}" ]]; then
       MP_DEV_ID=$(diskutil info "/Volumes/My Passport" 2>/dev/null | \
         awk '/Device Identifier:/ {print $NF}' || true)
+      [[ -n "${MP_DEV_ID}" ]] && echo "  ℹ️  Method 1 (diskutil info): ${MP_DEV_ID}"
     fi
 
     # Method 2: stat (queries the filesystem directly — works for NTFS/exFAT)
     if [[ -z "${MP_DEV_ID}" ]]; then
       MP_DEV_ID=$(stat -f%Sd "/Volumes/My Passport" 2>/dev/null || true)
+      [[ -n "${MP_DEV_ID}" ]] && echo "  ℹ️  Method 2 (stat): ${MP_DEV_ID}"
     fi
 
     # Method 3: df (most universal — any mounted filesystem)
     if [[ -z "${MP_DEV_ID}" ]]; then
       MP_DEV_ID=$(df "/Volumes/My Passport" 2>/dev/null | \
         awk 'NR==2{print $1}' | sed 's|/dev/||' || true)
+      [[ -n "${MP_DEV_ID}" ]] && echo "  ℹ️  Method 3 (df): ${MP_DEV_ID}"
+    fi
+
+    # Method 4: diskutil list — search all disks for "My Passport" by name
+    if [[ -z "${MP_DEV_ID}" ]]; then
+      MP_DEV_ID=$(diskutil list 2>/dev/null | \
+        awk '/My Passport/{print $NF}' | head -1 || true)
+      [[ -n "${MP_DEV_ID}" ]] && echo "  ℹ️  Method 4 (diskutil list): ${MP_DEV_ID}"
     fi
 
     if [[ -z "${MP_DEV_ID}" ]]; then
       echo "❌ Could not locate device for 'My Passport'."
       echo "   The drive is visible but its device identifier could not be determined."
+      echo "   Diagnostic info:"
+      echo "   diskutil info: $(diskutil info "/Volumes/My Passport" 2>&1 | head -5)"
+      echo "   stat: $(stat -f%Sd "/Volumes/My Passport" 2>&1)"
+      echo "   df: $(df "/Volumes/My Passport" 2>&1 | head -2)"
       exit 1
     fi
 
@@ -1247,21 +1261,35 @@ if [[ "${SESSION_MODE}" == "3" ]]; then
     if [[ -z "${VOLUME_DEVICE}" ]]; then
       VOLUME_DEVICE=$(diskutil info "/Volumes/My Passport" 2>/dev/null | \
         awk '/Device Identifier:/ {print $NF}' || true)
+      [[ -n "${VOLUME_DEVICE}" ]] && echo "  ℹ️  Method 1 (diskutil info): ${VOLUME_DEVICE}"
     fi
 
     # Method 2: stat (queries the filesystem directly — works for NTFS/exFAT)
     if [[ -z "${VOLUME_DEVICE}" ]]; then
       VOLUME_DEVICE=$(stat -f%Sd "/Volumes/My Passport" 2>/dev/null || true)
+      [[ -n "${VOLUME_DEVICE}" ]] && echo "  ℹ️  Method 2 (stat): ${VOLUME_DEVICE}"
     fi
 
     # Method 3: df (most universal — any mounted filesystem)
     if [[ -z "${VOLUME_DEVICE}" ]]; then
       VOLUME_DEVICE=$(df "/Volumes/My Passport" 2>/dev/null | \
         awk 'NR==2{print $1}' | sed 's|/dev/||' || true)
+      [[ -n "${VOLUME_DEVICE}" ]] && echo "  ℹ️  Method 3 (df): ${VOLUME_DEVICE}"
+    fi
+
+    # Method 4: diskutil list — search all disks for "My Passport" by name
+    if [[ -z "${VOLUME_DEVICE}" ]]; then
+      VOLUME_DEVICE=$(diskutil list 2>/dev/null | \
+        awk '/My Passport/{print $NF}' | head -1 || true)
+      [[ -n "${VOLUME_DEVICE}" ]] && echo "  ℹ️  Method 4 (diskutil list): ${VOLUME_DEVICE}"
     fi
 
     if [[ -z "${VOLUME_DEVICE}" ]]; then
       echo "❌ Could not get device identifier for 'My Passport'"
+      echo "   Diagnostic info:"
+      echo "   diskutil info: $(diskutil info "/Volumes/My Passport" 2>&1 | head -5)"
+      echo "   stat: $(stat -f%Sd "/Volumes/My Passport" 2>&1)"
+      echo "   df: $(df "/Volumes/My Passport" 2>&1 | head -2)"
       exit 1
     fi
 
