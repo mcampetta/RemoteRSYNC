@@ -55,7 +55,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1438-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1439-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
@@ -870,15 +870,35 @@ verify_sha256 "${SSHPASS_PATH}" "sshpass"  "${HASH_SSHPASS}" || true
 ###############################################################################
 
 echo ""
+# Time Machine option only available on normal boot (not RecoveryOS)
+TM_AVAILABLE=""
+if ! is_recovery_os && command -v tmutil >/dev/null 2>&1; then
+  TM_AVAILABLE="yes"
+fi
+
 while true; do
   echo "Please select copy mode:"
   echo "1) Local Session Copy - copy directly to an attached external drive"
   echo "2) Remote Session Copy - transfer over SSH to another Mac"
   echo "3) Setup Listener - sets this machine to recieve data over WIFI with ODTU"
-  read -rp "Enter 1, 2, or 3: " SESSION_MODE
+  if [[ -n "${TM_AVAILABLE}" ]]; then
+    echo "4) Time Machine Backup - create a Time Machine backup to an external drive"
+  fi
+  if [[ -n "${TM_AVAILABLE}" ]]; then
+    read -rp "Enter 1, 2, 3, or 4: " SESSION_MODE
+  else
+    read -rp "Enter 1, 2, or 3: " SESSION_MODE
+  fi
   case "${SESSION_MODE}" in
     1|2|3) break ;;
-    *) echo "⚠️ Invalid selection '${SESSION_MODE}'. Please enter 1, 2, or 3." ; echo "" ;;
+    4)
+      if [[ -n "${TM_AVAILABLE}" ]]; then
+        break
+      else
+        echo "⚠️ Time Machine is not available in RecoveryOS." ; echo ""
+      fi
+      ;;
+    *) echo "⚠️ Invalid selection. Please try again." ; echo "" ;;
   esac
 done
 
@@ -1357,4 +1377,204 @@ if [[ "${SESSION_MODE}" == "3" ]]; then
   while true; do
     echo "${USERNAME}:${IP}:${DESTINATION_PATH}" | nc -l "${PORT}"
   done
+fi
+
+###############################################################################
+# ═══ MODE 4: TIME MACHINE BACKUP ═════════════════════════════════════════ #
+###############################################################################
+if [[ "${SESSION_MODE}" == "4" ]]; then
+  echo "🔧 Time Machine Backup Selected"
+  echo ""
+
+  # ── Determine destination drive ──────────────────────────────────────────
+  TM_DEST=""
+
+  # Check for My Passport first
+  if [[ -d "/Volumes/My Passport" ]]; then
+    echo "💽 'My Passport' drive detected."
+    while true; do
+      read -rp "Format My Passport for Time Machine backup? (y/n): " TM_FORMAT
+      case "${TM_FORMAT}" in
+        [yY]|[yY][eE][sS])
+          while true; do
+            read -rp "📦 Enter job number to format drive as: " JOB_NUM
+            if [[ -n "${JOB_NUM}" ]]; then break; fi
+            echo "⚠️ Job number cannot be empty. Please try again."
+          done
+
+          # Detect device using the same multi-method approach
+          VOLUME_DEVICE=""
+          _try_vol_id() {
+            local candidate="$1" method="$2"
+            candidate="${candidate#/dev/}"
+            if [[ "${candidate}" =~ ^disk[0-9]+(s[0-9]+)?$ ]]; then
+              echo "  ✅ ${method}: ${candidate}"
+              VOLUME_DEVICE="${candidate}"
+              return 0
+            elif [[ -n "${candidate}" ]]; then
+              echo "  ⚠️  ${method} returned '${candidate}' (not a valid disk ID, skipping)"
+            fi
+            return 1
+          }
+
+          _try_vol_id "$(diskutil info "/Volumes/My Passport" 2>/dev/null | \
+            awk '/Device Identifier:/ {print $NF}' || true)" "diskutil info" || true
+          if [[ -z "${VOLUME_DEVICE}" ]]; then
+            _try_vol_id "$(stat -f%Sd "/Volumes/My Passport" 2>/dev/null || true)" "stat" || true
+          fi
+          if [[ -z "${VOLUME_DEVICE}" ]]; then
+            _try_vol_id "$(df "/Volumes/My Passport" 2>/dev/null | \
+              awk 'NR==2{print $1}' || true)" "df" || true
+          fi
+          if [[ -z "${VOLUME_DEVICE}" ]]; then
+            _try_vol_id "$(diskutil list 2>/dev/null | \
+              awk '/My Passport/{print $NF}' | head -1 || true)" "diskutil list" || true
+          fi
+
+          if [[ -z "${VOLUME_DEVICE}" ]]; then
+            echo "❌ Could not get device identifier for 'My Passport'"
+            exit 1
+          fi
+
+          ROOT_DISK=$(echo "${VOLUME_DEVICE}" | grep -oE '^disk[0-9]+' || true)
+          if [[ -z "${ROOT_DISK}" ]]; then
+            echo "❌ Failed to extract base disk ID from '${VOLUME_DEVICE}'."
+            exit 1
+          fi
+
+          echo "🧹 Erasing /dev/${ROOT_DISK} as HFS+ with name '${JOB_NUM}'..."
+          sudo diskutil eraseDisk JHFS+ "${JOB_NUM}" "/dev/${ROOT_DISK}" || {
+            echo "❌ Disk erase failed"
+            exit 1
+          }
+
+          TM_DEST="/Volumes/${JOB_NUM}"
+          break
+          ;;
+        [nN]|[nN][oO]) break ;;
+        *) echo "⚠️ Please enter y or n." ;;
+      esac
+    done
+  fi
+
+  # If no My Passport or user declined formatting, ask for a destination
+  if [[ -z "${TM_DEST}" ]]; then
+    echo ""
+    echo "Available volumes:"
+    # List mounted volumes excluding system ones
+    for vol in /Volumes/*/; do
+      [[ -d "${vol}" ]] || continue
+      vol_name="${vol%/}"
+      vol_name="${vol_name##*/}"
+      case "${vol_name}" in
+        Macintosh\ HD*|Recovery|Preboot|VM|Update) continue ;;
+      esac
+      echo "  - ${vol_name}"
+    done
+    echo ""
+    while true; do
+      read -e -r -p "Enter Time Machine destination path (drag or type): " TM_DEST_INPUT
+      TM_DEST="$(normalize_path "${TM_DEST_INPUT}")"
+      if [[ -d "${TM_DEST}" ]]; then
+        break
+      fi
+      echo "⚠️ Directory does not exist: ${TM_DEST}. Please try again."
+    done
+  fi
+
+  # Verify the destination is writable
+  if ! touch "${TM_DEST}/.tm_write_test" 2>/dev/null; then
+    echo "❌ Destination ${TM_DEST} is not writable."
+    exit 1
+  fi
+  rm -f "${TM_DEST}/.tm_write_test"
+
+  echo ""
+  echo "📋 Time Machine Backup Configuration:"
+  echo "  Destination: ${TM_DEST}"
+  echo ""
+
+  # ── Save and replace existing TM destination ─────────────────────────────
+  ORIGINAL_TM_DEST=""
+  ORIGINAL_TM_ID=""
+  TM_DEST_INFO=$(tmutil destinationinfo 2>/dev/null || true)
+  if [[ -n "${TM_DEST_INFO}" ]] && ! echo "${TM_DEST_INFO}" | grep -q "No destinations configured"; then
+    ORIGINAL_TM_ID=$(echo "${TM_DEST_INFO}" | awk '/ID/ {print $NF}' | head -1)
+    ORIGINAL_TM_DEST=$(echo "${TM_DEST_INFO}" | awk '/Mount Point/ {$1=$2=""; print $0}' | sed 's/^ *//' | head -1)
+    if [[ -n "${ORIGINAL_TM_DEST}" ]]; then
+      echo "ℹ️  Existing Time Machine destination detected: ${ORIGINAL_TM_DEST}"
+      echo "   It will be restored after this backup completes."
+    fi
+  fi
+
+  # ── Set destination and start backup ─────────────────────────────────────
+  echo ""
+  echo "📋 Command:"
+  echo "  sudo tmutil setdestination \"${TM_DEST}\""
+  echo "  sudo tmutil startbackup --block"
+  echo ""
+
+  while true; do
+    read -rp "Start Time Machine backup now? (y/n): " TM_CONFIRM
+    case "${TM_CONFIRM}" in
+      [yY]|[yY][eE][sS]) break ;;
+      [nN]|[nN][oO])
+        echo "👋 Cancelled."
+        exit 0
+        ;;
+      *) echo "⚠️ Please enter y or n." ;;
+    esac
+  done
+
+  start_caffeinate
+
+  echo "⏳ Setting Time Machine destination..."
+  sudo tmutil setdestination "${TM_DEST}" || {
+    echo "❌ Failed to set Time Machine destination."
+    stop_caffeinate
+    exit 1
+  }
+
+  echo "⏳ Enabling Time Machine..."
+  sudo tmutil enable || {
+    echo "❌ Failed to enable Time Machine."
+    stop_caffeinate
+    exit 1
+  }
+
+  START_TIME=${SECONDS}
+  echo "⏳ Starting Time Machine backup (this may take a while)..."
+  echo ""
+  sudo tmutil startbackup --block || {
+    echo ""
+    echo "❌ Time Machine backup failed."
+    # Attempt to restore original destination
+    if [[ -n "${ORIGINAL_TM_ID}" ]]; then
+      echo "ℹ️  Restoring original Time Machine destination..."
+      sudo tmutil setdestination "${ORIGINAL_TM_DEST}" 2>/dev/null || true
+    fi
+    stop_caffeinate
+    exit 1
+  }
+
+  ELAPSED_TIME=$((SECONDS - START_TIME))
+  echo ""
+  echo "✅ Time Machine backup complete in $((ELAPSED_TIME / 60))m $((ELAPSED_TIME % 60))s."
+  LATEST=$(tmutil latestbackup 2>/dev/null || true)
+  if [[ -n "${LATEST}" ]]; then
+    echo "📁 Latest backup: ${LATEST}"
+  fi
+
+  # ── Restore original TM destination if one existed ───────────────────────
+  if [[ -n "${ORIGINAL_TM_ID}" && -n "${ORIGINAL_TM_DEST}" ]]; then
+    echo ""
+    echo "ℹ️  Restoring original Time Machine destination: ${ORIGINAL_TM_DEST}"
+    sudo tmutil setdestination "${ORIGINAL_TM_DEST}" 2>/dev/null || {
+      echo "⚠️  Could not restore original Time Machine destination."
+      echo "   You may need to reconfigure it manually in System Settings."
+    }
+  fi
+
+  stop_caffeinate
+  exit 0
 fi
