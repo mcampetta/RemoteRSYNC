@@ -55,7 +55,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1440-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1441-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
@@ -870,9 +870,9 @@ verify_sha256 "${SSHPASS_PATH}" "sshpass"  "${HASH_SSHPASS}" || true
 ###############################################################################
 
 echo ""
-# Time Machine option only available on normal boot (not RecoveryOS)
+# Time Machine option only available on normal boot with sudo access
 TM_AVAILABLE=""
-if ! is_recovery_os && command -v tmutil >/dev/null 2>&1; then
+if ! is_recovery_os && [[ -z "${LIMITED_ACCESS_MODE}" ]] && command -v tmutil >/dev/null 2>&1; then
   TM_AVAILABLE="yes"
 fi
 
@@ -1385,6 +1385,17 @@ fi
 if [[ "${SESSION_MODE}" == "4" ]]; then
   echo "🔧 Time Machine Backup Selected"
   echo ""
+
+  # Verify sudo access before proceeding — tmutil requires it
+  if ! sudo -n true 2>/dev/null; then
+    echo "⚠️  Time Machine requires administrator privileges."
+    echo "   Checking sudo access..."
+    if ! sudo true 2>/dev/null; then
+      echo "❌ Could not obtain sudo access. Time Machine backup requires admin privileges."
+      echo "   This user may not be in the sudoers file."
+      exit 1
+    fi
+  fi
 
   # ── Determine destination drive ──────────────────────────────────────────
   TM_DEST=""
