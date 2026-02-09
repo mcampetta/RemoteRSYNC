@@ -54,7 +54,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1432-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1433-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
@@ -267,11 +267,17 @@ choose_rsync_runtime_mode() {
     fi
   else
     echo ""
-    echo "Rsync mode:"
-    echo "1) Strict (fail on read/permission errors)"
-    echo "2) Best-effort (resume + continue past unreadable files)"
-    read -rp "Enter 1 or 2 [2]: " RSYNC_MODE
-    RSYNC_MODE="${RSYNC_MODE:-2}"
+    while true; do
+      echo "Rsync mode:"
+      echo "1) Strict (fail on read/permission errors)"
+      echo "2) Best-effort (resume + continue past unreadable files)"
+      read -rp "Enter 1 or 2 [2]: " RSYNC_MODE
+      RSYNC_MODE="${RSYNC_MODE:-2}"
+      case "${RSYNC_MODE}" in
+        1|2) break ;;
+        *) echo "⚠️ Invalid selection '${RSYNC_MODE}'. Please enter 1 or 2." ; echo "" ;;
+      esac
+    done
 
     if [[ "${RSYNC_MODE}" == "2" ]]; then
       RSYNC_RUNTIME_OPTS+=(--partial --partial-dir=.rsync-partial --ignore-errors)
@@ -765,8 +771,14 @@ else
       echo "  The transfer will skip files that require elevated permissions"
       echo "  but will still capture the user's home folder data."
       echo ""
-      read -rp "Enter 1 or 2 [1]: " fda_choice
-      fda_choice="${fda_choice:-1}"
+      while true; do
+        read -rp "Enter 1 or 2 [1]: " fda_choice
+        fda_choice="${fda_choice:-1}"
+        case "${fda_choice}" in
+          1|2) break ;;
+          *) echo "⚠️ Invalid selection '${fda_choice}'. Please enter 1 or 2." ;;
+        esac
+      done
 
       if [[ "${fda_choice}" == "2" ]]; then
         LIMITED_ACCESS_MODE="1"
@@ -857,18 +869,30 @@ verify_sha256 "${SSHPASS_PATH}" "sshpass"  "${HASH_SSHPASS}" || true
 ###############################################################################
 
 echo ""
-echo "Please select copy mode:"
-echo "1) Local Session Copy - copy directly to an attached external drive"
-echo "2) Remote Session Copy - transfer over SSH to another Mac"
-echo "3) Setup Listener - sets this machine to recieve data over WIFI with ODTU"
-read -rp "Enter 1, 2, or 3: " SESSION_MODE
+while true; do
+  echo "Please select copy mode:"
+  echo "1) Local Session Copy - copy directly to an attached external drive"
+  echo "2) Remote Session Copy - transfer over SSH to another Mac"
+  echo "3) Setup Listener - sets this machine to recieve data over WIFI with ODTU"
+  read -rp "Enter 1, 2, or 3: " SESSION_MODE
+  case "${SESSION_MODE}" in
+    1|2|3) break ;;
+    *) echo "⚠️ Invalid selection '${SESSION_MODE}'. Please enter 1, 2, or 3." ; echo "" ;;
+  esac
+done
 
 ###############################################################################
 # ═══ MODE 1: LOCAL SESSION ══════════════════════════════════════════════════ #
 ###############################################################################
 if [[ "${SESSION_MODE}" == "1" ]]; then
   echo "🔧 Local Session Selected"
-  read -rp "Enter job number: " JOB_NUM
+  while true; do
+    read -rp "Enter job number: " JOB_NUM
+    if [[ -n "${JOB_NUM}" ]]; then
+      break
+    fi
+    echo "⚠️ Job number cannot be empty. Please try again."
+  done
 
   select_source_volume "${JOB_NUM}"
 
@@ -975,12 +999,20 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
     if [[ -n "${LIMITED_ACCESS_MODE}" ]]; then
       tar_extra_flags="--ignore-failed-read"
     fi
+    echo ""
+    echo "📋 Command:"
+    echo "  COPYFILE_DISABLE=1 ${GTAR_PATH} -cf - ${tar_extra_flags} ${TAR_EXCLUDES[*]+"${TAR_EXCLUDES[*]}"} . | ${PV_PATH} | ${GTAR_PATH} -xf - -C ${FINAL_DEST}"
+    echo ""
     # shellcheck disable=SC2086
     COPYFILE_DISABLE=1 "${GTAR_PATH}" -cf - ${tar_extra_flags} ${TAR_EXCLUDES[@]+"${TAR_EXCLUDES[@]}"} . \
       | "${PV_PATH}" \
       | "${GTAR_PATH}" -xf - -C "${FINAL_DEST}"
   elif [[ "${TRANSFER_METHOD}" == "1" ]]; then
     # Rsync transfer with detected flags
+    echo ""
+    echo "📋 Command:"
+    echo "  ${RSYNC_PATH} ${RSYNC_FLAGS[*]+"${RSYNC_FLAGS[*]}"} -v ${RSYNC_RUNTIME_OPTS[*]+"${RSYNC_RUNTIME_OPTS[*]}"} ${RSYNC_EXCLUDES[*]+"${RSYNC_EXCLUDES[*]}"} ${SRC_VOL}/ ${FINAL_DEST}"
+    echo ""
     "${RSYNC_PATH}" ${RSYNC_FLAGS[@]+"${RSYNC_FLAGS[@]}"} -v \
       ${RSYNC_RUNTIME_OPTS[@]+"${RSYNC_RUNTIME_OPTS[@]}"} \
       ${RSYNC_EXCLUDES[@]+"${RSYNC_EXCLUDES[@]}"} \
@@ -1052,7 +1084,16 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
     done < "${TMP_DIR}/listeners.txt"
 
     echo ""
-    read -rp "Select a receiver [1-${#LISTENERS[@]}]: " CHOICE
+    while true; do
+      read -rp "Select a receiver [1-${#LISTENERS[@]}]: " CHOICE
+      # Validate: must be a number within range
+      if [[ "${CHOICE}" =~ ^[0-9]+$ ]] && \
+         [[ "${CHOICE}" -ge 1 ]] && \
+         [[ "${CHOICE}" -le ${#LISTENERS[@]} ]]; then
+        break
+      fi
+      echo "⚠️ Invalid selection '${CHOICE}'. Please enter a number between 1 and ${#LISTENERS[@]}."
+    done
     SELECTED="${LISTENERS[$((CHOICE-1))]}"
     IFS=':' read -r REMOTE_USER REMOTE_IP REMOTE_DEST <<< "${SELECTED}"
   else
@@ -1131,6 +1172,10 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
       # Best-effort vs strict rsync behavior (resume/ignore errors)
       choose_rsync_runtime_mode
       # rsync with --protect-args handles spaces in remote paths
+      echo ""
+      echo "📋 Command:"
+      echo "  sshpass -p '****' ${RSYNC_PATH} -e \"ssh ${SSH_OPTIONS}\" ${RSYNC_FLAGS[*]+"${RSYNC_FLAGS[*]}"} -v ${RSYNC_RUNTIME_OPTS[*]+"${RSYNC_RUNTIME_OPTS[*]}"} ${RSYNC_EXCLUDES[*]+"${RSYNC_EXCLUDES[*]}"} ${SRC_VOL}/ ${REMOTE_USER}@${REMOTE_IP}:${REMOTE_DEST}"
+      echo ""
       # shellcheck disable=SC2086
       "${SSHPASS_PATH}" -p "${SSH_PASSWORD}" \
         "${RSYNC_PATH}" -e "ssh ${SSH_OPTIONS}" \
@@ -1142,6 +1187,10 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
     2)
       # Tar pipeline — excludes before path, use gtar on both ends
       REMOTE_TAR_CMD=$(printf 'cd %q && tar -xf -' "${REMOTE_DEST}")
+      echo ""
+      echo "📋 Command:"
+      echo "  COPYFILE_DISABLE=1 ${GTAR_PATH} -cf - --totals --ignore-failed-read ${TAR_EXCLUDES[*]+"${TAR_EXCLUDES[*]}"} . | ${PV_PATH} -p -t -e -b -r | sshpass -p '****' ssh ${SSH_OPTIONS} ${REMOTE_USER}@${REMOTE_IP} \"${REMOTE_TAR_CMD}\""
+      echo ""
       # shellcheck disable=SC2086
       COPYFILE_DISABLE=1 "${GTAR_PATH}" -cf - --totals --ignore-failed-read \
         ${TAR_EXCLUDES[@]+"${TAR_EXCLUDES[@]}"} . \
@@ -1178,7 +1227,13 @@ if [[ "${SESSION_MODE}" == "3" ]]; then
   # === Check if "My Passport" is connected and offer to format ===
   if [[ -d "/Volumes/My Passport" ]]; then
     echo "💽 'My Passport' drive detected."
-    read -rp "📦 Enter job number to format drive as: " JOB_NUM
+    while true; do
+      read -rp "📦 Enter job number to format drive as: " JOB_NUM
+      if [[ -n "${JOB_NUM}" ]]; then
+        break
+      fi
+      echo "⚠️ Job number cannot be empty. Please try again."
+    done
 
     # Try multiple methods to get the device identifier
     VOLUME_DEVICE=""
