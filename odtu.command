@@ -22,9 +22,24 @@ TMP_DIR=""
 SSH_CONTROL_PATH=""  # reserved for future ControlMaster support
 LOG_FILE=""
 RSYNC_RUNTIME_OPTS=()
+TM_BACKUP_ACTIVE=""
+TM_MONITOR_PID=""
 
 cleanup() {
   local ec=$?
+  # Stop Time Machine backup if one is running
+  if [[ -n "${TM_BACKUP_ACTIVE}" ]]; then
+    echo ""
+    echo "⏳ Stopping Time Machine backup..."
+    sudo tmutil stopbackup 2>/dev/null || true
+    TM_BACKUP_ACTIVE=""
+  fi
+  # Kill TM progress monitor
+  if [[ -n "${TM_MONITOR_PID}" ]]; then
+    kill "${TM_MONITOR_PID}" 2>/dev/null || true
+    wait "${TM_MONITOR_PID}" 2>/dev/null || true
+    TM_MONITOR_PID=""
+  fi
   # Stop caffeinate
   if [[ -n "${CAFFEINATE_PID}" ]]; then
     kill "${CAFFEINATE_PID}" 2>/dev/null || true
@@ -1053,10 +1068,21 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
     echo "📋 Command:"
     echo "  ${RSYNC_PATH} ${RSYNC_FLAGS[*]+"${RSYNC_FLAGS[*]}"} -v ${RSYNC_RUNTIME_OPTS[*]+"${RSYNC_RUNTIME_OPTS[*]}"} ${RSYNC_EXCLUDES[*]+"${RSYNC_EXCLUDES[*]}"} ${SRC_VOL}/ ${FINAL_DEST}"
     echo ""
+    RSYNC_EXIT=0
     "${RSYNC_PATH}" ${RSYNC_FLAGS[@]+"${RSYNC_FLAGS[@]}"} -v \
       ${RSYNC_RUNTIME_OPTS[@]+"${RSYNC_RUNTIME_OPTS[@]}"} \
       ${RSYNC_EXCLUDES[@]+"${RSYNC_EXCLUDES[@]}"} \
-      "${SRC_VOL}/" "${FINAL_DEST}"
+      "${SRC_VOL}/" "${FINAL_DEST}" || RSYNC_EXIT=$?
+    if [[ "${RSYNC_EXIT}" -eq 23 || "${RSYNC_EXIT}" -eq 24 ]]; then
+      echo ""
+      echo "⚠️  rsync completed with partial-transfer warnings (exit code ${RSYNC_EXIT})."
+      echo "   Some files could not be read (permissions, TCC, or vanished during copy)."
+      echo "   This is normal for full-volume copies on macOS."
+    elif [[ "${RSYNC_EXIT}" -ne 0 ]]; then
+      echo ""
+      echo "❌ rsync failed with exit code ${RSYNC_EXIT}."
+      exit "${RSYNC_EXIT}"
+    fi
   fi
 
   ELAPSED_TIME=$((SECONDS - START_TIME))
@@ -1217,12 +1243,23 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
       echo "  sshpass -p '****' ${RSYNC_PATH} -e \"ssh ${SSH_OPTIONS}\" ${RSYNC_FLAGS[*]+"${RSYNC_FLAGS[*]}"} -v ${RSYNC_RUNTIME_OPTS[*]+"${RSYNC_RUNTIME_OPTS[*]}"} ${RSYNC_EXCLUDES[*]+"${RSYNC_EXCLUDES[*]}"} ${SRC_VOL}/ ${REMOTE_USER}@${REMOTE_IP}:${REMOTE_DEST}"
       echo ""
       # shellcheck disable=SC2086
+      RSYNC_EXIT=0
       "${SSHPASS_PATH}" -p "${SSH_PASSWORD}" \
         "${RSYNC_PATH}" -e "ssh ${SSH_OPTIONS}" \
         ${RSYNC_FLAGS[@]+"${RSYNC_FLAGS[@]}"} -v \
         ${RSYNC_RUNTIME_OPTS[@]+"${RSYNC_RUNTIME_OPTS[@]}"} \
         ${RSYNC_EXCLUDES[@]+"${RSYNC_EXCLUDES[@]}"} \
-        "${SRC_VOL}/" "${REMOTE_USER}@${REMOTE_IP}:${REMOTE_DEST}"
+        "${SRC_VOL}/" "${REMOTE_USER}@${REMOTE_IP}:${REMOTE_DEST}" || RSYNC_EXIT=$?
+      if [[ "${RSYNC_EXIT}" -eq 23 || "${RSYNC_EXIT}" -eq 24 ]]; then
+        echo ""
+        echo "⚠️  rsync completed with partial-transfer warnings (exit code ${RSYNC_EXIT})."
+        echo "   Some files could not be read (permissions, TCC, or vanished during copy)."
+        echo "   This is normal for full-volume copies on macOS."
+      elif [[ "${RSYNC_EXIT}" -ne 0 ]]; then
+        echo ""
+        echo "❌ rsync failed with exit code ${RSYNC_EXIT}."
+        exit "${RSYNC_EXIT}"
+      fi
       ;;
     2)
       # Tar pipeline — excludes before path, use gtar on both ends
@@ -1508,16 +1545,15 @@ if [[ "${SESSION_MODE}" == "4" ]]; then
     done
   fi
 
-  # Place Time Machine backup in a subfolder
-  TM_DEST="${TM_DEST}/Time Machine Backups"
-  mkdir -p "${TM_DEST}"
+  # tmutil requires a volume mount point — it manages its own folder structure
+  # (creates Backups.backupdb/<MachineName>/<Date>/ automatically)
 
-  # Verify the destination is writable
-  if ! touch "${TM_DEST}/.tm_write_test" 2>/dev/null; then
+  # Verify the destination is writable (use sudo — TM may have changed ownership)
+  if ! sudo touch "${TM_DEST}/.tm_write_test" 2>/dev/null; then
     echo "❌ Destination ${TM_DEST} is not writable."
     exit 1
   fi
-  rm -f "${TM_DEST}/.tm_write_test"
+  sudo rm -f "${TM_DEST}/.tm_write_test"
 
   echo ""
   echo "📋 Time Machine Backup Configuration:"
@@ -1575,9 +1611,80 @@ if [[ "${SESSION_MODE}" == "4" ]]; then
   START_TIME=${SECONDS}
   echo "⏳ Starting Time Machine backup (this may take a while)..."
   echo ""
+
+  # Start a background progress monitor polling tmutil status
+  TM_MONITOR_PID=""
+  (
+    sleep 5
+    while true; do
+      TM_STATUS=$(tmutil status 2>/dev/null || true)
+      if [[ -z "${TM_STATUS}" ]]; then
+        sleep 5
+        continue
+      fi
+      # Extract useful fields
+      TM_PHASE=$(echo "${TM_STATUS}" | awk -F'"' '/BackupPhase/ {print $2}')
+      TM_PERCENT=$(echo "${TM_STATUS}" | awk -F'[=;]' '/Percent/ {gsub(/ /,"",$2); print $2}')
+      TM_BYTES=$(echo "${TM_STATUS}" | awk -F'[=;]' '/bytes/ {gsub(/ /,"",$2); print $2}' | head -1)
+
+      # Format bytes into human-readable
+      TM_SIZE=""
+      if [[ -n "${TM_BYTES}" ]] && [[ "${TM_BYTES}" =~ ^[0-9]+$ ]]; then
+        if [[ "${TM_BYTES}" -gt 1073741824 ]]; then
+          TM_SIZE="$((TM_BYTES / 1073741824)) GB"
+        elif [[ "${TM_BYTES}" -gt 1048576 ]]; then
+          TM_SIZE="$((TM_BYTES / 1048576)) MB"
+        else
+          TM_SIZE="$((TM_BYTES / 1024)) KB"
+        fi
+      fi
+
+      # Format percent
+      TM_PCT_DISPLAY=""
+      if [[ -n "${TM_PERCENT}" ]] && [[ "${TM_PERCENT}" != "0" ]]; then
+        # Truncate to 1 decimal: multiply by 100 for display
+        TM_PCT_INT=$(printf '%.1f' "$(echo "${TM_PERCENT} * 100" | bc 2>/dev/null || echo "0")" 2>/dev/null || true)
+        if [[ -n "${TM_PCT_INT}" ]] && [[ "${TM_PCT_INT}" != "0" ]] && [[ "${TM_PCT_INT}" != "0.0" ]]; then
+          TM_PCT_DISPLAY="${TM_PCT_INT}%"
+        fi
+      fi
+
+      # Build status line
+      TM_LINE=""
+      if [[ -n "${TM_PHASE}" ]]; then
+        TM_LINE="  Phase: ${TM_PHASE}"
+      fi
+      if [[ -n "${TM_PCT_DISPLAY}" ]]; then
+        TM_LINE="${TM_LINE}  |  Progress: ${TM_PCT_DISPLAY}"
+      fi
+      if [[ -n "${TM_SIZE}" ]]; then
+        TM_LINE="${TM_LINE}  |  Copied: ${TM_SIZE}"
+      fi
+
+      if [[ -n "${TM_LINE}" ]]; then
+        printf "\r%-80s" "${TM_LINE}"
+      fi
+
+      sleep 10
+    done
+  ) &
+  TM_MONITOR_PID=$!
+
+  TM_BACKUP_ACTIVE="yes"
   sudo tmutil startbackup --block || {
+    # Stop the backup daemon — the CLI wrapper dying doesn't stop it
     echo ""
-    echo "❌ Time Machine backup failed."
+    echo "⏳ Stopping Time Machine backup..."
+    sudo tmutil stopbackup 2>/dev/null || true
+    TM_BACKUP_ACTIVE=""
+    # Kill the progress monitor
+    if [[ -n "${TM_MONITOR_PID}" ]]; then
+      kill "${TM_MONITOR_PID}" 2>/dev/null || true
+      wait "${TM_MONITOR_PID}" 2>/dev/null || true
+      TM_MONITOR_PID=""
+    fi
+    echo ""
+    echo "❌ Time Machine backup failed or was interrupted."
     # Attempt to restore original destination
     if [[ -n "${ORIGINAL_TM_ID}" ]]; then
       echo "ℹ️  Restoring original Time Machine destination..."
@@ -1586,6 +1693,15 @@ if [[ "${SESSION_MODE}" == "4" ]]; then
     stop_caffeinate
     exit 1
   }
+  TM_BACKUP_ACTIVE=""
+
+  # Kill the progress monitor
+  if [[ -n "${TM_MONITOR_PID}" ]]; then
+    kill "${TM_MONITOR_PID}" 2>/dev/null || true
+    wait "${TM_MONITOR_PID}" 2>/dev/null || true
+    TM_MONITOR_PID=""
+  fi
+  printf "\r%-80s\n" ""
 
   ELAPSED_TIME=$((SECONDS - START_TIME))
   echo ""
