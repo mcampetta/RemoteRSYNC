@@ -7,6 +7,27 @@
 # ── Strict mode ──────────────────────────────────────────────────────────────
 set -euo pipefail
 
+
+# ── Interactive input helper ────────────────────────────────────────────────
+# When the script is executed via a pipe (e.g. curl ... | bash), stdin is NOT a
+# terminal, so plain `read` will hit EOF and return 1 (fatal under `set -e`).
+# This wrapper preserves interactive prompts by reading from /dev/tty when
+# stdin isn't a TTY, while remaining compatible with non-interactive runs.
+read_tty() {
+  # If stdin is already a TTY, read normally (supports readline -e).
+  if [[ -t 0 ]]; then
+    read "$@"
+    return $?
+  fi
+  # If we have a controlling terminal, read from it explicitly.
+  if [[ -r /dev/tty ]]; then
+    read "$@" </dev/tty
+    return $?
+  fi
+  # No TTY available (non-interactive). Fall back to stdin.
+  read "$@"
+}
+
 # ── Error handler ────────────────────────────────────────────────────────────
 _error_handler() {
   local lineno="$1" cmd="$2" code="$3"
@@ -145,7 +166,7 @@ verify_ssh_connection() {
 
 prompt_for_password() {
   echo ""
-  read -rsp "🔑 Enter SSH password for $1: " SSH_PASSWORD
+  read_tty -rsp "🔑 Enter SSH password for $1: " SSH_PASSWORD
   echo ""
 }
 
@@ -220,11 +241,11 @@ edit_excludes() {
     echo "  R - Remove an exclude by number"
     echo "  V - View list again"
     echo "  D - Done (use current list)"
-    read -rp "➡️  Enter choice [A/R/V/D]: " action
+    read_tty -rp "➡️  Enter choice [A/R/V/D]: " action
 
     case "${action}" in
       [Aa])
-        read -rp "Enter value to exclude (e.g., .DS_Store): " new_excl
+        read_tty -rp "Enter value to exclude (e.g., .DS_Store): " new_excl
         new_excl="$(echo "${new_excl}" | xargs)"
         if [[ -n "${new_excl}" ]]; then
           EXCLUDES+=("${new_excl}")
@@ -232,7 +253,7 @@ edit_excludes() {
         fi
         ;;
       [Rr])
-        read -rp "Enter the number of the exclude to remove: " idx
+        read_tty -rp "Enter the number of the exclude to remove: " idx
         idx=$((idx - 1))
         if [[ ${idx} -ge 0 && ${idx} -lt ${#EXCLUDES[@]} ]]; then
           echo "❌ Removed: ${EXCLUDES[$idx]}"
@@ -287,7 +308,7 @@ choose_rsync_runtime_mode() {
       echo "Rsync mode:"
       echo "1) Strict (fail on read/permission errors)"
       echo "2) Best-effort (resume + continue past unreadable files)"
-      read -rp "Enter 1 or 2 [2]: " RSYNC_MODE
+      read_tty -rp "Enter 1 or 2 [2]: " RSYNC_MODE
       RSYNC_MODE="${RSYNC_MODE:-2}"
       case "${RSYNC_MODE}" in
         1|2) break ;;
@@ -462,7 +483,7 @@ find_largest_volume() {
       ov_mount=$(echo "${ov}" | awk '{for(i=3;i<=NF;i++) printf "%s%s", $i, (i<NF?" ":""); print ""}')
       echo "    - ${ov_mount}"
     done
-    read -rp "Include Ontrack volume(s) anyway? (y/N): " include_ontrack
+    read_tty -rp "Include Ontrack volume(s) anyway? (y/N): " include_ontrack
     if [[ "${include_ontrack}" =~ ^[Yy]$ ]]; then
       echo "✅ Including Ontrack volume(s) in detection."
     else
@@ -539,11 +560,11 @@ select_source_volume() {
     echo "   3. Click 'Mount'"
     echo "   4. Note the mount path shown (e.g. /Volumes/Macintosh HD - Data)"
     echo ""
-    read -rp "Press Enter to continue and manually specify the path, or Ctrl+C to exit and mount first: " _
+    read_tty -rp "Press Enter to continue and manually specify the path, or Ctrl+C to exit and mount first: " _
   fi
 
   echo "📝 Detection method: ${method}"
-  read -e -r -p "Press Enter to accept [${suggested}], or type/drag a different path (Tab to autocomplete): " custom_volume
+  read_tty -e -r -p "Press Enter to accept [${suggested}], or type/drag a different path (Tab to autocomplete): " custom_volume
   SRC_VOL="${custom_volume:-${suggested}}"
   SRC_VOL="$(normalize_path "${SRC_VOL}")"
 
@@ -788,7 +809,7 @@ else
       echo "  but will still capture the user's home folder data."
       echo ""
       while true; do
-        read -rp "Enter 1 or 2 [1]: " fda_choice
+        read_tty -rp "Enter 1 or 2 [1]: " fda_choice
         fda_choice="${fda_choice:-1}"
         case "${fda_choice}" in
           1|2) break ;;
@@ -900,9 +921,9 @@ while true; do
     echo "4) Time Machine Backup - create a Time Machine backup to an external drive"
   fi
   if [[ -n "${TM_AVAILABLE}" ]]; then
-    read -rp "Enter 1, 2, 3, or 4: " SESSION_MODE
+    read_tty -rp "Enter 1, 2, 3, or 4: " SESSION_MODE
   else
-    read -rp "Enter 1, 2, or 3: " SESSION_MODE
+    read_tty -rp "Enter 1, 2, or 3: " SESSION_MODE
   fi
   case "${SESSION_MODE}" in
     1|2|3) break ;;
@@ -923,7 +944,7 @@ done
 if [[ "${SESSION_MODE}" == "1" ]]; then
   echo "🔧 Local Session Selected"
   while true; do
-    read -rp "Enter job number: " JOB_NUM
+    read_tty -rp "Enter job number: " JOB_NUM
     if [[ -n "${JOB_NUM}" ]]; then
       break
     fi
@@ -1019,7 +1040,7 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
     echo "1) rsync (default, recommended)"
     echo "2) tar"
     echo "3) OPTION - edit excludes for transfers"
-    read -rp "Enter 1, 2, or 3: " TRANSFER_CHOICE
+    read_tty -rp "Enter 1, 2, or 3: " TRANSFER_CHOICE
 
     case "${TRANSFER_CHOICE}" in
       1|2)
@@ -1151,7 +1172,7 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
 
     echo ""
     while true; do
-      read -rp "Select a receiver [1-${#LISTENERS[@]}]: " CHOICE
+      read_tty -rp "Select a receiver [1-${#LISTENERS[@]}]: " CHOICE
       # Validate: must be a number within range
       if [[ "${CHOICE}" =~ ^[0-9]+$ ]] && \
          [[ "${CHOICE}" -ge 1 ]] && \
@@ -1185,7 +1206,7 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
     echo "1) rsync (default, recommended)"
     echo "2) tar"
     echo "3) OPTION - edit excludes for transfers"
-    read -rp "Enter 1, 2, or 3: " TRANSFER_CHOICE
+    read_tty -rp "Enter 1, 2, or 3: " TRANSFER_CHOICE
 
     case "${TRANSFER_CHOICE}" in
       1|2)
@@ -1305,7 +1326,7 @@ if [[ "${SESSION_MODE}" == "3" ]]; then
   if [[ -d "/Volumes/My Passport" ]]; then
     echo "💽 'My Passport' drive detected."
     while true; do
-      read -rp "📦 Enter job number to format drive as: " JOB_NUM
+      read_tty -rp "📦 Enter job number to format drive as: " JOB_NUM
       if [[ -n "${JOB_NUM}" ]]; then
         break
       fi
@@ -1381,7 +1402,7 @@ if [[ "${SESSION_MODE}" == "3" ]]; then
 
     while true; do
       echo "📁 Destination directory [${DEFAULT_DESTINATION}]"
-      read -e -r -p "Press Enter for default, or type/drag a custom path (Tab to autocomplete): " DEST_OVERRIDE
+      read_tty -e -r -p "Press Enter for default, or type/drag a custom path (Tab to autocomplete): " DEST_OVERRIDE
       DESTINATION_PATH="$(normalize_path "${DEST_OVERRIDE:-${DEFAULT_DESTINATION}}")"
 
       if [[ -z "${DEST_OVERRIDE}" ]]; then
@@ -1441,11 +1462,11 @@ if [[ "${SESSION_MODE}" == "4" ]]; then
   if [[ -d "/Volumes/My Passport" ]]; then
     echo "💽 'My Passport' drive detected."
     while true; do
-      read -rp "Format My Passport for Time Machine backup? (y/n): " TM_FORMAT
+      read_tty -rp "Format My Passport for Time Machine backup? (y/n): " TM_FORMAT
       case "${TM_FORMAT}" in
         [yY]|[yY][eE][sS])
           while true; do
-            read -rp "📦 Enter job number to format drive as: " JOB_NUM
+            read_tty -rp "📦 Enter job number to format drive as: " JOB_NUM
             if [[ -n "${JOB_NUM}" ]]; then break; fi
             echo "⚠️ Job number cannot be empty. Please try again."
           done
@@ -1524,7 +1545,7 @@ if [[ "${SESSION_MODE}" == "4" ]]; then
     done
     echo ""
     while true; do
-      read -e -r -p "Select a volume number, or drag/type a custom path: " TM_DEST_INPUT
+      read_tty -e -r -p "Select a volume number, or drag/type a custom path: " TM_DEST_INPUT
       # Check if input is a number matching a listed volume
       if [[ "${TM_DEST_INPUT}" =~ ^[0-9]+$ ]] && \
          [[ "${TM_DEST_INPUT}" -ge 1 ]] && \
@@ -1581,7 +1602,7 @@ if [[ "${SESSION_MODE}" == "4" ]]; then
   echo ""
 
   while true; do
-    read -rp "Start Time Machine backup now? (y/n): " TM_CONFIRM
+    read_tty -rp "Start Time Machine backup now? (y/n): " TM_CONFIRM
     case "${TM_CONFIRM}" in
       [yY]|[yY][eE][sS]) break ;;
       [nN]|[nN][oO])
