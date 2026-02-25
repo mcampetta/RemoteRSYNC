@@ -91,7 +91,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1443-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1444-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
@@ -193,9 +193,10 @@ normalize_path() {
   if [[ "${p}" =~ ^\".*\"$ || "${p}" =~ ^\'.*\'$ ]]; then
     p="${p:1:${#p}-2}"
   fi
-  # If it contains backslashes, interpret escapes via printf %b
+  # If it contains backslashes, un-escape shell-style sequences
+  # (e.g. "\ " → " " from Terminal drag-and-drop, "\(" → "(", "\\" → "\")
   if [[ "${p}" == *\\* ]]; then
-    p="$(printf '%b' "${p//%/%%}")"
+    p="$(printf '%s' "${p}" | sed 's/\\\(.\)/\1/g')"
   fi
   echo "${p}"
 }
@@ -391,29 +392,53 @@ detect_apfs_data_volume() {
   DATA_DETECT_METHOD=""
   DETECTED_APFS_MOUNT=""
 
-  # Method 1: diskutil apfs list — look for the Data role volume
+  # Method 1: diskutil apfs list — look for Data role volumes
+  # Collects ALL Data-role mount points and filters out:
+  #   - /System/Volumes/Data (local system's synthetic data volume)
+  #   - Volumes with "Ontrack" in the mount path (local extraction machine)
   if command -v diskutil >/dev/null 2>&1; then
+    local candidates=()
+    local skipped_ontrack=()
     local data_mount
-    # IMPORTANT: Mount points commonly contain spaces (e.g. "/Volumes/Macintosh HD - Data").
-    # So we must capture the full remainder of the line, not $NF.
-    data_mount=$(
-      diskutil apfs list 2>/dev/null | awk '
-        /^[[:space:]]*Role:[[:space:]]*/ {
-          role=$0
-          sub(/^[[:space:]]*Role:[[:space:]]*/, "", role)
-        }
-        /^[[:space:]]*Mount Point:[[:space:]]*/ {
-          mp=$0
-          sub(/^[[:space:]]*Mount Point:[[:space:]]*/, "", mp)
-          # Accept "Data" role, including formats like "(Data)" or "Data, something"
-          if (role ~ /(^|[[:space:]]|\()Data(\)|$|,)/) print mp
-        }
-      ' | head -1
-    )
-    # Trim whitespace
-    data_mount="${data_mount#"${data_mount%%[![:space:]]*}"}"
-    data_mount="${data_mount%"${data_mount##*[![:space:]]}"}"
-    if [[ -n "${data_mount}" && -d "${data_mount}" ]]; then
+
+    while IFS= read -r data_mount; do
+      [[ -z "${data_mount}" ]] && continue
+      # Trim whitespace
+      data_mount="${data_mount#"${data_mount%%[![:space:]]*}"}"
+      data_mount="${data_mount%"${data_mount##*[![:space:]]}"}"
+      [[ -z "${data_mount}" ]] && continue
+      [[ -d "${data_mount}" ]] || continue
+
+      # Skip /System/Volumes/Data (local system volume — wrong target on
+      # extraction machines with an attached customer drive)
+      if [[ "${data_mount}" == "/System/Volumes/Data" ]]; then
+        echo "ℹ️  Skipping local system volume: ${data_mount}"
+        continue
+      fi
+
+      # Skip volumes with "Ontrack" in the mount path (extraction machine's own volume)
+      if echo "${data_mount}" | grep -qi "ontrack"; then
+        echo "ℹ️  Skipping Ontrack volume: ${data_mount}"
+        skipped_ontrack+=("${data_mount}")
+        continue
+      fi
+
+      candidates+=("${data_mount}")
+    done < <(diskutil apfs list 2>/dev/null | awk '
+      /^[[:space:]]*Role:[[:space:]]*/ {
+        role=$0
+        sub(/^[[:space:]]*Role:[[:space:]]*/, "", role)
+      }
+      /^[[:space:]]*Mount Point:[[:space:]]*/ {
+        mp=$0
+        sub(/^[[:space:]]*Mount Point:[[:space:]]*/, "", mp)
+        # Accept "Data" role, including formats like "(Data)" or "Data, something"
+        if (role ~ /(^|[[:space:]]|\()Data(\)|$|,)/) print mp
+      }
+    ')
+
+    # Try each non-filtered candidate
+    for data_mount in ${candidates[@]+"${candidates[@]}"}; do
       if _validate_data_volume "${data_mount}"; then
         DATA_DETECT_METHOD="diskutil apfs list (Data role)"
         DETECTED_APFS_MOUNT="${data_mount}"
@@ -422,12 +447,39 @@ detect_apfs_data_volume() {
         echo "⚠️  Found Data volume at ${data_mount} but it appears empty (no user data)."
         echo "   This is likely the system scaffold, not the customer data volume."
       fi
+    done
+
+    # If we only found Ontrack volumes (no other candidates), offer override
+    if [[ ${#skipped_ontrack[@]} -gt 0 && ${#candidates[@]} -eq 0 ]]; then
+      echo ""
+      echo "⚠️  Only Ontrack-named Data volume(s) were found:"
+      for ov in "${skipped_ontrack[@]}"; do
+        echo "    - ${ov}"
+      done
+      read_tty -rp "Include Ontrack volume(s) anyway? (y/N): " include_ontrack
+      if [[ "${include_ontrack}" =~ ^[Yy]$ ]]; then
+        for data_mount in "${skipped_ontrack[@]}"; do
+          if _validate_data_volume "${data_mount}"; then
+            DATA_DETECT_METHOD="diskutil apfs list (Data role, Ontrack override)"
+            DETECTED_APFS_MOUNT="${data_mount}"
+            return 0
+          fi
+        done
+      fi
     fi
   fi
 
-  # Method 2: well-known path — also validate it has real content
+  # Method 2: /System/Volumes/Data fallback — only use when we're likely
+  # booted directly on the customer machine (not on an extraction machine).
+  # Check the volume name for "Ontrack" to avoid targeting the local drive.
   if [[ -d "/System/Volumes/Data" ]]; then
-    if _validate_data_volume "/System/Volumes/Data"; then
+    local sys_vol_name=""
+    sys_vol_name=$(diskutil info "/System/Volumes/Data" 2>/dev/null \
+      | awk -F: '/Volume Name/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2}' \
+      | head -1)
+    if echo "${sys_vol_name}" | grep -qi "ontrack"; then
+      echo "ℹ️  Skipping /System/Volumes/Data (Ontrack volume: ${sys_vol_name})"
+    elif _validate_data_volume "/System/Volumes/Data"; then
       DATA_DETECT_METHOD="/System/Volumes/Data fallback"
       DETECTED_APFS_MOUNT="/System/Volumes/Data"
       return 0
@@ -466,7 +518,7 @@ find_largest_volume() {
     # Reconstruct mount point from field 9 onwards
     mp=""; for(i=9;i<=NF;i++) mp=(mp ? mp " " $i : $i);
     print $2, $3, mp
-  }' | grep -v "My Passport")
+  }' | grep -v "My Passport" | grep -v "/System/Volumes/Data")
 
   if [[ -n "${job_filter}" ]]; then
     df_output=$(echo "${df_output}" | grep -v "${job_filter}")
@@ -1071,18 +1123,28 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
   if [[ "${TRANSFER_METHOD}" == "2" ]]; then
     # Tar transfer — excludes BEFORE the path argument
     cd "${SRC_VOL}" || exit 1
-    tar_extra_flags=""
-    if [[ -n "${LIMITED_ACCESS_MODE}" ]]; then
-      tar_extra_flags="--ignore-failed-read"
-    fi
+    # Always use --ignore-failed-read: forensic volume copies routinely
+    # encounter unreadable files (TCC-protected, permission denied, etc.)
     echo ""
     echo "📋 Command:"
-    echo "  COPYFILE_DISABLE=1 ${GTAR_PATH} -cf - ${tar_extra_flags} ${TAR_EXCLUDES[*]+"${TAR_EXCLUDES[*]}"} . | ${PV_PATH} | ${GTAR_PATH} -xf - -C ${FINAL_DEST}"
+    echo "  COPYFILE_DISABLE=1 ${GTAR_PATH} -cf - --ignore-failed-read ${TAR_EXCLUDES[*]+"${TAR_EXCLUDES[*]}"} . | ${PV_PATH} | ${GTAR_PATH} -xf - -C ${FINAL_DEST}"
     echo ""
     # shellcheck disable=SC2086
-    COPYFILE_DISABLE=1 "${GTAR_PATH}" -cf - ${tar_extra_flags} ${TAR_EXCLUDES[@]+"${TAR_EXCLUDES[@]}"} . \
+    TAR_EXIT=0
+    COPYFILE_DISABLE=1 "${GTAR_PATH}" -cf - --ignore-failed-read \
+      ${TAR_EXCLUDES[@]+"${TAR_EXCLUDES[@]}"} . \
       | "${PV_PATH}" \
-      | "${GTAR_PATH}" -xf - -C "${FINAL_DEST}"
+      | "${GTAR_PATH}" -xf - -C "${FINAL_DEST}" || TAR_EXIT=$?
+    if [[ "${TAR_EXIT}" -eq 2 ]]; then
+      echo ""
+      echo "⚠️  tar completed with partial-read warnings (exit code ${TAR_EXIT})."
+      echo "   Some files could not be read (permissions, TCC, or vanished during copy)."
+      echo "   This is normal for full-volume copies on macOS."
+    elif [[ "${TAR_EXIT}" -ne 0 ]]; then
+      echo ""
+      echo "❌ tar failed with exit code ${TAR_EXIT}."
+      exit "${TAR_EXIT}"
+    fi
   elif [[ "${TRANSFER_METHOD}" == "1" ]]; then
     # Rsync transfer with detected flags
     echo ""
@@ -1290,11 +1352,22 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
       echo "  COPYFILE_DISABLE=1 ${GTAR_PATH} -cf - --totals --ignore-failed-read ${TAR_EXCLUDES[*]+"${TAR_EXCLUDES[*]}"} . | ${PV_PATH} -p -t -e -b -r | sshpass -p '****' ssh ${SSH_OPTIONS} ${REMOTE_USER}@${REMOTE_IP} \"${REMOTE_TAR_CMD}\""
       echo ""
       # shellcheck disable=SC2086
+      TAR_EXIT=0
       COPYFILE_DISABLE=1 "${GTAR_PATH}" -cf - --totals --ignore-failed-read \
         ${TAR_EXCLUDES[@]+"${TAR_EXCLUDES[@]}"} . \
         | "${PV_PATH}" -p -t -e -b -r \
         | "${SSHPASS_PATH}" -p "${SSH_PASSWORD}" \
-          ssh ${SSH_OPTIONS} "${REMOTE_USER}@${REMOTE_IP}" "${REMOTE_TAR_CMD}"
+          ssh ${SSH_OPTIONS} "${REMOTE_USER}@${REMOTE_IP}" "${REMOTE_TAR_CMD}" || TAR_EXIT=$?
+      if [[ "${TAR_EXIT}" -eq 2 ]]; then
+        echo ""
+        echo "⚠️  tar completed with partial-read warnings (exit code ${TAR_EXIT})."
+        echo "   Some files could not be read (permissions, TCC, or vanished during copy)."
+        echo "   This is normal for full-volume copies on macOS."
+      elif [[ "${TAR_EXIT}" -ne 0 ]]; then
+        echo ""
+        echo "❌ tar failed with exit code ${TAR_EXIT}."
+        exit "${TAR_EXIT}"
+      fi
       ;;
   esac
 
