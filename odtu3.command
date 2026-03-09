@@ -7,6 +7,27 @@
 # ── Strict mode ──────────────────────────────────────────────────────────────
 set -euo pipefail
 
+
+# ── Interactive input helper ────────────────────────────────────────────────
+# When the script is executed via a pipe (e.g. curl ... | bash), stdin is NOT a
+# terminal, so plain `read` will hit EOF and return 1 (fatal under `set -e`).
+# This wrapper preserves interactive prompts by reading from /dev/tty when
+# stdin isn't a TTY, while remaining compatible with non-interactive runs.
+read_tty() {
+  # If stdin is already a TTY, read normally (supports readline -e).
+  if [[ -t 0 ]]; then
+    read "$@"
+    return $?
+  fi
+  # If we have a controlling terminal, read from it explicitly.
+  if [[ -r /dev/tty ]]; then
+    read "$@" </dev/tty
+    return $?
+  fi
+  # No TTY available (non-interactive). Fall back to stdin.
+  read "$@"
+}
+
 # ── Error handler ────────────────────────────────────────────────────────────
 _error_handler() {
   local lineno="$1" cmd="$2" code="$3"
@@ -22,12 +43,28 @@ TMP_DIR=""
 SSH_CONTROL_PATH=""  # reserved for future ControlMaster support
 LOG_FILE=""
 RSYNC_RUNTIME_OPTS=()
+TM_BACKUP_ACTIVE=""
+TM_MONITOR_PID=""
 
 cleanup() {
   local ec=$?
+  # Stop Time Machine backup if one is running
+  if [[ -n "${TM_BACKUP_ACTIVE}" ]]; then
+    echo ""
+    echo "⏳ Stopping Time Machine backup..."
+    sudo tmutil stopbackup 2>/dev/null || true
+    TM_BACKUP_ACTIVE=""
+  fi
+  # Kill TM progress monitor
+  if [[ -n "${TM_MONITOR_PID}" ]]; then
+    kill "${TM_MONITOR_PID}" 2>/dev/null || true
+    wait "${TM_MONITOR_PID}" 2>/dev/null || true
+    TM_MONITOR_PID=""
+  fi
   # Stop caffeinate
   if [[ -n "${CAFFEINATE_PID}" ]]; then
     kill "${CAFFEINATE_PID}" 2>/dev/null || true
+    wait "${CAFFEINATE_PID}" 2>/dev/null || true
   fi
   # Remove temp dir
   if [[ -n "${TMP_DIR}" && -d "${TMP_DIR}" ]]; then
@@ -44,6 +81,7 @@ cleanup() {
   exit "${ec}"
 }
 trap cleanup EXIT
+trap 'echo ""; echo "👋 Interrupted."; exit 130' INT
 
 # ── Banner ───────────────────────────────────────────────────────────────────
 clear 2>/dev/null || true
@@ -54,7 +92,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1428-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1446-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
@@ -105,7 +143,7 @@ log_tool_versions() {
 # ── Caffeinate ───────────────────────────────────────────────────────────────
 start_caffeinate() {
   if command -v caffeinate >/dev/null 2>&1; then
-    caffeinate -dimsu &
+    caffeinate -d &
     CAFFEINATE_PID=$!
   else
     echo "ℹ️  caffeinate not available (RecoveryOS) — skipping sleep prevention."
@@ -115,6 +153,7 @@ start_caffeinate() {
 stop_caffeinate() {
   if [[ -n "${CAFFEINATE_PID}" ]]; then
     kill "${CAFFEINATE_PID}" 2>/dev/null || true
+    wait "${CAFFEINATE_PID}" 2>/dev/null || true
     CAFFEINATE_PID=""
   fi
 }
@@ -129,7 +168,7 @@ verify_ssh_connection() {
 
 prompt_for_password() {
   echo ""
-  read -rsp "🔑 Enter SSH password for $1: " SSH_PASSWORD
+  read_tty -rsp "🔑 Enter SSH password for $1: " SSH_PASSWORD
   echo ""
 }
 
@@ -156,9 +195,10 @@ normalize_path() {
   if [[ "${p}" =~ ^\".*\"$ || "${p}" =~ ^\'.*\'$ ]]; then
     p="${p:1:${#p}-2}"
   fi
-  # If it contains backslashes, interpret escapes via printf %b
+  # If it contains backslashes, un-escape shell-style sequences
+  # (e.g. "\ " → " " from Terminal drag-and-drop, "\(" → "(", "\\" → "\")
   if [[ "${p}" == *\\* ]]; then
-    p="$(printf '%b' "${p//%/%%}")"
+    p="$(printf '%s' "${p}" | sed 's/\\\(.\)/\1/g')"
   fi
   echo "${p}"
 }
@@ -204,11 +244,11 @@ edit_excludes() {
     echo "  R - Remove an exclude by number"
     echo "  V - View list again"
     echo "  D - Done (use current list)"
-    read -rp "➡️  Enter choice [A/R/V/D]: " action
+    read_tty -rp "➡️  Enter choice [A/R/V/D]: " action
 
     case "${action}" in
       [Aa])
-        read -rp "Enter value to exclude (e.g., .DS_Store): " new_excl
+        read_tty -rp "Enter value to exclude (e.g., .DS_Store): " new_excl
         new_excl="$(echo "${new_excl}" | xargs)"
         if [[ -n "${new_excl}" ]]; then
           EXCLUDES+=("${new_excl}")
@@ -216,7 +256,7 @@ edit_excludes() {
         fi
         ;;
       [Rr])
-        read -rp "Enter the number of the exclude to remove: " idx
+        read_tty -rp "Enter the number of the exclude to remove: " idx
         idx=$((idx - 1))
         if [[ ${idx} -ge 0 && ${idx} -lt ${#EXCLUDES[@]} ]]; then
           echo "❌ Removed: ${EXCLUDES[$idx]}"
@@ -267,11 +307,17 @@ choose_rsync_runtime_mode() {
     fi
   else
     echo ""
-    echo "Rsync mode:"
-    echo "1) Strict (fail on read/permission errors)"
-    echo "2) Best-effort (resume + continue past unreadable files)"
-    read -rp "Enter 1 or 2 [2]: " RSYNC_MODE
-    RSYNC_MODE="${RSYNC_MODE:-2}"
+    while true; do
+      echo "Rsync mode:"
+      echo "1) Strict (fail on read/permission errors)"
+      echo "2) Best-effort (resume + continue past unreadable files)"
+      read_tty -rp "Enter 1 or 2 [2]: " RSYNC_MODE
+      RSYNC_MODE="${RSYNC_MODE:-2}"
+      case "${RSYNC_MODE}" in
+        1|2) break ;;
+        *) echo "⚠️ Invalid selection '${RSYNC_MODE}'. Please enter 1 or 2." ; echo "" ;;
+      esac
+    done
 
     if [[ "${RSYNC_MODE}" == "2" ]]; then
       RSYNC_RUNTIME_OPTS+=(--partial --partial-dir=.rsync-partial --ignore-errors)
@@ -325,10 +371,10 @@ _validate_data_volume() {
     local entry
     for entry in "${mount}/Users"/*/; do
       [[ -d "${entry}" ]] || continue
-      local basename
-      basename="$(basename "${entry}")"
+      local bname="${entry%/}"
+      bname="${bname##*/}"
       # Skip known system directories
-      case "${basename}" in
+      case "${bname}" in
         Shared|Guest|.localized|_*) continue ;;
       esac
       # A real home folder will have Library, Desktop, or Documents
@@ -348,29 +394,53 @@ detect_apfs_data_volume() {
   DATA_DETECT_METHOD=""
   DETECTED_APFS_MOUNT=""
 
-  # Method 1: diskutil apfs list — look for the Data role volume
+  # Method 1: diskutil apfs list — look for Data role volumes
+  # Collects ALL Data-role mount points and filters out:
+  #   - /System/Volumes/Data (local system's synthetic data volume)
+  #   - Volumes with "Ontrack" in the mount path (local extraction machine)
   if command -v diskutil >/dev/null 2>&1; then
+    local candidates=()
+    local skipped_ontrack=()
     local data_mount
-    # IMPORTANT: Mount points commonly contain spaces (e.g. "/Volumes/Macintosh HD - Data").
-    # So we must capture the full remainder of the line, not $NF.
-    data_mount=$(
-      diskutil apfs list 2>/dev/null | awk '
-        /^[[:space:]]*Role:[[:space:]]*/ {
-          role=$0
-          sub(/^[[:space:]]*Role:[[:space:]]*/, "", role)
-        }
-        /^[[:space:]]*Mount Point:[[:space:]]*/ {
-          mp=$0
-          sub(/^[[:space:]]*Mount Point:[[:space:]]*/, "", mp)
-          # Accept "Data" role, including formats like "(Data)" or "Data, something"
-          if (role ~ /(^|[[:space:]]|\()Data(\)|$|,)/) print mp
-        }
-      ' | head -1
-    )
-    # Trim whitespace
-    data_mount="${data_mount#"${data_mount%%[![:space:]]*}"}"
-    data_mount="${data_mount%"${data_mount##*[![:space:]]}"}"
-    if [[ -n "${data_mount}" && -d "${data_mount}" ]]; then
+
+    while IFS= read -r data_mount; do
+      [[ -z "${data_mount}" ]] && continue
+      # Trim whitespace
+      data_mount="${data_mount#"${data_mount%%[![:space:]]*}"}"
+      data_mount="${data_mount%"${data_mount##*[![:space:]]}"}"
+      [[ -z "${data_mount}" ]] && continue
+      [[ -d "${data_mount}" ]] || continue
+
+      # Skip /System/Volumes/Data (local system volume — wrong target on
+      # extraction machines with an attached customer drive)
+      if [[ "${data_mount}" == "/System/Volumes/Data" ]]; then
+        echo "ℹ️  Skipping local system volume: ${data_mount}"
+        continue
+      fi
+
+      # Skip volumes with "Ontrack" in the mount path (extraction machine's own volume)
+      if echo "${data_mount}" | grep -qi "ontrack"; then
+        echo "ℹ️  Skipping Ontrack volume: ${data_mount}"
+        skipped_ontrack+=("${data_mount}")
+        continue
+      fi
+
+      candidates+=("${data_mount}")
+    done < <(diskutil apfs list 2>/dev/null | awk '
+      /^[[:space:]]*Role:[[:space:]]*/ {
+        role=$0
+        sub(/^[[:space:]]*Role:[[:space:]]*/, "", role)
+      }
+      /^[[:space:]]*Mount Point:[[:space:]]*/ {
+        mp=$0
+        sub(/^[[:space:]]*Mount Point:[[:space:]]*/, "", mp)
+        # Accept "Data" role, including formats like "(Data)" or "Data, something"
+        if (role ~ /(^|[[:space:]]|\()Data(\)|$|,)/) print mp
+      }
+    ')
+
+    # Try each non-filtered candidate
+    for data_mount in ${candidates[@]+"${candidates[@]}"}; do
       if _validate_data_volume "${data_mount}"; then
         DATA_DETECT_METHOD="diskutil apfs list (Data role)"
         DETECTED_APFS_MOUNT="${data_mount}"
@@ -379,12 +449,39 @@ detect_apfs_data_volume() {
         echo "⚠️  Found Data volume at ${data_mount} but it appears empty (no user data)."
         echo "   This is likely the system scaffold, not the customer data volume."
       fi
+    done
+
+    # If we only found Ontrack volumes (no other candidates), offer override
+    if [[ ${#skipped_ontrack[@]} -gt 0 && ${#candidates[@]} -eq 0 ]]; then
+      echo ""
+      echo "⚠️  Only Ontrack-named Data volume(s) were found:"
+      for ov in "${skipped_ontrack[@]}"; do
+        echo "    - ${ov}"
+      done
+      read_tty -rp "Include Ontrack volume(s) anyway? (y/N): " include_ontrack
+      if [[ "${include_ontrack}" =~ ^[Yy]$ ]]; then
+        for data_mount in "${skipped_ontrack[@]}"; do
+          if _validate_data_volume "${data_mount}"; then
+            DATA_DETECT_METHOD="diskutil apfs list (Data role, Ontrack override)"
+            DETECTED_APFS_MOUNT="${data_mount}"
+            return 0
+          fi
+        done
+      fi
     fi
   fi
 
-  # Method 2: well-known path — also validate it has real content
+  # Method 2: /System/Volumes/Data fallback — only use when we're likely
+  # booted directly on the customer machine (not on an extraction machine).
+  # Check the volume name for "Ontrack" to avoid targeting the local drive.
   if [[ -d "/System/Volumes/Data" ]]; then
-    if _validate_data_volume "/System/Volumes/Data"; then
+    local sys_vol_name=""
+    sys_vol_name=$(diskutil info "/System/Volumes/Data" 2>/dev/null \
+      | awk -F: '/Volume Name/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2}' \
+      | head -1)
+    if echo "${sys_vol_name}" | grep -qi "ontrack"; then
+      echo "ℹ️  Skipping /System/Volumes/Data (Ontrack volume: ${sys_vol_name})"
+    elif _validate_data_volume "/System/Volumes/Data"; then
       DATA_DETECT_METHOD="/System/Volumes/Data fallback"
       DETECTED_APFS_MOUNT="/System/Volumes/Data"
       return 0
@@ -423,7 +520,7 @@ find_largest_volume() {
     # Reconstruct mount point from field 9 onwards
     mp=""; for(i=9;i<=NF;i++) mp=(mp ? mp " " $i : $i);
     print $2, $3, mp
-  }' | grep -v "My Passport")
+  }' | grep -v "My Passport" | grep -v "/System/Volumes/Data")
 
   if [[ -n "${job_filter}" ]]; then
     df_output=$(echo "${df_output}" | grep -v "${job_filter}")
@@ -440,7 +537,7 @@ find_largest_volume() {
       ov_mount=$(echo "${ov}" | awk '{for(i=3;i<=NF;i++) printf "%s%s", $i, (i<NF?" ":""); print ""}')
       echo "    - ${ov_mount}"
     done
-    read -rp "Include Ontrack volume(s) anyway? (y/N): " include_ontrack
+    read_tty -rp "Include Ontrack volume(s) anyway? (y/N): " include_ontrack
     if [[ "${include_ontrack}" =~ ^[Yy]$ ]]; then
       echo "✅ Including Ontrack volume(s) in detection."
     else
@@ -517,11 +614,11 @@ select_source_volume() {
     echo "   3. Click 'Mount'"
     echo "   4. Note the mount path shown (e.g. /Volumes/Macintosh HD - Data)"
     echo ""
-    read -rp "Press Enter to continue and manually specify the path, or Ctrl+C to exit and mount first: " _
+    read_tty -rp "Press Enter to continue and manually specify the path, or Ctrl+C to exit and mount first: " _
   fi
 
   echo "📝 Detection method: ${method}"
-  read -e -r -p "Press Enter to accept [${suggested}], or type/drag a different path (Tab to autocomplete): " custom_volume
+  read_tty -e -r -p "Press Enter to accept [${suggested}], or type/drag a different path (Tab to autocomplete): " custom_volume
   SRC_VOL="${custom_volume:-${suggested}}"
   SRC_VOL="$(normalize_path "${SRC_VOL}")"
 
@@ -556,8 +653,18 @@ build_rsync_flags() {
   # transfers the receiver is likely Apple 2.6.9, so we skip both to
   # avoid protocol mismatch.
   if [[ "${mode}" != "remote" ]]; then
-    RSYNC_FLAGS+=(-E -X)
-    echo "✅ Executability (-E) and extended attributes (-X) enabled for local transfer."
+    if "${RSYNC_PATH}" --help 2>&1 | grep -q -- '-E.*executability\|--executability'; then
+      RSYNC_FLAGS+=(-E)
+      echo "✅ rsync supports executability (-E), enabled."
+    else
+      echo "⚠️  rsync does not support executability (-E), skipping."
+    fi
+    if "${RSYNC_PATH}" --help 2>&1 | grep -q -- '-X.*xattrs\|--xattrs'; then
+      RSYNC_FLAGS+=(-X)
+      echo "✅ rsync supports extended attributes (-X), enabled."
+    else
+      echo "⚠️  rsync does not support extended attributes (-X), skipping. Resource forks may be lost."
+    fi
   else
     echo "ℹ️  Skipping -E/-X for remote transfer (avoids protocol mismatch with Apple rsync)."
   fi
@@ -668,7 +775,7 @@ SSHPASS_PATH="${TMP_DIR}/sshpass"
 SCRIPT_REALPATH="$(realpath "$0" 2>/dev/null || true)"
 if [[ -f "${SCRIPT_REALPATH}" ]]; then
   RUN_MODE="local"
-  MARKER_FILE="/tmp/$(basename "${SCRIPT_REALPATH}").fda_granted"
+  MARKER_FILE="/tmp/${SCRIPT_REALPATH##*/}.fda_granted"
 else
   RUN_MODE="remote"
   MARKER_FILE="/tmp/odtu.fda_granted"
@@ -765,8 +872,14 @@ else
       echo "  The transfer will skip files that require elevated permissions"
       echo "  but will still capture the user's home folder data."
       echo ""
-      read -rp "Enter 1 or 2 [1]: " fda_choice
-      fda_choice="${fda_choice:-1}"
+      while true; do
+        read_tty -rp "Enter 1 or 2 [1]: " fda_choice
+        fda_choice="${fda_choice:-1}"
+        case "${fda_choice}" in
+          1|2) break ;;
+          *) echo "⚠️ Invalid selection '${fda_choice}'. Please enter 1 or 2." ;;
+        esac
+      done
 
       if [[ "${fda_choice}" == "2" ]]; then
         LIMITED_ACCESS_MODE="1"
@@ -857,18 +970,50 @@ verify_sha256 "${SSHPASS_PATH}" "sshpass"  "${HASH_SSHPASS}" || true
 ###############################################################################
 
 echo ""
-echo "Please select copy mode:"
-echo "1) Local Session Copy - copy directly to an attached external drive"
-echo "2) Remote Session Copy - transfer over SSH to another Mac"
-echo "3) Setup Listener - sets this machine to recieve data over WIFI with ODTU"
-read -rp "Enter 1, 2, or 3: " SESSION_MODE
+# Time Machine option only available on normal boot with sudo access
+TM_AVAILABLE=""
+if ! is_recovery_os && [[ -z "${LIMITED_ACCESS_MODE}" ]] && command -v tmutil >/dev/null 2>&1; then
+  TM_AVAILABLE="yes"
+fi
+
+while true; do
+  echo "Please select copy mode:"
+  echo "1) Local Session Copy - copy directly to an attached external drive"
+  echo "2) Remote Session Copy - transfer over SSH to another Mac"
+  echo "3) Setup Listener - sets this machine to recieve data over WIFI with ODTU"
+  if [[ -n "${TM_AVAILABLE}" ]]; then
+    echo "4) Time Machine Backup - create a Time Machine backup to an external drive"
+  fi
+  if [[ -n "${TM_AVAILABLE}" ]]; then
+    read_tty -rp "Enter 1, 2, 3, or 4: " SESSION_MODE
+  else
+    read_tty -rp "Enter 1, 2, or 3: " SESSION_MODE
+  fi
+  case "${SESSION_MODE}" in
+    1|2|3) break ;;
+    4)
+      if [[ -n "${TM_AVAILABLE}" ]]; then
+        break
+      else
+        echo "⚠️ Time Machine is not available in RecoveryOS." ; echo ""
+      fi
+      ;;
+    *) echo "⚠️ Invalid selection. Please try again." ; echo "" ;;
+  esac
+done
 
 ###############################################################################
 # ═══ MODE 1: LOCAL SESSION ══════════════════════════════════════════════════ #
 ###############################################################################
 if [[ "${SESSION_MODE}" == "1" ]]; then
   echo "🔧 Local Session Selected"
-  read -rp "Enter job number: " JOB_NUM
+  while true; do
+    read_tty -rp "Enter job number: " JOB_NUM
+    if [[ -n "${JOB_NUM}" ]]; then
+      break
+    fi
+    echo "⚠️ Job number cannot be empty. Please try again."
+  done
 
   select_source_volume "${JOB_NUM}"
 
@@ -883,18 +1028,57 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
     while [[ ! -d "/Volumes/My Passport" ]]; do sleep 1; done
     echo "✅ External drive detected. Formatting..."
 
-    MP_DEV_ID=$(diskutil info -plist "/Volumes/My Passport" 2>/dev/null | \
-      plutil -extract DeviceIdentifier xml1 -o - - | \
-      grep -oE "disk[0-9]+s[0-9]+")
+    # Try multiple methods to get the device identifier — NTFS and other
+    # non-native filesystems may not respond to all of these.
+    # Each result is validated: must match diskNsN or diskN pattern.
+    # (e.g. stat returns "???" for NTFS which must be rejected)
+    MP_DEV_ID=""
+    _try_dev_id() {
+      local candidate="$1" method="$2"
+      candidate="${candidate#/dev/}"  # strip /dev/ prefix
+      if [[ "${candidate}" =~ ^disk[0-9]+(s[0-9]+)?$ ]]; then
+        echo "  ✅ ${method}: ${candidate}"
+        MP_DEV_ID="${candidate}"
+        return 0
+      elif [[ -n "${candidate}" ]]; then
+        echo "  ⚠️  ${method} returned '${candidate}' (not a valid disk ID, skipping)"
+      fi
+      return 1
+    }
+
+    # Method 1: diskutil info (works for HFS+/APFS)
+    _try_dev_id "$(diskutil info "/Volumes/My Passport" 2>/dev/null | \
+      awk '/Device Identifier:/ {print $NF}' || true)" "diskutil info" || true
+
+    # Method 2: stat (queries the filesystem directly)
+    if [[ -z "${MP_DEV_ID}" ]]; then
+      _try_dev_id "$(stat -f%Sd "/Volumes/My Passport" 2>/dev/null || true)" "stat" || true
+    fi
+
+    # Method 3: df
+    if [[ -z "${MP_DEV_ID}" ]]; then
+      _try_dev_id "$(df "/Volumes/My Passport" 2>/dev/null | \
+        awk 'NR==2{print $1}' || true)" "df" || true
+    fi
+
+    # Method 4: diskutil list — search all disks for "My Passport" by name
+    if [[ -z "${MP_DEV_ID}" ]]; then
+      _try_dev_id "$(diskutil list 2>/dev/null | \
+        awk '/My Passport/{print $NF}' | head -1 || true)" "diskutil list" || true
+    fi
 
     if [[ -z "${MP_DEV_ID}" ]]; then
-      echo "❌ Could not locate volume for 'My Passport'."
+      echo "❌ Could not locate device for 'My Passport'."
+      echo "   The drive is visible but no method returned a valid disk identifier."
       exit 1
     fi
 
-    ROOT_DISK=$(echo "${MP_DEV_ID}" | sed 's/s[0-9]*$//')
+    echo "  📀 Using device: ${MP_DEV_ID}"
+
+    # Extract the base disk (e.g. disk2s1 → disk2)
+    ROOT_DISK=$(echo "${MP_DEV_ID}" | grep -oE '^disk[0-9]+' || true)
     if [[ -z "${ROOT_DISK}" ]]; then
-      echo "❌ Failed to extract base disk ID."
+      echo "❌ Failed to extract base disk ID from '${MP_DEV_ID}'."
       exit 1
     fi
 
@@ -920,7 +1104,7 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
     echo "1) rsync (default, recommended)"
     echo "2) tar"
     echo "3) OPTION - edit excludes for transfers"
-    read -rp "Enter 1, 2, or 3: " TRANSFER_CHOICE
+    read_tty -rp "Enter 1, 2, or 3: " TRANSFER_CHOICE
 
     case "${TRANSFER_CHOICE}" in
       1|2)
@@ -942,7 +1126,7 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
   echo "Starting local transfer using method ${TRANSFER_METHOD}..."
   start_caffeinate
 
-  VOL_NAME=$(basename "${SRC_VOL}")
+  VOL_NAME="${SRC_VOL##*/}"
   FINAL_DEST="${DEST_PATH}/${VOL_NAME}"
   mkdir -p "${FINAL_DEST}"
 
@@ -951,20 +1135,49 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
   if [[ "${TRANSFER_METHOD}" == "2" ]]; then
     # Tar transfer — excludes BEFORE the path argument
     cd "${SRC_VOL}" || exit 1
-    local tar_extra_flags=""
-    if [[ -n "${LIMITED_ACCESS_MODE}" ]]; then
-      tar_extra_flags="--ignore-failed-read"
-    fi
+    # Always use --ignore-failed-read: forensic volume copies routinely
+    # encounter unreadable files (TCC-protected, permission denied, etc.)
+    echo ""
+    echo "📋 Command:"
+    echo "  COPYFILE_DISABLE=1 ${GTAR_PATH} -cf - --ignore-failed-read ${TAR_EXCLUDES[*]+"${TAR_EXCLUDES[*]}"} . | ${PV_PATH} | ${GTAR_PATH} -xf - -C ${FINAL_DEST}"
+    echo ""
     # shellcheck disable=SC2086
-    COPYFILE_DISABLE=1 "${GTAR_PATH}" -cf - ${tar_extra_flags} ${TAR_EXCLUDES[@]+"${TAR_EXCLUDES[@]}"} . \
+    TAR_EXIT=0
+    COPYFILE_DISABLE=1 "${GTAR_PATH}" -cf - --ignore-failed-read \
+      ${TAR_EXCLUDES[@]+"${TAR_EXCLUDES[@]}"} . \
       | "${PV_PATH}" \
-      | "${GTAR_PATH}" -xf - -C "${FINAL_DEST}"
+      | "${GTAR_PATH}" -xf - -C "${FINAL_DEST}" || TAR_EXIT=$?
+    if [[ "${TAR_EXIT}" -eq 2 ]]; then
+      echo ""
+      echo "⚠️  tar completed with partial-read warnings (exit code ${TAR_EXIT})."
+      echo "   Some files could not be read (permissions, TCC, or vanished during copy)."
+      echo "   This is normal for full-volume copies on macOS."
+    elif [[ "${TAR_EXIT}" -ne 0 ]]; then
+      echo ""
+      echo "❌ tar failed with exit code ${TAR_EXIT}."
+      exit "${TAR_EXIT}"
+    fi
   elif [[ "${TRANSFER_METHOD}" == "1" ]]; then
     # Rsync transfer with detected flags
+    echo ""
+    echo "📋 Command:"
+    echo "  ${RSYNC_PATH} ${RSYNC_FLAGS[*]+"${RSYNC_FLAGS[*]}"} -v ${RSYNC_RUNTIME_OPTS[*]+"${RSYNC_RUNTIME_OPTS[*]}"} ${RSYNC_EXCLUDES[*]+"${RSYNC_EXCLUDES[*]}"} ${SRC_VOL}/ ${FINAL_DEST}"
+    echo ""
+    RSYNC_EXIT=0
     "${RSYNC_PATH}" ${RSYNC_FLAGS[@]+"${RSYNC_FLAGS[@]}"} -v \
       ${RSYNC_RUNTIME_OPTS[@]+"${RSYNC_RUNTIME_OPTS[@]}"} \
       ${RSYNC_EXCLUDES[@]+"${RSYNC_EXCLUDES[@]}"} \
-      "${SRC_VOL}/" "${FINAL_DEST}"
+      "${SRC_VOL}/" "${FINAL_DEST}" || RSYNC_EXIT=$?
+    if [[ "${RSYNC_EXIT}" -eq 23 || "${RSYNC_EXIT}" -eq 24 ]]; then
+      echo ""
+      echo "⚠️  rsync completed with partial-transfer warnings (exit code ${RSYNC_EXIT})."
+      echo "   Some files could not be read (permissions, TCC, or vanished during copy)."
+      echo "   This is normal for full-volume copies on macOS."
+    elif [[ "${RSYNC_EXIT}" -ne 0 ]]; then
+      echo ""
+      echo "❌ rsync failed with exit code ${RSYNC_EXIT}."
+      exit "${RSYNC_EXIT}"
+    fi
   fi
 
   ELAPSED_TIME=$((SECONDS - START_TIME))
@@ -1032,7 +1245,16 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
     done < "${TMP_DIR}/listeners.txt"
 
     echo ""
-    read -rp "Select a receiver [1-${#LISTENERS[@]}]: " CHOICE
+    while true; do
+      read_tty -rp "Select a receiver [1-${#LISTENERS[@]}]: " CHOICE
+      # Validate: must be a number within range
+      if [[ "${CHOICE}" =~ ^[0-9]+$ ]] && \
+         [[ "${CHOICE}" -ge 1 ]] && \
+         [[ "${CHOICE}" -le ${#LISTENERS[@]} ]]; then
+        break
+      fi
+      echo "⚠️ Invalid selection '${CHOICE}'. Please enter a number between 1 and ${#LISTENERS[@]}."
+    done
     SELECTED="${LISTENERS[$((CHOICE-1))]}"
     IFS=':' read -r REMOTE_USER REMOTE_IP REMOTE_DEST <<< "${SELECTED}"
   else
@@ -1058,7 +1280,7 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
     echo "1) rsync (default, recommended)"
     echo "2) tar"
     echo "3) OPTION - edit excludes for transfers"
-    read -rp "Enter 1, 2, or 3: " TRANSFER_CHOICE
+    read_tty -rp "Enter 1, 2, or 3: " TRANSFER_CHOICE
 
     case "${TRANSFER_CHOICE}" in
       1|2)
@@ -1111,23 +1333,53 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
       # Best-effort vs strict rsync behavior (resume/ignore errors)
       choose_rsync_runtime_mode
       # rsync with --protect-args handles spaces in remote paths
+      echo ""
+      echo "📋 Command:"
+      echo "  sshpass -p '****' ${RSYNC_PATH} -e \"ssh ${SSH_OPTIONS}\" ${RSYNC_FLAGS[*]+"${RSYNC_FLAGS[*]}"} -v ${RSYNC_RUNTIME_OPTS[*]+"${RSYNC_RUNTIME_OPTS[*]}"} ${RSYNC_EXCLUDES[*]+"${RSYNC_EXCLUDES[*]}"} ${SRC_VOL}/ ${REMOTE_USER}@${REMOTE_IP}:${REMOTE_DEST}"
+      echo ""
       # shellcheck disable=SC2086
+      RSYNC_EXIT=0
       "${SSHPASS_PATH}" -p "${SSH_PASSWORD}" \
         "${RSYNC_PATH}" -e "ssh ${SSH_OPTIONS}" \
         ${RSYNC_FLAGS[@]+"${RSYNC_FLAGS[@]}"} -v \
         ${RSYNC_RUNTIME_OPTS[@]+"${RSYNC_RUNTIME_OPTS[@]}"} \
         ${RSYNC_EXCLUDES[@]+"${RSYNC_EXCLUDES[@]}"} \
-        "${SRC_VOL}/" "${REMOTE_USER}@${REMOTE_IP}:${REMOTE_DEST}"
+        "${SRC_VOL}/" "${REMOTE_USER}@${REMOTE_IP}:${REMOTE_DEST}" || RSYNC_EXIT=$?
+      if [[ "${RSYNC_EXIT}" -eq 23 || "${RSYNC_EXIT}" -eq 24 ]]; then
+        echo ""
+        echo "⚠️  rsync completed with partial-transfer warnings (exit code ${RSYNC_EXIT})."
+        echo "   Some files could not be read (permissions, TCC, or vanished during copy)."
+        echo "   This is normal for full-volume copies on macOS."
+      elif [[ "${RSYNC_EXIT}" -ne 0 ]]; then
+        echo ""
+        echo "❌ rsync failed with exit code ${RSYNC_EXIT}."
+        exit "${RSYNC_EXIT}"
+      fi
       ;;
     2)
       # Tar pipeline — excludes before path, use gtar on both ends
       REMOTE_TAR_CMD=$(printf 'cd %q && tar -xf -' "${REMOTE_DEST}")
+      echo ""
+      echo "📋 Command:"
+      echo "  COPYFILE_DISABLE=1 ${GTAR_PATH} -cf - --totals --ignore-failed-read ${TAR_EXCLUDES[*]+"${TAR_EXCLUDES[*]}"} . | ${PV_PATH} -p -t -e -b -r | sshpass -p '****' ssh ${SSH_OPTIONS} ${REMOTE_USER}@${REMOTE_IP} \"${REMOTE_TAR_CMD}\""
+      echo ""
       # shellcheck disable=SC2086
+      TAR_EXIT=0
       COPYFILE_DISABLE=1 "${GTAR_PATH}" -cf - --totals --ignore-failed-read \
         ${TAR_EXCLUDES[@]+"${TAR_EXCLUDES[@]}"} . \
         | "${PV_PATH}" -p -t -e -b -r \
         | "${SSHPASS_PATH}" -p "${SSH_PASSWORD}" \
-          ssh ${SSH_OPTIONS} "${REMOTE_USER}@${REMOTE_IP}" "${REMOTE_TAR_CMD}"
+          ssh ${SSH_OPTIONS} "${REMOTE_USER}@${REMOTE_IP}" "${REMOTE_TAR_CMD}" || TAR_EXIT=$?
+      if [[ "${TAR_EXIT}" -eq 2 ]]; then
+        echo ""
+        echo "⚠️  tar completed with partial-read warnings (exit code ${TAR_EXIT})."
+        echo "   Some files could not be read (permissions, TCC, or vanished during copy)."
+        echo "   This is normal for full-volume copies on macOS."
+      elif [[ "${TAR_EXIT}" -ne 0 ]]; then
+        echo ""
+        echo "❌ tar failed with exit code ${TAR_EXIT}."
+        exit "${TAR_EXIT}"
+      fi
       ;;
   esac
 
@@ -1158,18 +1410,66 @@ if [[ "${SESSION_MODE}" == "3" ]]; then
   # === Check if "My Passport" is connected and offer to format ===
   if [[ -d "/Volumes/My Passport" ]]; then
     echo "💽 'My Passport' drive detected."
-    read -rp "📦 Enter job number to format drive as: " JOB_NUM
+    while true; do
+      read_tty -rp "📦 Enter job number to format drive as: " JOB_NUM
+      if [[ -n "${JOB_NUM}" ]]; then
+        break
+      fi
+      echo "⚠️ Job number cannot be empty. Please try again."
+    done
 
-    VOLUME_DEVICE=$(diskutil info -plist "/Volumes/My Passport" | \
-      plutil -extract DeviceIdentifier xml1 -o - - | \
-      grep -oE "disk[0-9]+s[0-9]+")
+    # Try multiple methods to get the device identifier.
+    # Uses the same _try_dev_id helper defined above (validates diskNsN format).
+    VOLUME_DEVICE=""
+    # Reuse _try_dev_id but write to VOLUME_DEVICE instead of MP_DEV_ID
+    _try_vol_id() {
+      local candidate="$1" method="$2"
+      candidate="${candidate#/dev/}"
+      if [[ "${candidate}" =~ ^disk[0-9]+(s[0-9]+)?$ ]]; then
+        echo "  ✅ ${method}: ${candidate}"
+        VOLUME_DEVICE="${candidate}"
+        return 0
+      elif [[ -n "${candidate}" ]]; then
+        echo "  ⚠️  ${method} returned '${candidate}' (not a valid disk ID, skipping)"
+      fi
+      return 1
+    }
+
+    # Method 1: diskutil info
+    _try_vol_id "$(diskutil info "/Volumes/My Passport" 2>/dev/null | \
+      awk '/Device Identifier:/ {print $NF}' || true)" "diskutil info" || true
+
+    # Method 2: stat
+    if [[ -z "${VOLUME_DEVICE}" ]]; then
+      _try_vol_id "$(stat -f%Sd "/Volumes/My Passport" 2>/dev/null || true)" "stat" || true
+    fi
+
+    # Method 3: df
+    if [[ -z "${VOLUME_DEVICE}" ]]; then
+      _try_vol_id "$(df "/Volumes/My Passport" 2>/dev/null | \
+        awk 'NR==2{print $1}' || true)" "df" || true
+    fi
+
+    # Method 4: diskutil list — search by name
+    if [[ -z "${VOLUME_DEVICE}" ]]; then
+      _try_vol_id "$(diskutil list 2>/dev/null | \
+        awk '/My Passport/{print $NF}' | head -1 || true)" "diskutil list" || true
+    fi
 
     if [[ -z "${VOLUME_DEVICE}" ]]; then
       echo "❌ Could not get device identifier for 'My Passport'"
+      echo "   No method returned a valid disk identifier."
       exit 1
     fi
 
-    ROOT_DISK=$(echo "${VOLUME_DEVICE}" | sed 's/s[0-9]*$//')
+    echo "  📀 Using device: ${VOLUME_DEVICE}"
+
+    # Extract the base disk (e.g. disk2s1 → disk2)
+    ROOT_DISK=$(echo "${VOLUME_DEVICE}" | grep -oE '^disk[0-9]+' || true)
+    if [[ -z "${ROOT_DISK}" ]]; then
+      echo "❌ Failed to extract base disk ID from '${VOLUME_DEVICE}'."
+      exit 1
+    fi
 
     echo "🧹 Erasing /dev/${ROOT_DISK} as HFS+ with name '${JOB_NUM}'..."
     sudo diskutil eraseDisk JHFS+ "${JOB_NUM}" "/dev/${ROOT_DISK}" || {
@@ -1187,7 +1487,7 @@ if [[ "${SESSION_MODE}" == "3" ]]; then
 
     while true; do
       echo "📁 Destination directory [${DEFAULT_DESTINATION}]"
-      read -e -r -p "Press Enter for default, or type/drag a custom path (Tab to autocomplete): " DEST_OVERRIDE
+      read_tty -e -r -p "Press Enter for default, or type/drag a custom path (Tab to autocomplete): " DEST_OVERRIDE
       DESTINATION_PATH="$(normalize_path "${DEST_OVERRIDE:-${DEFAULT_DESTINATION}}")"
 
       if [[ -z "${DEST_OVERRIDE}" ]]; then
@@ -1220,4 +1520,313 @@ if [[ "${SESSION_MODE}" == "3" ]]; then
   while true; do
     echo "${USERNAME}:${IP}:${DESTINATION_PATH}" | nc -l "${PORT}"
   done
+fi
+
+###############################################################################
+# ═══ MODE 4: TIME MACHINE BACKUP ═════════════════════════════════════════ #
+###############################################################################
+if [[ "${SESSION_MODE}" == "4" ]]; then
+  echo "🔧 Time Machine Backup Selected"
+  echo ""
+
+  # Verify sudo access before proceeding — tmutil requires it
+  if ! sudo -n true 2>/dev/null; then
+    echo "⚠️  Time Machine requires administrator privileges."
+    echo "   Checking sudo access..."
+    if ! sudo true 2>/dev/null; then
+      echo "❌ Could not obtain sudo access. Time Machine backup requires admin privileges."
+      echo "   This user may not be in the sudoers file."
+      exit 1
+    fi
+  fi
+
+  # ── Determine destination drive ──────────────────────────────────────────
+  TM_DEST=""
+
+  # Check for My Passport first
+  if [[ -d "/Volumes/My Passport" ]]; then
+    echo "💽 'My Passport' drive detected."
+    while true; do
+      read_tty -rp "Format My Passport for Time Machine backup? (y/n): " TM_FORMAT
+      case "${TM_FORMAT}" in
+        [yY]|[yY][eE][sS])
+          while true; do
+            read_tty -rp "📦 Enter job number to format drive as: " JOB_NUM
+            if [[ -n "${JOB_NUM}" ]]; then break; fi
+            echo "⚠️ Job number cannot be empty. Please try again."
+          done
+
+          # Detect device using the same multi-method approach
+          VOLUME_DEVICE=""
+          _try_vol_id() {
+            local candidate="$1" method="$2"
+            candidate="${candidate#/dev/}"
+            if [[ "${candidate}" =~ ^disk[0-9]+(s[0-9]+)?$ ]]; then
+              echo "  ✅ ${method}: ${candidate}"
+              VOLUME_DEVICE="${candidate}"
+              return 0
+            elif [[ -n "${candidate}" ]]; then
+              echo "  ⚠️  ${method} returned '${candidate}' (not a valid disk ID, skipping)"
+            fi
+            return 1
+          }
+
+          _try_vol_id "$(diskutil info "/Volumes/My Passport" 2>/dev/null | \
+            awk '/Device Identifier:/ {print $NF}' || true)" "diskutil info" || true
+          if [[ -z "${VOLUME_DEVICE}" ]]; then
+            _try_vol_id "$(stat -f%Sd "/Volumes/My Passport" 2>/dev/null || true)" "stat" || true
+          fi
+          if [[ -z "${VOLUME_DEVICE}" ]]; then
+            _try_vol_id "$(df "/Volumes/My Passport" 2>/dev/null | \
+              awk 'NR==2{print $1}' || true)" "df" || true
+          fi
+          if [[ -z "${VOLUME_DEVICE}" ]]; then
+            _try_vol_id "$(diskutil list 2>/dev/null | \
+              awk '/My Passport/{print $NF}' | head -1 || true)" "diskutil list" || true
+          fi
+
+          if [[ -z "${VOLUME_DEVICE}" ]]; then
+            echo "❌ Could not get device identifier for 'My Passport'"
+            exit 1
+          fi
+
+          ROOT_DISK=$(echo "${VOLUME_DEVICE}" | grep -oE '^disk[0-9]+' || true)
+          if [[ -z "${ROOT_DISK}" ]]; then
+            echo "❌ Failed to extract base disk ID from '${VOLUME_DEVICE}'."
+            exit 1
+          fi
+
+          echo "🧹 Erasing /dev/${ROOT_DISK} as HFS+ with name '${JOB_NUM}'..."
+          sudo diskutil eraseDisk JHFS+ "${JOB_NUM}" "/dev/${ROOT_DISK}" || {
+            echo "❌ Disk erase failed"
+            exit 1
+          }
+
+          TM_DEST="/Volumes/${JOB_NUM}"
+          break
+          ;;
+        [nN]|[nN][oO]) break ;;
+        *) echo "⚠️ Please enter y or n." ;;
+      esac
+    done
+  fi
+
+  # If no My Passport or user declined formatting, ask for a destination
+  if [[ -z "${TM_DEST}" ]]; then
+    echo ""
+    echo "Available volumes:"
+    TM_VOL_LIST=()
+    TM_VOL_INDEX=1
+    for vol in /Volumes/*/; do
+      [[ -d "${vol}" ]] || continue
+      vol_path="${vol%/}"
+      vol_name="${vol_path##*/}"
+      case "${vol_name}" in
+        Macintosh\ HD*|Recovery|Preboot|VM|Update) continue ;;
+      esac
+      TM_VOL_LIST+=("${vol_path}")
+      echo "  ${TM_VOL_INDEX}) ${vol_name}"
+      TM_VOL_INDEX=$((TM_VOL_INDEX + 1))
+    done
+    echo ""
+    while true; do
+      read_tty -e -r -p "Select a volume number, or drag/type a custom path: " TM_DEST_INPUT
+      # Check if input is a number matching a listed volume
+      if [[ "${TM_DEST_INPUT}" =~ ^[0-9]+$ ]] && \
+         [[ "${TM_DEST_INPUT}" -ge 1 ]] && \
+         [[ "${TM_DEST_INPUT}" -le ${#TM_VOL_LIST[@]} ]]; then
+        TM_DEST="${TM_VOL_LIST[$((TM_DEST_INPUT - 1))]}"
+        break
+      elif [[ "${TM_DEST_INPUT}" =~ ^[0-9]+$ ]]; then
+        echo "⚠️ Invalid selection '${TM_DEST_INPUT}'. Please enter a number between 1 and ${#TM_VOL_LIST[@]}."
+      else
+        # Treat as a typed/dragged path
+        TM_DEST="$(normalize_path "${TM_DEST_INPUT}")"
+        if [[ -d "${TM_DEST}" ]]; then
+          break
+        fi
+        echo "⚠️ Directory does not exist: ${TM_DEST}. Please try again."
+        TM_DEST=""
+      fi
+    done
+  fi
+
+  # tmutil requires a volume mount point — it manages its own folder structure
+  # (creates Backups.backupdb/<MachineName>/<Date>/ automatically)
+
+  # Verify the destination is writable (use sudo — TM may have changed ownership)
+  if ! sudo touch "${TM_DEST}/.tm_write_test" 2>/dev/null; then
+    echo "❌ Destination ${TM_DEST} is not writable."
+    exit 1
+  fi
+  sudo rm -f "${TM_DEST}/.tm_write_test"
+
+  echo ""
+  echo "📋 Time Machine Backup Configuration:"
+  echo "  Destination: ${TM_DEST}"
+  echo ""
+
+  # ── Save and replace existing TM destination ─────────────────────────────
+  ORIGINAL_TM_DEST=""
+  ORIGINAL_TM_ID=""
+  TM_DEST_INFO=$(tmutil destinationinfo 2>/dev/null || true)
+  if [[ -n "${TM_DEST_INFO}" ]] && ! echo "${TM_DEST_INFO}" | grep -q "No destinations configured"; then
+    ORIGINAL_TM_ID=$(echo "${TM_DEST_INFO}" | awk '/ID/ {print $NF}' | head -1)
+    ORIGINAL_TM_DEST=$(echo "${TM_DEST_INFO}" | awk '/Mount Point/ {$1=$2=""; print $0}' | sed 's/^ *//' | head -1)
+    if [[ -n "${ORIGINAL_TM_DEST}" ]]; then
+      echo "ℹ️  Existing Time Machine destination detected: ${ORIGINAL_TM_DEST}"
+      echo "   It will be restored after this backup completes."
+    fi
+  fi
+
+  # ── Set destination and start backup ─────────────────────────────────────
+  echo ""
+  echo "📋 Command:"
+  echo "  sudo tmutil setdestination \"${TM_DEST}\""
+  echo "  sudo tmutil startbackup --block"
+  echo ""
+
+  while true; do
+    read_tty -rp "Start Time Machine backup now? (y/n): " TM_CONFIRM
+    case "${TM_CONFIRM}" in
+      [yY]|[yY][eE][sS]) break ;;
+      [nN]|[nN][oO])
+        echo "👋 Cancelled."
+        exit 0
+        ;;
+      *) echo "⚠️ Please enter y or n." ;;
+    esac
+  done
+
+  start_caffeinate
+
+  echo "⏳ Setting Time Machine destination..."
+  sudo tmutil setdestination "${TM_DEST}" || {
+    echo "❌ Failed to set Time Machine destination."
+    stop_caffeinate
+    exit 1
+  }
+
+  echo "⏳ Enabling Time Machine..."
+  sudo tmutil enable || {
+    echo "❌ Failed to enable Time Machine."
+    stop_caffeinate
+    exit 1
+  }
+
+  START_TIME=${SECONDS}
+  echo "⏳ Starting Time Machine backup (this may take a while)..."
+  echo ""
+
+  # Start a background progress monitor polling tmutil status
+  TM_MONITOR_PID=""
+  (
+    sleep 5
+    while true; do
+      TM_STATUS=$(tmutil status 2>/dev/null || true)
+      if [[ -z "${TM_STATUS}" ]]; then
+        sleep 5
+        continue
+      fi
+      # Extract useful fields
+      TM_PHASE=$(echo "${TM_STATUS}" | awk -F'"' '/BackupPhase/ {print $2}')
+      TM_PERCENT=$(echo "${TM_STATUS}" | awk -F'[=;]' '/Percent/ {gsub(/ /,"",$2); print $2}')
+      TM_BYTES=$(echo "${TM_STATUS}" | awk -F'[=;]' '/bytes/ {gsub(/ /,"",$2); print $2}' | head -1)
+
+      # Format bytes into human-readable
+      TM_SIZE=""
+      if [[ -n "${TM_BYTES}" ]] && [[ "${TM_BYTES}" =~ ^[0-9]+$ ]]; then
+        if [[ "${TM_BYTES}" -gt 1073741824 ]]; then
+          TM_SIZE="$((TM_BYTES / 1073741824)) GB"
+        elif [[ "${TM_BYTES}" -gt 1048576 ]]; then
+          TM_SIZE="$((TM_BYTES / 1048576)) MB"
+        else
+          TM_SIZE="$((TM_BYTES / 1024)) KB"
+        fi
+      fi
+
+      # Format percent
+      TM_PCT_DISPLAY=""
+      if [[ -n "${TM_PERCENT}" ]] && [[ "${TM_PERCENT}" != "0" ]]; then
+        # Truncate to 1 decimal: multiply by 100 for display
+        TM_PCT_INT=$(printf '%.1f' "$(echo "${TM_PERCENT} * 100" | bc 2>/dev/null || echo "0")" 2>/dev/null || true)
+        if [[ -n "${TM_PCT_INT}" ]] && [[ "${TM_PCT_INT}" != "0" ]] && [[ "${TM_PCT_INT}" != "0.0" ]]; then
+          TM_PCT_DISPLAY="${TM_PCT_INT}%"
+        fi
+      fi
+
+      # Build status line
+      TM_LINE=""
+      if [[ -n "${TM_PHASE}" ]]; then
+        TM_LINE="  Phase: ${TM_PHASE}"
+      fi
+      if [[ -n "${TM_PCT_DISPLAY}" ]]; then
+        TM_LINE="${TM_LINE}  |  Progress: ${TM_PCT_DISPLAY}"
+      fi
+      if [[ -n "${TM_SIZE}" ]]; then
+        TM_LINE="${TM_LINE}  |  Copied: ${TM_SIZE}"
+      fi
+
+      if [[ -n "${TM_LINE}" ]]; then
+        printf "\r%-80s" "${TM_LINE}"
+      fi
+
+      sleep 10
+    done
+  ) &
+  TM_MONITOR_PID=$!
+
+  TM_BACKUP_ACTIVE="yes"
+  sudo tmutil startbackup --block || {
+    # Stop the backup daemon — the CLI wrapper dying doesn't stop it
+    echo ""
+    echo "⏳ Stopping Time Machine backup..."
+    sudo tmutil stopbackup 2>/dev/null || true
+    TM_BACKUP_ACTIVE=""
+    # Kill the progress monitor
+    if [[ -n "${TM_MONITOR_PID}" ]]; then
+      kill "${TM_MONITOR_PID}" 2>/dev/null || true
+      wait "${TM_MONITOR_PID}" 2>/dev/null || true
+      TM_MONITOR_PID=""
+    fi
+    echo ""
+    echo "❌ Time Machine backup failed or was interrupted."
+    # Attempt to restore original destination
+    if [[ -n "${ORIGINAL_TM_ID}" ]]; then
+      echo "ℹ️  Restoring original Time Machine destination..."
+      sudo tmutil setdestination "${ORIGINAL_TM_DEST}" 2>/dev/null || true
+    fi
+    stop_caffeinate
+    exit 1
+  }
+  TM_BACKUP_ACTIVE=""
+
+  # Kill the progress monitor
+  if [[ -n "${TM_MONITOR_PID}" ]]; then
+    kill "${TM_MONITOR_PID}" 2>/dev/null || true
+    wait "${TM_MONITOR_PID}" 2>/dev/null || true
+    TM_MONITOR_PID=""
+  fi
+  printf "\r%-80s\n" ""
+
+  ELAPSED_TIME=$((SECONDS - START_TIME))
+  echo ""
+  echo "✅ Time Machine backup complete in $((ELAPSED_TIME / 60))m $((ELAPSED_TIME % 60))s."
+  LATEST=$(tmutil latestbackup 2>/dev/null || true)
+  if [[ -n "${LATEST}" ]]; then
+    echo "📁 Latest backup: ${LATEST}"
+  fi
+
+  # ── Restore original TM destination if one existed ───────────────────────
+  if [[ -n "${ORIGINAL_TM_ID}" && -n "${ORIGINAL_TM_DEST}" ]]; then
+    echo ""
+    echo "ℹ️  Restoring original Time Machine destination: ${ORIGINAL_TM_DEST}"
+    sudo tmutil setdestination "${ORIGINAL_TM_DEST}" 2>/dev/null || {
+      echo "⚠️  Could not restore original Time Machine destination."
+      echo "   You may need to reconfigure it manually in System Settings."
+    }
+  fi
+
+  stop_caffeinate
+  exit 0
 fi
