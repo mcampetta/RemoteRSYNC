@@ -45,6 +45,11 @@ LOG_FILE=""
 RSYNC_RUNTIME_OPTS=()
 TM_BACKUP_ACTIVE=""
 TM_MONITOR_PID=""
+RSYNC_FLAGS=()
+USER_HOST=""
+REMOTE_RSYNC_PATH=""
+REMOTE_RSYNC_MODE=""
+REMOTE_RSYNC_CLEANUP_PATH=""
 
 cleanup() {
   local ec=$?
@@ -60,6 +65,13 @@ cleanup() {
     kill "${TM_MONITOR_PID}" 2>/dev/null || true
     wait "${TM_MONITOR_PID}" 2>/dev/null || true
     TM_MONITOR_PID=""
+  fi
+  # Remove bootstrapped remote rsync if we staged one for this session.
+  if [[ -n "${REMOTE_RSYNC_CLEANUP_PATH}" && -n "${USER_HOST}" && -x "${SSHPASS_PATH:-}" ]]; then
+    # shellcheck disable=SC2086
+    "${SSHPASS_PATH}" -p "${SSH_PASSWORD}" ssh ${SSH_OPTIONS} "${USER_HOST}" \
+      "$(remote_cmd rm -f "${REMOTE_RSYNC_CLEANUP_PATH}")" >/dev/null 2>&1 || true
+    REMOTE_RSYNC_CLEANUP_PATH=""
   fi
   # Stop caffeinate
   if [[ -n "${CAFFEINATE_PID}" ]]; then
@@ -92,7 +104,7 @@ echo "██║   ██║██╔██╗ ██║   ██║   ███�
 echo "██║   ██║██║╚██╗██║   ██║   ██╔███╗ ██╔══██║██║     ██╔═██╗ "
 echo "╚██████╔╝██║ ╚████║   ██║   ██║ ███╗██║  ██║╚██████╗██║  ██╗"
 echo " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚══╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝"
-echo " ONTRACK DATA TRANSFER UTILITY V1.1447-hardened (tar, rsync)"
+echo " ONTRACK DATA TRANSFER UTILITY V1.1449-hardened (tar, rsync)"
 echo ""
 
 # ── Architecture detection ───────────────────────────────────────────────────
@@ -103,6 +115,13 @@ else
   if [[ "${ARCH}" == "i386" ]]; then
     ARCH="x86_64"
   fi
+fi
+
+SCRIPT_SOURCE_PATH="$(realpath "${BASH_SOURCE[0]:-$0}" 2>/dev/null || true)"
+if [[ -n "${SCRIPT_SOURCE_PATH}" && -f "${SCRIPT_SOURCE_PATH}" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_SOURCE_PATH}")" && pwd)"
+else
+  SCRIPT_DIR="$(pwd)"
 fi
 
 TMP_DIR=$(mktemp -d)
@@ -164,6 +183,13 @@ verify_ssh_connection() {
   echo "🔐 Attempting SSH connection using sshpass..."
   # shellcheck disable=SC2086
   "${SSHPASS_PATH}" -p "${SSH_PASSWORD}" ssh ${SSH_OPTIONS} -o ConnectTimeout=5 "${user_host}" "echo OK" >/dev/null 2>&1
+}
+
+run_remote_command() {
+  local user_host="$1"
+  shift
+  # shellcheck disable=SC2086
+  "${SSHPASS_PATH}" -p "${SSH_PASSWORD}" ssh ${SSH_OPTIONS} "${user_host}" "$(remote_cmd "$@")"
 }
 
 prompt_for_password() {
@@ -641,11 +667,13 @@ select_source_volume() {
 # remote rsync to also support them (e.g. --protect-args / -s).
 build_rsync_flags() {
   local mode="${1:-local}"
+  local rsync_help
+  rsync_help="$("${RSYNC_PATH}" --help 2>&1 || true)"
   # Base flags: archive, one-filesystem
   RSYNC_FLAGS=(-a -x)
 
   # Hard links (-H) is a compile-time option (SUPPORT_HARD_LINKS)
-  if "${RSYNC_PATH}" --help 2>&1 | grep -q -- '-H.*hard-links\|--hard-links'; then
+  if printf '%s\n' "${rsync_help}" | grep -Eq -- '-H.*hard-links|--hard-links'; then
     RSYNC_FLAGS+=(-H)
     echo "✅ rsync supports hard links (-H), enabled."
   else
@@ -660,16 +688,19 @@ build_rsync_flags() {
   # we enable both -E and -X for full metadata fidelity.  For remote
   # transfers the receiver is likely Apple 2.6.9, so we skip both to
   # avoid protocol mismatch.
-  if [[ "${mode}" != "remote" ]]; then
-    if "${RSYNC_PATH}" --help 2>&1 | grep -q -- '-E.*executability\|--executability'; then
+  if [[ "${mode}" != "remote_builtin" ]]; then
+    if printf '%s\n' "${rsync_help}" | grep -Eq -- '-E.*executability|--executability'; then
       RSYNC_FLAGS+=(-E)
       echo "✅ rsync supports executability (-E), enabled."
     else
       echo "⚠️  rsync does not support executability (-E), skipping."
     fi
-    if "${RSYNC_PATH}" --help 2>&1 | grep -q -- '-X.*xattrs\|--xattrs'; then
+    if printf '%s\n' "${rsync_help}" | grep -Eq -- '-X.*xattrs|--xattrs'; then
       RSYNC_FLAGS+=(-X)
       echo "✅ rsync supports extended attributes (-X), enabled."
+    elif printf '%s\n' "${rsync_help}" | grep -Eq -- '-E.*extended-attributes|--extended-attributes'; then
+      RSYNC_FLAGS+=(-E)
+      echo "✅ rsync uses Apple-style extended attributes (-E), enabled."
     else
       echo "⚠️  rsync does not support extended attributes (-X), skipping. Resource forks may be lost."
     fi
@@ -680,8 +711,8 @@ build_rsync_flags() {
   # --protect-args (-s) requires rsync 3.0+ on BOTH sides.
   # The remote Mac may only have the old system rsync 2.6.9, so we only
   # enable it for local transfers where both sides use our downloaded binary.
-  if [[ "${mode}" != "remote" ]]; then
-    if "${RSYNC_PATH}" --help 2>&1 | grep -q -- '--protect-args\|-s'; then
+  if [[ "${mode}" != "remote_builtin" ]]; then
+    if printf '%s\n' "${rsync_help}" | grep -Eq -- '--protect-args|-s'; then
       RSYNC_FLAGS+=(--protect-args)
       echo "✅ rsync supports --protect-args, enabled."
     fi
@@ -691,8 +722,8 @@ build_rsync_flags() {
 
   # Check if rsync supports ACLs (-A)
   # ACLs also require both sides to agree, so skip for remote.
-  if [[ "${mode}" != "remote" ]]; then
-    if "${RSYNC_PATH}" --help 2>&1 | grep -q -- '-A.*ACLs\|--acls'; then
+  if [[ "${mode}" != "remote_builtin" ]]; then
+    if printf '%s\n' "${rsync_help}" | grep -Eq -- '-A.*ACLs|--acls'; then
       RSYNC_FLAGS+=(-A)
       echo "✅ rsync supports ACLs (-A), enabled."
     else
@@ -708,8 +739,8 @@ build_rsync_flags() {
 # TODO: Populate these with actual hashes from verified release artifacts.
 # When empty, verification is skipped but actual hashes are still logged.
 # NOTE: Using plain variables instead of associative arrays for bash 3.2 compat.
-HASH_RSYNC_X86_64=""
-HASH_RSYNC_ARM64=""
+HASH_RSYNC_X86_64="704a7b8d47423cbaaa62e52ba72bd6305b22c81fe28a8a68b2a2d9d32c3c9b0e"
+HASH_RSYNC_ARM64="704a7b8d47423cbaaa62e52ba72bd6305b22c81fe28a8a68b2a2d9d32c3c9b0e"
 HASH_GTAR_X86_64=""
 HASH_GTAR_ARM64=""
 HASH_PV_X86_64=""
@@ -748,8 +779,8 @@ verify_sha256() {
 ###############################################################################
 
 # NOTE: These point to raw/main. Pin to versioned release tags when available.
+RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/rsync_universal"
 if [[ "${ARCH}" == "x86_64" ]]; then
-  RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/rsync"
   GTAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/tar_x86_64"
   PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/pv_x86_64"
   SSHPASS_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/sshpass_x86_64"
@@ -758,7 +789,6 @@ if [[ "${ARCH}" == "x86_64" ]]; then
   HASH_PV="${HASH_PV_X86_64}"
   HASH_SSHPASS="${HASH_SSHPASS_X86_64}"
 elif [[ "${ARCH}" == "arm64" ]]; then
-  RSYNC_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/rsync_arm64"
   GTAR_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/tar_arm64"
   PV_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/pv_arm64"
   SSHPASS_URL="https://github.com/mcampetta/RemoteRSYNC/raw/main/sshpass_arm"
@@ -775,6 +805,110 @@ RSYNC_PATH="${TMP_DIR}/rsync"
 GTAR_PATH="${TMP_DIR}/gtar"
 PV_PATH="${TMP_DIR}/pv"
 SSHPASS_PATH="${TMP_DIR}/sshpass"
+RSYNC_SOURCE_MODE=""
+RSYNC_SOURCE_LABEL=""
+RSYNC_SOURCE_PATH=""
+
+stage_local_rsync_override() {
+  local source_path="$1"
+  source_path="$(normalize_path "${source_path}")"
+  if [[ ! -f "${source_path}" ]]; then
+    echo "❌ File not found: ${source_path}"
+    return 1
+  fi
+
+  echo "  - Staging rsync from local override..."
+  cp "${source_path}" "${RSYNC_PATH}"
+  chmod +x "${RSYNC_PATH}"
+  if command -v xattr >/dev/null 2>&1; then
+    xattr -d com.apple.quarantine "${RSYNC_PATH}" 2>/dev/null || true
+  fi
+
+  RSYNC_SOURCE_MODE="local"
+  RSYNC_SOURCE_PATH="${source_path}"
+  RSYNC_SOURCE_LABEL="local override (${RSYNC_SOURCE_PATH})"
+  return 0
+}
+
+prompt_rsync_override() {
+  local override_path=""
+  echo ""
+  echo "🧰 Hidden rsync override"
+  echo "   This replaces the downloaded bundled rsync for this run only."
+  read_tty -rp "Path to local rsync binary: " override_path
+  override_path="$(normalize_path "${override_path}")"
+
+  if ! stage_local_rsync_override "${override_path}"; then
+    return 1
+  fi
+
+  smoke_test_binary "${RSYNC_PATH}" "rsync override"
+  echo "✅ Using rsync override: ${RSYNC_SOURCE_LABEL}"
+  if [[ -n "${LOG_FILE}" ]]; then
+    log_msg "Rsync source override: ${RSYNC_SOURCE_LABEL}"
+  fi
+  return 0
+}
+
+prompt_remote_builtin_rsync_fallback() {
+  local choice=""
+  echo ""
+  echo "⚠️  Remote rsync bootstrap failed."
+  echo "1) Continue with receiver built-in rsync"
+  echo "2) Abort"
+  while true; do
+    read_tty -rp "Enter 1 or 2 [1]: " choice
+    choice="${choice:-1}"
+    case "${choice}" in
+      1) return 0 ;;
+      2) return 1 ;;
+      *) echo "⚠️ Invalid selection '${choice}'. Please enter 1 or 2." ;;
+    esac
+  done
+}
+
+bootstrap_remote_rsync() {
+  local user_host="$1"
+  local remote_stage_dir="/tmp"
+  local remote_stage_path="${remote_stage_dir}/odtu-rsync"
+  local remote_version=""
+
+  echo ""
+  echo "📦 Bootstrapping rsync on receiver..."
+
+  if ! run_remote_command "${user_host}" mkdir -p "${remote_stage_dir}"; then
+    echo "⚠️  Failed to create remote staging directory: ${remote_stage_dir}"
+    return 1
+  fi
+
+  # shellcheck disable=SC2086
+  if ! "${SSHPASS_PATH}" -p "${SSH_PASSWORD}" scp ${SSH_OPTIONS} "${RSYNC_PATH}" "${user_host}:${remote_stage_path}" >/dev/null 2>&1; then
+    echo "⚠️  Failed to upload rsync to receiver."
+    return 1
+  fi
+  REMOTE_RSYNC_CLEANUP_PATH="${remote_stage_path}"
+
+  if ! run_remote_command "${user_host}" chmod +x "${remote_stage_path}"; then
+    echo "⚠️  Failed to mark remote rsync executable."
+    return 1
+  fi
+
+  if ! remote_version="$(run_remote_command "${user_host}" "${remote_stage_path}" --version 2>/dev/null | head -1)"; then
+    echo "⚠️  Remote rsync smoke test failed."
+    return 1
+  fi
+
+  REMOTE_RSYNC_MODE="bootstrapped"
+  REMOTE_RSYNC_PATH="${remote_stage_path}"
+
+  echo "✅ Receiver rsync bootstrapped: ${remote_version}"
+  if [[ -n "${LOG_FILE}" ]]; then
+    log_msg "Remote rsync mode: ${REMOTE_RSYNC_MODE}"
+    log_msg "Remote rsync path: ${REMOTE_RSYNC_PATH}"
+    log_msg "Remote rsync version: ${remote_version}"
+  fi
+  return 0
+}
 
 ###############################################################################
 # FDA (Full Disk Access) check                                                #
@@ -931,7 +1065,9 @@ download_binary() {
   chmod +x "${dest}"
 }
 
-download_binary "${RSYNC_URL}"   "${RSYNC_PATH}"   "rsync"
+RSYNC_SOURCE_MODE="bundled"
+RSYNC_SOURCE_LABEL="bundled universal (${RSYNC_URL})"
+download_binary "${RSYNC_URL}"   "${RSYNC_PATH}"    "rsync"
 download_binary "${GTAR_URL}"    "${GTAR_PATH}"     "gtar"
 download_binary "${PV_URL}"      "${PV_PATH}"       "pv"
 download_binary "${SSHPASS_URL}" "${SSHPASS_PATH}"   "sshpass"
@@ -1101,10 +1237,10 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
   log_msg "Job number: ${JOB_NUM}"
   log_msg "Source: ${SRC_VOL}"
   log_msg "Destination: ${DEST_PATH}"
+  log_msg "Rsync source: ${RSYNC_SOURCE_LABEL}"
   log_tool_versions
 
   init_default_excludes
-  build_rsync_flags "local"
 
   while true; do
     echo ""
@@ -1112,19 +1248,23 @@ if [[ "${SESSION_MODE}" == "1" ]]; then
     echo "1) rsync (default, recommended)"
     echo "2) tar"
     echo "3) OPTION - edit excludes for transfers"
-    read_tty -rp "Enter 1, 2, or 3: " TRANSFER_CHOICE
+    echo ""
+    echo "Current rsync source: ${RSYNC_SOURCE_LABEL}"
+    read_tty -rp "Enter 1, 2, 3, or 99 for hidden rsync override: " TRANSFER_CHOICE
 
     case "${TRANSFER_CHOICE}" in
       1|2)
         TRANSFER_METHOD="${TRANSFER_CHOICE}"
         compile_exclude_flags
         if [[ "${TRANSFER_METHOD}" == "1" ]]; then
+          build_rsync_flags "local"
           choose_rsync_runtime_mode
         fi
         break
         ;;
       3) edit_excludes ;;
-      *) echo "⚠️ Invalid option. Please choose 1, 2, or 3." ;;
+      99) prompt_rsync_override ;;
+      *) echo "⚠️ Invalid option. Please choose 1, 2, 3, or 99." ;;
     esac
   done
 
@@ -1277,10 +1417,10 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
   log_msg "Mode: Remote Session${LIMITED_ACCESS_MODE:+ (LIMITED ACCESS)}"
   log_msg "Source: ${SRC_VOL}"
   log_msg "Remote: ${REMOTE_USER}@${REMOTE_IP}:${REMOTE_DEST}"
+  log_msg "Rsync source: ${RSYNC_SOURCE_LABEL}"
   log_tool_versions
 
   init_default_excludes
-  build_rsync_flags "remote"
 
   while true; do
     echo ""
@@ -1288,7 +1428,9 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
     echo "1) rsync (default, recommended)"
     echo "2) tar"
     echo "3) OPTION - edit excludes for transfers"
-    read_tty -rp "Enter 1, 2, or 3: " TRANSFER_CHOICE
+    echo ""
+    echo "Current rsync source: ${RSYNC_SOURCE_LABEL}"
+    read_tty -rp "Enter 1, 2, 3, or 99 for hidden rsync override: " TRANSFER_CHOICE
 
     case "${TRANSFER_CHOICE}" in
       1|2)
@@ -1297,7 +1439,8 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
         break
         ;;
       3) edit_excludes ;;
-      *) echo "⚠️ Invalid option. Please choose 1, 2, or 3." ;;
+      99) prompt_rsync_override ;;
+      *) echo "⚠️ Invalid option. Please choose 1, 2, 3, or 99." ;;
     esac
   done
 
@@ -1333,22 +1476,54 @@ if [[ "${SESSION_MODE}" == "2" ]]; then
     exit 1
   }
 
+  REMOTE_RSYNC_MODE="builtin"
+  REMOTE_RSYNC_PATH=""
+  REMOTE_RSYNC_CLEANUP_PATH=""
+
+  if [[ "${TRANSFER_METHOD}" == "1" ]]; then
+    if bootstrap_remote_rsync "${USER_HOST}"; then
+      build_rsync_flags "remote_bootstrapped"
+    else
+      if prompt_remote_builtin_rsync_fallback; then
+        REMOTE_RSYNC_VERSION="$(run_remote_command "${USER_HOST}" rsync --version 2>/dev/null | head -1 || echo 'unknown')"
+        REMOTE_RSYNC_MODE="builtin"
+        REMOTE_RSYNC_PATH=""
+        REMOTE_RSYNC_CLEANUP_PATH=""
+        build_rsync_flags "remote_builtin"
+        echo "ℹ️  Continuing with receiver built-in rsync."
+        if [[ -n "${LOG_FILE}" ]]; then
+          log_msg "Remote rsync mode: builtin (fallback)"
+          log_msg "Remote rsync version: ${REMOTE_RSYNC_VERSION}"
+        fi
+      else
+        echo "❌ Aborting because remote rsync bootstrap did not succeed."
+        exit 1
+      fi
+    fi
+  fi
+
   start_caffeinate
   START_TIME=${SECONDS}
 
   case "${TRANSFER_METHOD}" in
     1)
       # Best-effort vs strict rsync behavior (resume/ignore errors)
+      REMOTE_RSYNC_ARGS=()
+      if [[ "${REMOTE_RSYNC_MODE}" == "bootstrapped" && -n "${REMOTE_RSYNC_PATH}" ]]; then
+        REMOTE_RSYNC_ARGS+=(--rsync-path="${REMOTE_RSYNC_PATH}")
+      fi
+
       choose_rsync_runtime_mode
-      # rsync with --protect-args handles spaces in remote paths
       echo ""
       echo "📋 Command:"
-      echo "  sshpass -p '****' ${RSYNC_PATH} -e \"ssh ${SSH_OPTIONS}\" ${RSYNC_FLAGS[*]+"${RSYNC_FLAGS[*]}"} -v ${RSYNC_RUNTIME_OPTS[*]+"${RSYNC_RUNTIME_OPTS[*]}"} ${RSYNC_EXCLUDES[*]+"${RSYNC_EXCLUDES[*]}"} ${SRC_VOL}/ ${REMOTE_USER}@${REMOTE_IP}:${REMOTE_DEST}"
+      echo "  sshpass -p '****' ${RSYNC_PATH} -e \"ssh ${SSH_OPTIONS}\" ${REMOTE_RSYNC_ARGS[*]+"${REMOTE_RSYNC_ARGS[*]}"} ${RSYNC_FLAGS[*]+"${RSYNC_FLAGS[*]}"} -v ${RSYNC_RUNTIME_OPTS[*]+"${RSYNC_RUNTIME_OPTS[*]}"} ${RSYNC_EXCLUDES[*]+"${RSYNC_EXCLUDES[*]}"} ${SRC_VOL}/ ${REMOTE_USER}@${REMOTE_IP}:${REMOTE_DEST}"
+      echo "  Receiver rsync mode: ${REMOTE_RSYNC_MODE}${REMOTE_RSYNC_PATH:+ (${REMOTE_RSYNC_PATH})}"
       echo ""
       # shellcheck disable=SC2086
       RSYNC_EXIT=0
       "${SSHPASS_PATH}" -p "${SSH_PASSWORD}" \
         "${RSYNC_PATH}" -e "ssh ${SSH_OPTIONS}" \
+        ${REMOTE_RSYNC_ARGS[@]+"${REMOTE_RSYNC_ARGS[@]}"} \
         ${RSYNC_FLAGS[@]+"${RSYNC_FLAGS[@]}"} -v \
         ${RSYNC_RUNTIME_OPTS[@]+"${RSYNC_RUNTIME_OPTS[@]}"} \
         ${RSYNC_EXCLUDES[@]+"${RSYNC_EXCLUDES[@]}"} \
