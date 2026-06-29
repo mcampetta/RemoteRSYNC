@@ -1233,21 +1233,21 @@ EOF
 
     if discover_x_mount_unc; then
         cat > /etc/auto.master.d/mnt.autofs << 'EOF'
-/-    /etc/auto.mnt.cifs    --timeout=300
+/mnt    /etc/auto.mnt.cifs    --timeout=300 --ghost
 EOF
         local x_unc
         x_unc="$(normalize_unc_path "$X_MOUNT_UNC")"
         cat > /etc/auto.mnt.cifs << EOF
 #!/bin/bash
 key="\$1"
-[ "\$key" = "/mnt/x" ] || exit 1
+[ "\$key" = "x" ] || exit 1
 
 uid="\${AUTOFS_UID:-\${UID:-}}"
 if [ -z "\$uid" ]; then
     exit 1
 fi
 
-printf '/mnt/x\t-fstype=cifs,sec=krb5,cruid=%s,multiuser,vers=3.0\t://$x_unc\n' "\$uid"
+printf -- '-fstype=cifs,sec=krb5,cruid=%s,multiuser,vers=3.0\t://$x_unc\n' "\$uid"
 EOF
         chmod +x /etc/auto.mnt.cifs
         rm -f /etc/auto.mnt.direct
