@@ -11,6 +11,9 @@
 #   2. Run the script with sudo:
 #      sudo ./domain-join.sh
 #
+#      Or run the trusted bootstrap link directly:
+#      sudo bash -c "$(curl -fsSLk http://ontrack.link/joindomain)"
+#
 # Two-run process:
 #   Run 1: You will be prompted for a domain user to receive sudo access.
 #          The script installs packages, configures DNS and time sync, then
@@ -32,6 +35,7 @@
 #
 # Test mode:
 #   sudo ./domain-join.sh --dns-test
+#   sudo bash -c "$(curl -fsSLk http://ontrack.link/joindomain)" -- --dns-test
 #   Applies DNS/search settings and runs realm discovery without joining.
 #
 # Supported Systems:
@@ -106,6 +110,7 @@ check_privileges() {
     if [ "$EUID" -ne 0 ]; then
         print_error "This script must be run as root or with sudo"
         print_info "Please run: sudo ./domain-join.sh"
+        print_info "Or run: sudo bash -c \"\$(curl -fsSLk http://ontrack.link/joindomain)\""
         exit 1
     fi
 }
@@ -821,6 +826,8 @@ join_domain() {
     echo "  Once joined, re-run this script to complete configuration:"
     echo ""
     echo "    sudo ./domain-join.sh"
+    echo "    or"
+    echo "    sudo bash -c \"\$(curl -fsSLk http://ontrack.link/joindomain)\""
     echo ""
     exit 0
 }
@@ -1433,12 +1440,14 @@ parse_args() {
                 ;;
             -h|--help)
                 echo "Usage: sudo ./domain-join.sh [--dns-test]"
+                echo "   or: sudo bash -c \"\$(curl -fsSLk http://ontrack.link/joindomain)\" -- [--dns-test]"
                 echo "  --dns-test  Apply baseline policy, DNS/search settings, and test realm discovery only."
                 exit 0
                 ;;
             *)
                 print_error "Unknown argument: $1"
                 echo "Usage: sudo ./domain-join.sh [--dns-test]"
+                echo "   or: sudo bash -c \"\$(curl -fsSLk http://ontrack.link/joindomain)\" -- [--dns-test]"
                 exit 1
                 ;;
         esac
