@@ -1223,7 +1223,7 @@ configure_autofs_cifs() {
     # Master entries: /smb is the prefix the DRIP REST API uses in Location
     # paths (e.g. /smb/dr-ep-drip12/Images/...). /net is kept for general
     # share browsing. Both reuse the same executable map.
-    mkdir -p /smb /net /mnt/x
+    mkdir -p /smb /net
     cat > /etc/auto.master.d/smb.autofs << 'EOF'
 /smb    /etc/auto.net.cifs    --timeout=300 --ghost
 EOF
