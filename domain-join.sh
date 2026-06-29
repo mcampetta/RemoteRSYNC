@@ -1233,17 +1233,27 @@ EOF
 
     if discover_x_mount_unc; then
         cat > /etc/auto.master.d/mnt.autofs << 'EOF'
-/-    /etc/auto.mnt.direct    --timeout=300
+/-    /etc/auto.mnt.cifs    --timeout=300
 EOF
         local x_unc
         x_unc="$(normalize_unc_path "$X_MOUNT_UNC")"
-        cat > /etc/auto.mnt.direct << EOF
-/mnt/x    -fstype=cifs,sec=krb5,cruid=\${UID},multiuser,vers=3.0    ://$x_unc
+        cat > /etc/auto.mnt.cifs << EOF
+#!/bin/bash
+key="\$1"
+[ "\$key" = "/mnt/x" ] || exit 1
+
+uid="\${AUTOFS_UID:-\${UID:-}}"
+if [ -z "\$uid" ]; then
+    exit 1
+fi
+
+printf '/mnt/x\t-fstype=cifs,sec=krb5,cruid=%s,multiuser,vers=3.0\t://$x_unc\n' "\$uid"
 EOF
-        chmod 644 /etc/auto.mnt.direct
+        chmod +x /etc/auto.mnt.cifs
+        rm -f /etc/auto.mnt.direct
         print_info "/mnt/x autofs map configured for $X_MOUNT_UNC"
     else
-        rm -f /etc/auto.master.d/mnt.autofs /etc/auto.mnt.direct /etc/auto.master.d/x.autofs /etc/auto.x.cifs
+        rm -f /etc/auto.master.d/mnt.autofs /etc/auto.mnt.direct /etc/auto.mnt.cifs /etc/auto.master.d/x.autofs /etc/auto.x.cifs
         print_warning "/mnt/x autofs map skipped because X_MOUNT_UNC is not set"
     fi
 
@@ -1363,11 +1373,6 @@ configure_sudoers() {
     local safe_name="${SUDO_USER//./_}"
     local sudoers_file="/etc/sudoers.d/${safe_name}_domain_sudo"
 
-    if [ -f "$sudoers_file" ]; then
-        print_info "Sudoers entry already exists for $full_user — skipping"
-        return 0
-    fi
-
     {
         echo "$SUDO_USER ALL=(ALL:ALL) ALL"
         echo "$full_user ALL=(ALL:ALL) ALL"
@@ -1376,7 +1381,7 @@ configure_sudoers() {
     chown root:root "$sudoers_file"
 
     if visudo -c -f "$sudoers_file" > /dev/null 2>&1; then
-        print_info "Sudoers entry created for $full_user"
+        print_info "Sudoers entry configured for $SUDO_USER and $full_user"
     else
         print_warning "Sudoers file failed syntax check — removing $sudoers_file"
         rm -f "$sudoers_file"
