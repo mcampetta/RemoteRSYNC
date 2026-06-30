@@ -1146,10 +1146,10 @@ configure_autofs_cifs() {
     # instead of autofs because direct/indirect autofs maps for /mnt/x proved
     # unreliable on tested Ubuntu builds, while an explicit Kerberos CIFS mount
     # was reliable.
-    ensure_dir "/smb"
-    ensure_dir "/net"
-    ensure_dir "/mnt"
-    ensure_dir "/mnt/x"
+    mkdir -p /smb
+    mkdir -p /net
+    mkdir -p /mnt
+    mkdir -p /mnt/x
 
     # Remove old /mnt/x autofs configuration from earlier script versions.
     rm -f /etc/auto.master.d/mnt.autofs /etc/auto.mnt.direct /etc/auto.mnt
