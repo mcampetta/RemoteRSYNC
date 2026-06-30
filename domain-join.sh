@@ -1452,6 +1452,23 @@ verify_join() {
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
+prompt_office_code() {
+    echo ""
+    echo "  Enter the office code for this machine."
+    echo "  This is used to derive the tools server name."
+    echo "  Example: EP1 → dr-ep1-tools"
+    echo ""
+
+    while [ -z "$OFFICE_CODE" ]; do
+        read -r -p "  Office code: " OFFICE_CODE
+        OFFICE_CODE="$(echo "$OFFICE_CODE" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"
+
+        if [ -z "$OFFICE_CODE" ]; then
+            print_warning "Office code cannot be blank"
+        fi
+    done
+}
+
 parse_args() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -1459,22 +1476,23 @@ parse_args() {
                 DNS_TEST_ONLY=true
                 ;;
             -h|--help)
-                echo "Usage: sudo ./domain-join.sh <OFFICE_CODE> [--dns-test]"
-                echo "  OFFICE_CODE  Office code for your location (e.g. EP1, UK1, DE1)"
+                echo "Usage: sudo ./domain-join.sh [OFFICE_CODE] [--dns-test]"
+                echo "  OFFICE_CODE  Optional office code for your location (e.g. EP1, UK1, DE1)."
+                echo "               If omitted, the script prompts for it interactively."
                 echo "  --dns-test   Apply DNS/search settings and test realm discovery only."
                 exit 0
                 ;;
             -*)
                 print_error "Unknown option: $1"
-                echo "Usage: sudo ./domain-join.sh <OFFICE_CODE> [--dns-test]"
+                echo "Usage: sudo ./domain-join.sh [OFFICE_CODE] [--dns-test]"
                 exit 1
                 ;;
             *)
                 if [ -z "$OFFICE_CODE" ]; then
-                    OFFICE_CODE="$1"
+                    OFFICE_CODE="$(echo "$1" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"
                 else
                     print_error "Unexpected argument: $1"
-                    echo "Usage: sudo ./domain-join.sh <OFFICE_CODE> [--dns-test]"
+                    echo "Usage: sudo ./domain-join.sh [OFFICE_CODE] [--dns-test]"
                     exit 1
                 fi
                 ;;
@@ -1483,10 +1501,7 @@ parse_args() {
     done
 
     if [ -z "$OFFICE_CODE" ]; then
-        print_error "Office code is required"
-        echo "Usage: sudo ./domain-join.sh <OFFICE_CODE> [--dns-test]"
-        echo "  Example: sudo ./domain-join.sh EP1"
-        exit 1
+        prompt_office_code
     fi
 
     TOOLS_SERVER="dr-$(echo "$OFFICE_CODE" | tr '[:upper:]' '[:lower:]')-tools"
