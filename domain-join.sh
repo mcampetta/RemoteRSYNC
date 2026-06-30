@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.1.6"
+SCRIPT_VERSION="1.2.0"
 set -e  # Exit on error
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -1224,51 +1224,46 @@ mount -t cifs "\$SHARE" "\$MOUNT_POINT" -o sec=krb5,cruid=\$CRUID,vers=3.0
 EOF
     chmod +x /usr/local/bin/mount-kit-tools
 
-    # Desktop/Unity launcher wrapper. pkexec during Unity/XDG launch has proven
-    # unreliable on Ubuntu 16.04, while sudo from a terminal works correctly.
-    # Use a separate runner script so terminal -e does not have to parse a long
-    # quoted shell command.
-    cat > /usr/local/bin/mount-kit-tools-runner << 'EOF'
-#!/bin/bash
-sudo /usr/local/bin/mount-kit-tools
-status=$?
-
-echo
-if [ "$status" -eq 0 ]; then
-    echo "DR Tools mounted at /mnt/x"
-else
-    echo "Mount failed with exit code $status"
-fi
-
-echo
-read -r -p "Press Enter to close..."
-exit "$status"
-EOF
-    chmod +x /usr/local/bin/mount-kit-tools-runner
-
+    # User-facing wrapper. The post-join script installs a tightly scoped
+    # sudoers rule that allows only /usr/local/bin/mount-kit-tools to run
+    # passwordlessly. This avoids broad NOPASSWD access while letting domain
+    # users mount /mnt/x without opening a terminal or typing sudo.
     cat > /usr/local/bin/mount-kit-tools-desktop << 'EOF'
 #!/bin/bash
 set -e
 
-if command -v x-terminal-emulator >/dev/null 2>&1; then
-    exec x-terminal-emulator -e /usr/local/bin/mount-kit-tools-runner
+if mountpoint -q /mnt/x; then
+    exit 0
 fi
 
-if command -v gnome-terminal >/dev/null 2>&1; then
-    exec gnome-terminal -- /usr/local/bin/mount-kit-tools-runner
-fi
-
-if command -v mate-terminal >/dev/null 2>&1; then
-    exec mate-terminal -e /usr/local/bin/mount-kit-tools-runner
-fi
-
-if command -v xfce4-terminal >/dev/null 2>&1; then
-    exec xfce4-terminal -e /usr/local/bin/mount-kit-tools-runner
-fi
-
-exec sudo /usr/local/bin/mount-kit-tools
+exec sudo -n /usr/local/bin/mount-kit-tools
 EOF
     chmod +x /usr/local/bin/mount-kit-tools-desktop
+
+    # Allow permitted domain users to run only the mount helper without a password.
+    # This does NOT grant broad passwordless sudo. It only permits:
+    #   /usr/local/bin/mount-kit-tools
+    #
+    # The script prompts once for the optional sudo/domain user in post-join.
+    # Use that same short-name identity because SSSD is configured for short names.
+    mount_user="${DOMAIN_SUDO_USER:-${SUDO_USER:-}}"
+    if [ -n "$mount_user" ] && [ "$mount_user" != "root" ]; then
+        mount_sudoers_file="/etc/sudoers.d/dr_mount_kit_tools"
+        cat > "$mount_sudoers_file" << EOF
+# Managed by DR Domain Join
+$mount_user ALL=(root) NOPASSWD: /usr/local/bin/mount-kit-tools
+EOF
+        chmod 440 "$mount_sudoers_file"
+        chown root:root "$mount_sudoers_file"
+        if visudo -cf "$mount_sudoers_file" >/dev/null 2>&1; then
+            print_info "Configured passwordless mount permission for $mount_user"
+        else
+            print_warning "Mount helper sudoers validation failed; removing $mount_sudoers_file"
+            rm -f "$mount_sudoers_file"
+        fi
+    else
+        print_warning "No domain user available for passwordless mount helper rule"
+    fi
 
     cat > /usr/local/bin/umount-kit-tools << 'EOF'
 #!/bin/bash
@@ -1329,9 +1324,8 @@ Exec=/usr/local/bin/mount-kit-tools-desktop
 Icon=drive-network
 Terminal=false
 Type=Application
-X-GNOME-Autostart-enabled=false
+X-GNOME-Autostart-enabled=true
 NoDisplay=true
-Hidden=true
 EOF
     chmod 644 /etc/xdg/autostart/mount-kit-tools.desktop
 
@@ -1393,7 +1387,7 @@ EOF
     systemctl restart autofs
 
     print_info "DRIP autofs configured — /smb/<server>/<share>/ and /net/<server>/<share>/"
-    print_info "KIT tools mount helper configured — run: sudo mount-kit-tools"
+    print_info "KIT tools mount helper configured — run: mount-kit-tools"
     print_info "KIT tools path after helper runs: /mnt/x (${TOOLS_SERVER}/Tools)"
 
     # If this post-join run is being executed from a logged-in domain user via
@@ -1406,7 +1400,7 @@ EOF
             print_info "KIT tools share mounted at /mnt/x"
         else
             print_warning "KIT tools share was not mounted automatically"
-            print_warning "Log in as a domain user and run: sudo mount-kit-tools"
+            print_warning "Log in as a domain user and run: mount-kit-tools"
         fi
     fi
 }
@@ -1851,7 +1845,7 @@ main() {
         echo ""
         echo "  KIT tools can be mounted at /mnt/x using the desktop shortcut:"
         echo "    Mount DR Tools"
-        echo "  Use the Mount DR Tools desktop icon if /mnt/x is not already mounted."
+        echo "  After domain login, /mnt/x should mount automatically. If needed, use the Mount DR Tools desktop icon."
         echo ""
         if [ -n "$SUDO_USER" ]; then
             echo "  Sudo access has been granted to: ${SUDO_USER}"
