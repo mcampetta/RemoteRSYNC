@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.1.4"
+SCRIPT_VERSION="1.1.5"
 set -e  # Exit on error
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -1224,6 +1224,34 @@ mount -t cifs "\$SHARE" "\$MOUNT_POINT" -o sec=krb5,cruid=\$CRUID,vers=3.0
 EOF
     chmod +x /usr/local/bin/mount-kit-tools
 
+    # Desktop/Unity launcher wrapper. pkexec during Unity/XDG launch has proven
+    # unreliable on Ubuntu 16.04, while sudo from a terminal works correctly.
+    # This wrapper opens the user's terminal emulator and runs the known-good
+    # sudo mount path with visible status output.
+    cat > /usr/local/bin/mount-kit-tools-desktop << 'EOF'
+#!/bin/bash
+set -e
+
+if command -v x-terminal-emulator >/dev/null 2>&1; then
+    exec x-terminal-emulator -e "bash -lc 'sudo /usr/local/bin/mount-kit-tools; status=\$?; echo; if [ \$status -eq 0 ]; then echo \"DR Tools mounted at /mnt/x\"; else echo \"Mount failed with exit code \$status\"; fi; echo; read -r -p \"Press Enter to close...\"; exit \$status'"
+fi
+
+if command -v gnome-terminal >/dev/null 2>&1; then
+    exec gnome-terminal -- bash -lc 'sudo /usr/local/bin/mount-kit-tools; status=$?; echo; if [ $status -eq 0 ]; then echo "DR Tools mounted at /mnt/x"; else echo "Mount failed with exit code $status"; fi; echo; read -r -p "Press Enter to close..."; exit $status'
+fi
+
+if command -v mate-terminal >/dev/null 2>&1; then
+    exec mate-terminal -e "bash -lc 'sudo /usr/local/bin/mount-kit-tools; status=\$?; echo; if [ \$status -eq 0 ]; then echo \"DR Tools mounted at /mnt/x\"; else echo \"Mount failed with exit code \$status\"; fi; echo; read -r -p \"Press Enter to close...\"; exit \$status'"
+fi
+
+if command -v xfce4-terminal >/dev/null 2>&1; then
+    exec xfce4-terminal -e "bash -lc 'sudo /usr/local/bin/mount-kit-tools; status=\$?; echo; if [ \$status -eq 0 ]; then echo \"DR Tools mounted at /mnt/x\"; else echo \"Mount failed with exit code \$status\"; fi; echo; read -r -p \"Press Enter to close...\"; exit \$status'"
+fi
+
+exec sudo /usr/local/bin/mount-kit-tools
+EOF
+    chmod +x /usr/local/bin/mount-kit-tools-desktop
+
     cat > /usr/local/bin/umount-kit-tools << 'EOF'
 #!/bin/bash
 set -e
@@ -1240,7 +1268,7 @@ EOF
 [Desktop Entry]
 Name=Mount DR Tools
 Comment=Mount the DR Tools share at /mnt/x
-Exec=pkexec /usr/local/bin/mount-kit-tools
+Exec=/usr/local/bin/mount-kit-tools-desktop
 Icon=drive-network
 Terminal=false
 Type=Application
@@ -1279,12 +1307,13 @@ EOF
 [Desktop Entry]
 Name=Mount DR Tools
 Comment=Mount the DR Tools share at /mnt/x
-Exec=pkexec /usr/local/bin/mount-kit-tools
+Exec=/usr/local/bin/mount-kit-tools-desktop
 Icon=drive-network
 Terminal=false
 Type=Application
-X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-enabled=false
 NoDisplay=true
+Hidden=true
 EOF
     chmod 644 /etc/xdg/autostart/mount-kit-tools.desktop
 
@@ -1804,7 +1833,7 @@ main() {
         echo ""
         echo "  KIT tools can be mounted at /mnt/x using the desktop shortcut:"
         echo "    Mount DR Tools"
-        echo "  The same mount helper also runs automatically at graphical login."
+        echo "  Use the Mount DR Tools desktop icon if /mnt/x is not already mounted."
         echo ""
         if [ -n "$SUDO_USER" ]; then
             echo "  Sudo access has been granted to: ${SUDO_USER}"
