@@ -1672,8 +1672,9 @@ EOF
 
 main() {
     echo "=========================================="
-    echo "  DR Domain Join"
-    echo "=========================================="
+  echo "  DR Domain Join"
+  echo "  Version ${SCRIPT_VERSION}"
+  echo "=========================================="
     echo ""
 
     parse_args "$@"
