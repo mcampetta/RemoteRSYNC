@@ -1607,8 +1607,7 @@ parse_args() {
         case "$1" in
             --dns-test)
                 DNS_TEST_ONLY=true
-                ;;
-            -h|--help)
+                ;;-h|--help)
                 echo 'Usage: sudo bash -c \"$(wget -qO- http://ontrack.link/joindomain)\"'
                 echo "  If no office code has been saved, you will be prompted for it."
                 echo "  --dns-test   Apply DNS/search settings and test realm discovery only."
