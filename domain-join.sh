@@ -9,7 +9,7 @@
 #      chmod +x domain-join.sh
 #
 #   2. Run the script with sudo, passing your office code:
-#      sudo ./domain-join.sh EP1
+#      sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)" EP1
 #
 #   The office code is used to derive the tools file server hostname
 #   (e.g. EP1 → dr-ep1-tools, UK1 → dr-uk1-tools, DE1 → dr-de1-tools).
@@ -34,7 +34,7 @@
 #   the script will explicitly apply those DNS servers via NetworkManager.
 #
 # Test mode:
-#   sudo ./domain-join.sh EP1 --dns-test
+#   sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)" EP1 --dns-test
 #   Applies DNS/search settings and runs realm discovery without joining.
 #
 # Supported Systems:
@@ -105,7 +105,7 @@ load_config() {
 check_privileges() {
     if [ "$EUID" -ne 0 ]; then
         print_error "This script must be run as root or with sudo"
-        print_info "Please run: sudo ./domain-join.sh"
+        print_info "Please run: sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)""
         exit 1
     fi
 }
@@ -938,7 +938,7 @@ join_domain() {
     echo ""
     echo "  Once joined, re-run this script to complete configuration:"
     echo ""
-    echo "    sudo ./domain-join.sh"
+    echo "    sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)""
     echo ""
     exit 0
 }
@@ -1476,7 +1476,7 @@ parse_args() {
                 DNS_TEST_ONLY=true
                 ;;
             -h|--help)
-                echo "Usage: sudo ./domain-join.sh [OFFICE_CODE] [--dns-test]"
+                echo "Usage: sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)" [OFFICE_CODE] [--dns-test]"
                 echo "  OFFICE_CODE  Optional office code for your location (e.g. EP1, UK1, DE1)."
                 echo "               If omitted, the script prompts for it interactively."
                 echo "  --dns-test   Apply DNS/search settings and test realm discovery only."
@@ -1484,7 +1484,7 @@ parse_args() {
                 ;;
             -*)
                 print_error "Unknown option: $1"
-                echo "Usage: sudo ./domain-join.sh [OFFICE_CODE] [--dns-test]"
+                echo "Usage: sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)" [OFFICE_CODE] [--dns-test]"
                 exit 1
                 ;;
             *)
@@ -1492,7 +1492,7 @@ parse_args() {
                     OFFICE_CODE="$(echo "$1" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"
                 else
                     print_error "Unexpected argument: $1"
-                    echo "Usage: sudo ./domain-join.sh [OFFICE_CODE] [--dns-test]"
+                    echo "Usage: sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)" [OFFICE_CODE] [--dns-test]"
                     exit 1
                 fi
                 ;;
