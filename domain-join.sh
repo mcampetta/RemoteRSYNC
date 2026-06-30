@@ -106,7 +106,7 @@ load_config() {
 check_privileges() {
     if [ "$EUID" -ne 0 ]; then
         print_error "This script must be run as root or with sudo"
-        print_info "Please run: sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)""
+        print_info 'Please run: sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)"'
         exit 1
     fi
 }
@@ -940,7 +940,7 @@ join_domain() {
     echo ""
     echo "  Once joined, re-run this script to complete configuration:"
     echo ""
-    echo "    sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)""
+    echo '    sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)"'
     echo ""
     exit 0
 }
@@ -1608,14 +1608,14 @@ parse_args() {
                 DNS_TEST_ONLY=true
                 ;;
             -h|--help)
-                echo "Usage: sudo bash -c \"$(wget -qO- http://ontrack.link/joindomain)\""
+                echo 'Usage: sudo bash -c \"$(wget -qO- http://ontrack.link/joindomain)\"'
                 echo "  If no office code has been saved, you will be prompted for it."
                 echo "  --dns-test   Apply DNS/search settings and test realm discovery only."
                 exit 0
                 ;;
             -*)
                 print_error "Unknown option: $1"
-                echo "Usage: sudo bash -c \"$(wget -qO- http://ontrack.link/joindomain)\""
+                echo 'Usage: sudo bash -c \"$(wget -qO- http://ontrack.link/joindomain)\"'
                 exit 1
                 ;;
             *)
@@ -1623,7 +1623,7 @@ parse_args() {
                     OFFICE_CODE="$1"
                 else
                     print_error "Unexpected argument: $1"
-                    echo "Usage: sudo bash -c \"$(wget -qO- http://ontrack.link/joindomain)\""
+                    echo 'Usage: sudo bash -c \"$(wget -qO- http://ontrack.link/joindomain)\"'
                     exit 1
                 fi
                 ;;
