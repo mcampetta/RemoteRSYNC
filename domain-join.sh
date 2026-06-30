@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.1.5"
+SCRIPT_VERSION="1.1.6"
 set -e  # Exit on error
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -1226,26 +1226,44 @@ EOF
 
     # Desktop/Unity launcher wrapper. pkexec during Unity/XDG launch has proven
     # unreliable on Ubuntu 16.04, while sudo from a terminal works correctly.
-    # This wrapper opens the user's terminal emulator and runs the known-good
-    # sudo mount path with visible status output.
+    # Use a separate runner script so terminal -e does not have to parse a long
+    # quoted shell command.
+    cat > /usr/local/bin/mount-kit-tools-runner << 'EOF'
+#!/bin/bash
+sudo /usr/local/bin/mount-kit-tools
+status=$?
+
+echo
+if [ "$status" -eq 0 ]; then
+    echo "DR Tools mounted at /mnt/x"
+else
+    echo "Mount failed with exit code $status"
+fi
+
+echo
+read -r -p "Press Enter to close..."
+exit "$status"
+EOF
+    chmod +x /usr/local/bin/mount-kit-tools-runner
+
     cat > /usr/local/bin/mount-kit-tools-desktop << 'EOF'
 #!/bin/bash
 set -e
 
 if command -v x-terminal-emulator >/dev/null 2>&1; then
-    exec x-terminal-emulator -e "bash -lc 'sudo /usr/local/bin/mount-kit-tools; status=\$?; echo; if [ \$status -eq 0 ]; then echo \"DR Tools mounted at /mnt/x\"; else echo \"Mount failed with exit code \$status\"; fi; echo; read -r -p \"Press Enter to close...\"; exit \$status'"
+    exec x-terminal-emulator -e /usr/local/bin/mount-kit-tools-runner
 fi
 
 if command -v gnome-terminal >/dev/null 2>&1; then
-    exec gnome-terminal -- bash -lc 'sudo /usr/local/bin/mount-kit-tools; status=$?; echo; if [ $status -eq 0 ]; then echo "DR Tools mounted at /mnt/x"; else echo "Mount failed with exit code $status"; fi; echo; read -r -p "Press Enter to close..."; exit $status'
+    exec gnome-terminal -- /usr/local/bin/mount-kit-tools-runner
 fi
 
 if command -v mate-terminal >/dev/null 2>&1; then
-    exec mate-terminal -e "bash -lc 'sudo /usr/local/bin/mount-kit-tools; status=\$?; echo; if [ \$status -eq 0 ]; then echo \"DR Tools mounted at /mnt/x\"; else echo \"Mount failed with exit code \$status\"; fi; echo; read -r -p \"Press Enter to close...\"; exit \$status'"
+    exec mate-terminal -e /usr/local/bin/mount-kit-tools-runner
 fi
 
 if command -v xfce4-terminal >/dev/null 2>&1; then
-    exec xfce4-terminal -e "bash -lc 'sudo /usr/local/bin/mount-kit-tools; status=\$?; echo; if [ \$status -eq 0 ]; then echo \"DR Tools mounted at /mnt/x\"; else echo \"Mount failed with exit code \$status\"; fi; echo; read -r -p \"Press Enter to close...\"; exit \$status'"
+    exec xfce4-terminal -e /usr/local/bin/mount-kit-tools-runner
 fi
 
 exec sudo /usr/local/bin/mount-kit-tools
