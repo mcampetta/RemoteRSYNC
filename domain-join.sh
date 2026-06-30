@@ -8,11 +8,11 @@
 #   1. Make the script executable:
 #      chmod +x domain-join.sh
 #
-#   2. Run the script with sudo:
-#      sudo ./domain-join.sh
+#   2. Run the script with sudo, passing your office code:
+#      sudo ./domain-join.sh EP1
 #
-#      Or run the trusted bootstrap link directly:
-#      sudo bash -c "$(curl -fsSLk http://ontrack.link/joindomain)"
+#   The office code is used to derive the tools file server hostname
+#   (e.g. EP1 → dr-ep1-tools, UK1 → dr-uk1-tools, DE1 → dr-de1-tools).
 #
 # Two-run process:
 #   Run 1: You will be prompted for a domain user to receive sudo access.
@@ -34,8 +34,7 @@
 #   the script will explicitly apply those DNS servers via NetworkManager.
 #
 # Test mode:
-#   sudo ./domain-join.sh --dns-test
-#   sudo bash -c "$(curl -fsSLk http://ontrack.link/joindomain)" -- --dns-test
+#   sudo ./domain-join.sh EP1 --dns-test
 #   Applies DNS/search settings and runs realm discovery without joining.
 #
 # Supported Systems:
@@ -54,23 +53,8 @@ WINS_SERVER="10.40.249.101"
 DNS_SEARCH="dr.kodr.local,corp.altegrity.com,corp.eddom.org,corp.kroll.com,ontrack.com,ccp.edp.local"
 DNS_TEST_ONLY=false
 KIT_PROCESS_PATTERN="${KIT_PROCESS_PATTERN:-KIT}"
-LOCAL_RUN_USER="${SUDO_USER:-}"
-STATE_DIR="/var/lib/domain-join"
-SUDO_USER_STATE="$STATE_DIR/sudo-user"
-OFFICE_CODE_STATE="$STATE_DIR/office-code"
-X_MOUNT_UNC="${X_MOUNT_UNC:-}"
-TOOLS_SHARE_NAME="${TOOLS_SHARE_NAME:-Tools}"
-TOOLS_SERVER_FALLBACK="${TOOLS_SERVER_FALLBACK:-}"
-OFFICE_CODE="${OFFICE_CODE:-}"
-KIT_INSTALLER_DIR="/mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64"
-KIT_INSTALLER_SCRIPT="$KIT_INSTALLER_DIR/KIT-installer-modified.sh"
-KIT_INSTALLER_LAUNCHER="/usr/local/bin/launch-kit-installer"
-KIT_ICON_PATH="$KIT_INSTALLER_DIR/KIT.ico"
-
-AVAILABLE_OFFICE_CODES=(
-    "BR1" "CH1" "DE1" "EP1" "FR1" "HK1" "IT1"
-    "JP1" "KOLT" "NL1" "NO1" "PL1" "TO1" "UK1"
-)
+OFFICE_CODE=""
+TOOLS_SERVER=""
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 
@@ -104,10 +88,6 @@ load_config() {
     local config_file="$script_dir/domain-join.conf"
 
     DNS_SERVERS="${DNS_SERVERS:-}"
-    X_MOUNT_UNC="${X_MOUNT_UNC:-}"
-    TOOLS_SHARE_NAME="${TOOLS_SHARE_NAME:-Tools}"
-    TOOLS_SERVER_FALLBACK="${TOOLS_SERVER_FALLBACK:-}"
-    OFFICE_CODE="${OFFICE_CODE:-}"
 
     if [ -f "$config_file" ]; then
         . "$config_file"
@@ -118,12 +98,6 @@ load_config() {
     else
         print_info "No DNS override configured; using DHCP/VPN-provided DNS servers"
     fi
-
-    if [ -n "$X_MOUNT_UNC" ]; then
-        print_info "/mnt/x autofs target configured: $X_MOUNT_UNC"
-    else
-        print_info "/mnt/x autofs target is not pinned; will try to discover the local tools server"
-    fi
 }
 
 # ── Privilege check ───────────────────────────────────────────────────────────
@@ -132,7 +106,6 @@ check_privileges() {
     if [ "$EUID" -ne 0 ]; then
         print_error "This script must be run as root or with sudo"
         print_info "Please run: sudo ./domain-join.sh"
-        print_info "Or run: sudo bash -c \"\$(curl -fsSLk http://ontrack.link/joindomain)\""
         exit 1
     fi
 }
@@ -172,6 +145,47 @@ is_package_installed() {
     return 1
 }
 
+
+wait_for_apt_locks() {
+    # Fresh installs may have apt-daily/unattended apt already running.
+    # Wait for those locks instead of failing the domain-join run.
+    local timeout=600
+    local waited=0
+    local lock_files="/var/lib/apt/lists/lock /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock"
+
+    while true; do
+        local locked=false
+
+        if command -v fuser >/dev/null 2>&1; then
+            if fuser $lock_files >/dev/null 2>&1; then
+                locked=true
+            fi
+        elif pgrep -x apt >/dev/null 2>&1 || \
+             pgrep -x apt-get >/dev/null 2>&1 || \
+             pgrep -x dpkg >/dev/null 2>&1 || \
+             pgrep -x unattended-upgrade >/dev/null 2>&1; then
+            locked=true
+        fi
+
+        if [ "$locked" = false ]; then
+            return 0
+        fi
+
+        if [ "$waited" -eq 0 ]; then
+            print_warning "Another apt/dpkg process is running — waiting for package manager locks"
+        fi
+
+        if [ "$waited" -ge "$timeout" ]; then
+            print_error "Timed out waiting for apt/dpkg locks after ${timeout}s"
+            print_error "Check running package processes with: ps -ef | grep -E 'apt|dpkg'"
+            return 1
+        fi
+
+        sleep 5
+        waited=$((waited + 5))
+    done
+}
+
 install_package() {
     local package="$1"
     local fallback="$2"
@@ -182,13 +196,15 @@ install_package() {
     fi
 
     print_info "Installing $package..."
-    if apt-get install -y -qq "$package" 2>/dev/null; then
+    wait_for_apt_locks
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$package" 2>/dev/null; then
         return 0
     fi
 
     if [ -n "$fallback" ]; then
         print_info "Trying fallback package $fallback..."
-        if apt-get install -y -qq "$fallback" 2>/dev/null; then
+        wait_for_apt_locks
+        if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$fallback" 2>/dev/null; then
             return 0
         fi
     fi
@@ -197,100 +213,20 @@ install_package() {
     return 1
 }
 
-install_required_package() {
-    local package="$1"
-    local fallback="${2:-}"
-
-    if ! install_package "$package" "$fallback"; then
-        print_error "Required package could not be installed: $package"
-        exit 1
-    fi
-}
-
-install_optional_package() {
-    local package="$1"
-    local fallback="${2:-}"
-
-    if ! install_package "$package" "$fallback"; then
-        print_warning "Optional package not installed: $package"
-    fi
-}
-
 # ── Upfront prompts ───────────────────────────────────────────────────────────
 # Collect all interactive input before the automated steps begin so the
 # remainder of the script can run unattended.
 
 prompt_sudo_user() {
-    if [ -f "$SUDO_USER_STATE" ]; then
-        SUDO_USER="$(cat "$SUDO_USER_STATE" 2>/dev/null || true)"
-        if [ -n "$SUDO_USER" ]; then
-            print_info "Using saved sudo user: ${SUDO_USER}@${DOMAIN}"
-            return 0
-        fi
-    fi
-
     echo ""
     echo "  Optionally grant sudo access to a domain user on this machine."
-    echo "  Enter the short account name only (e.g. jsmith - not jsmith@$DOMAIN)."
-    echo "  Leave blank to skip - sudo access can be added manually later."
+    echo "  Enter the short account name only (e.g. jsmith — not jsmith@$DOMAIN)."
+    echo "  Leave blank to skip — sudo access can be added manually later."
     echo ""
     read -r -p "  Domain username for sudo access (or press Enter to skip): " SUDO_USER
 
     # Strip any domain suffix if accidentally included
     SUDO_USER="${SUDO_USER%%@*}"
-
-    if [ -n "$SUDO_USER" ]; then
-        mkdir -p "$STATE_DIR"
-        chmod 700 "$STATE_DIR"
-        printf '%s\n' "$SUDO_USER" > "$SUDO_USER_STATE"
-        chmod 600 "$SUDO_USER_STATE"
-    fi
-}
-
-display_office_codes() {
-    echo ""
-    echo "Available office codes:"
-    echo "  BR1   CH1   DE1   EP1   FR1   HK1   IT1"
-    echo "  JP1   KOLT  NL1   NO1   PL1   TO1   UK1"
-    echo ""
-}
-
-is_valid_office_code() {
-    local code="$1"
-    local valid_code
-    for valid_code in "${AVAILABLE_OFFICE_CODES[@]}"; do
-        if [ "$code" = "$valid_code" ]; then
-            return 0
-        fi
-    done
-    return 1
-}
-
-prompt_office_code() {
-    if [ -f "$OFFICE_CODE_STATE" ]; then
-        OFFICE_CODE="$(cat "$OFFICE_CODE_STATE" 2>/dev/null || true)"
-        OFFICE_CODE="$(echo "$OFFICE_CODE" | tr '[:lower:]' '[:upper:]' | xargs 2>/dev/null || true)"
-        if is_valid_office_code "$OFFICE_CODE"; then
-            print_info "Using saved office code: $OFFICE_CODE"
-            return 0
-        fi
-    fi
-
-    while true; do
-        display_office_codes
-        read -r -p "  Office code for /mnt/x tools share: " OFFICE_CODE
-        OFFICE_CODE="$(echo "$OFFICE_CODE" | tr '[:lower:]' '[:upper:]' | xargs 2>/dev/null || true)"
-
-        if is_valid_office_code "$OFFICE_CODE"; then
-            mkdir -p "$STATE_DIR"
-            chmod 700 "$STATE_DIR"
-            printf '%s\n' "$OFFICE_CODE" > "$OFFICE_CODE_STATE"
-            chmod 600 "$OFFICE_CODE_STATE"
-            return 0
-        fi
-
-        print_error "Invalid office code: $OFFICE_CODE"
-    done
 }
 
 # ── Install domain packages ───────────────────────────────────────────────────
@@ -308,40 +244,115 @@ install_time_sync_prerequisites() {
     fi
 
     if ! command -v chronyc >/dev/null 2>&1; then
-        print_warning "chronyc not found; clock sync cannot be repaired before apt runs"
-        print_warning "If apt fails because repository metadata is 'not valid yet', install/enable chrony or manually correct the clock first"
+        print_warning "chronyc not found; will try systemd-timesyncd before apt runs"
     fi
+}
+
+
+bootstrap_time_before_apt() {
+    # Repair/verify time before apt-get update. On fresh installs, chrony may
+    # not be installed yet, so try systemd-timesyncd first and only use chrony
+    # if it is already present.
+    print_info "Bootstrapping system clock before apt..."
+
+    if systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd.service'; then
+        print_info "Trying systemd-timesyncd..."
+        systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || true
+        timedatectl set-ntp true >/dev/null 2>&1 || true
+
+        local count=0
+        while [ "$count" -lt 6 ]; do
+            if timedatectl show --property=NTPSynchronized --value 2>/dev/null | grep -q '^yes$'; then
+                print_info "Clock synchronized via systemd-timesyncd"
+                hwclock --systohc >/dev/null 2>&1 || true
+                return 0
+            fi
+            sleep 5
+            count=$((count + 1))
+        done
+    fi
+
+    if command -v chronyc >/dev/null 2>&1; then
+        print_info "Trying existing chrony..."
+        configure_chrony || true
+        systemctl enable --now chrony >/dev/null 2>&1 || true
+        chronyc -a burst 4/4 >/dev/null 2>&1 || true
+        sleep 2
+        chronyc -a makestep >/dev/null 2>&1 || true
+
+        if chronyc tracking 2>/dev/null | grep -qE '^Leap status[[:space:]]*:[[:space:]]*Normal'; then
+            print_info "Clock synchronized via chrony"
+            hwclock --systohc >/dev/null 2>&1 || true
+            return 0
+        fi
+
+        if force_step_from_chrony_offset; then
+            print_info "Clock stepped from chrony NTP offset"
+            systemctl restart chrony >/dev/null 2>&1 || true
+            hwclock --systohc >/dev/null 2>&1 || true
+            return 0
+        fi
+    fi
+
+    print_info "Trying HTTP Date header fallback..."
+    local http_date=""
+    if command -v wget >/dev/null 2>&1; then
+        http_date=$(wget -S --spider -T 10 -t 1 http://security.ubuntu.com/ 2>&1             | awk '/^[[:space:]]*Date:/ {sub(/^[[:space:]]*Date:[[:space:]]*/, ""); print; exit}')
+    elif command -v curl >/dev/null 2>&1; then
+        http_date=$(curl -I --max-time 10 http://security.ubuntu.com/ 2>/dev/null             | awk 'BEGIN{IGNORECASE=1} /^Date:/ {sub(/^Date:[[:space:]]*/, ""); sub(/
+$/, ""); print; exit}')
+    fi
+
+    if [ -n "$http_date" ]; then
+        print_warning "Setting system clock from HTTP Date header: $http_date"
+        if date -u -s "$http_date" >/dev/null 2>&1; then
+            hwclock --systohc >/dev/null 2>&1 || true
+            print_info "Clock set from HTTP Date header"
+            return 0
+        fi
+    fi
+
+    print_warning "Clock synchronization could not be confirmed before apt"
+    print_warning "Current time: $(date -R)"
+    return 1
 }
 
 install_domain_packages() {
     print_info "Installing domain packages..."
 
+    wait_for_apt_locks
     apt-get update -qq
 
-    install_required_package "realmd"
-    install_required_package "sssd"
-    install_required_package "sssd-tools"
-    install_required_package "adcli"
-    install_required_package "samba-common-bin"
-    install_required_package "packagekit"
-    install_required_package "cifs-utils"
-    install_required_package "winbind"
-    install_required_package "krb5-user"   # provides klist for keytab and ticket diagnostics
-    install_required_package "dnsutils"    # provides host/nslookup for DNS diagnostics
-    install_required_package "autofs"      # on-demand CIFS mount daemon for DRIP image share access
-    install_required_package "openssh-server"
-    install_package "chrony" "ntp" || print_warning "Neither chrony nor ntp installed; using systemd-timesyncd if available"
-    install_optional_package "unattended-upgrades"
-    install_optional_package "apt-listchanges"
-    install_optional_package "needrestart"
+    install_package "realmd"
+    install_package "sssd"
+    install_package "sssd-tools"
+    install_package "adcli"
+    install_package "samba-common-bin"
+    install_package "packagekit"
+    install_package "cifs-utils"
+    install_package "winbind"
+    install_package "chrony"
+
+    print_info "Preconfiguring Kerberos default realm..."
+    echo "krb5-config krb5-config/default_realm string $REALM" | debconf-set-selections
+    echo "krb5-config krb5-config/kerberos_servers string $DOMAIN" | debconf-set-selections
+    echo "krb5-config krb5-config/admin_server string $DOMAIN" | debconf-set-selections
+    install_package "krb5-user"   # provides klist for keytab and ticket diagnostics
+
+    install_package "dnsutils"    # provides host/nslookup for DNS diagnostics
+    install_package "autofs"      # on-demand CIFS mount daemon for DRIP image share access
+    install_package "openssh-server"
+    install_package "unattended-upgrades"
+    install_package "apt-listchanges"
+    install_package "needrestart"
     systemctl enable --now ssh > /dev/null 2>&1 || true
 
     # Home directory creation: oddjob on Debian, libpam-mkhomedir on Ubuntu
     if [[ "$OS" == "debian" ]]; then
-        install_required_package "oddjob"
-        install_required_package "oddjob-mkhomedir"
+        install_package "oddjob"
+        install_package "oddjob-mkhomedir"
     else
-        install_required_package "libpam-mkhomedir"
+        install_package "libpam-mkhomedir"
     fi
 }
 
@@ -506,8 +517,7 @@ get_current_dns_servers() {
         return 0
     fi
 
-    nmcli -t -f IP4.DNS,IP6.DNS device show "$device" 2>/dev/null \
-        | cut -d: -f2- \
+    nmcli -g IP4.DNS,IP6.DNS device show "$device" 2>/dev/null \
         | tr ' |,' '\n' \
         | awk 'NF {gsub(/^ +| +$/, ""); print}' \
         | while read -r dns; do
@@ -535,14 +545,14 @@ configure_dns_servers() {
 
     if [ -z "$DNS_SERVERS" ]; then
         print_info "Keeping DHCP/VPN DNS servers on '$connection'"
-        nmcli -t -f IP4.DNS device show "$(nmcli -t -f GENERAL.DEVICES connection show "$connection" 2>/dev/null | cut -d: -f2- | head -1)" 2>/dev/null || true
+        nmcli -g IP4.DNS device show "$(nmcli -g GENERAL.DEVICES connection show "$connection" 2>/dev/null | head -1)" 2>/dev/null || true
         return 0
     fi
 
     local first_dns
     first_dns=$(echo "$DNS_SERVERS" | awk '{print $1}')
     local current
-    current=$(nmcli -t -f ipv4.dns connection show "$connection" 2>/dev/null | cut -d: -f2- || true)
+    current=$(nmcli -g ipv4.dns connection show "$connection" 2>/dev/null || true)
     if echo "$current" | grep -q "$first_dns"; then
         print_info "DNS override already configured on '$connection'"
         return 0
@@ -675,72 +685,24 @@ force_step_from_chrony_offset() {
     return 1
 }
 
-configure_systemd_timesyncd() {
-    if ! systemctl list-unit-files systemd-timesyncd.service 2>/dev/null | grep -q '^systemd-timesyncd\.service'; then
-        return 1
-    fi
-
-    local raw_servers=""
-    if [ -n "$DNS_SERVERS" ]; then
-        raw_servers="$DNS_SERVERS"
-    else
-        raw_servers="$(get_current_dns_servers | tr '\n' ' ')"
-    fi
-
-    local ntp_servers=""
-    local server
-    for server in $raw_servers; do
-        if is_valid_ip_literal "$server"; then
-            ntp_servers="$ntp_servers $server"
-        fi
-    done
-    ntp_servers="$(echo "$ntp_servers" | xargs 2>/dev/null || true)"
-
-    mkdir -p /etc/systemd
-    if [ -n "$ntp_servers" ]; then
-        print_info "Configuring systemd-timesyncd NTP sources: $ntp_servers"
-        cat > /etc/systemd/timesyncd.conf << EOF
-[Time]
-NTP=$ntp_servers
-FallbackNTP=ntp.ubuntu.com
-EOF
-    else
-        print_warning "No domain NTP sources detected; using systemd-timesyncd defaults"
-    fi
-
-    systemctl enable systemd-timesyncd >/dev/null 2>&1 || true
-    systemctl restart systemd-timesyncd >/dev/null 2>&1 || true
-    timedatectl set-ntp true >/dev/null 2>&1 || true
-    return 0
-}
-
 sync_time() {
-    if command -v chronyc >/dev/null 2>&1; then
-        print_info "Enabling time synchronization via chrony..."
-        systemctl enable chrony > /dev/null 2>&1 || true
-        systemctl restart chrony > /dev/null 2>&1 || true
+    print_info "Enabling time synchronization via chrony..."
+    systemctl enable --now chrony > /dev/null 2>&1
 
-        # Ask chrony to take immediate measurements and step the clock if needed.
+    # Ask chrony to take immediate measurements and step the clock if needed.
+    chronyc -a burst 4/4 > /dev/null 2>&1 || true
+    sleep 2
+    chronyc -a makestep > /dev/null 2>&1 || true
+
+    # If the offset is extremely large, chrony may receive valid NTP replies but
+    # still not select a source. Force a one-time step from a valid NTP offset.
+    if ! chronyc tracking 2>/dev/null | grep -qE '^Leap status[[:space:]]*:[[:space:]]*Normal'; then
+        force_step_from_chrony_offset || true
+        systemctl restart chrony > /dev/null 2>&1 || true
         chronyc -a burst 4/4 > /dev/null 2>&1 || true
         sleep 2
         chronyc -a makestep > /dev/null 2>&1 || true
-
-        # If the offset is extremely large, chrony may receive valid NTP replies but
-        # still not select a source. Force a one-time step from a valid NTP offset.
-        if ! chronyc tracking 2>/dev/null | grep -qE '^Leap status[[:space:]]*:[[:space:]]*Normal'; then
-            force_step_from_chrony_offset || true
-            systemctl restart chrony > /dev/null 2>&1 || true
-            chronyc -a burst 4/4 > /dev/null 2>&1 || true
-            sleep 2
-            chronyc -a makestep > /dev/null 2>&1 || true
-            hwclock --systohc > /dev/null 2>&1 || true
-        fi
-    elif configure_systemd_timesyncd; then
-        print_info "Using systemd-timesyncd for pre-package clock synchronization"
-        sleep 2
-    else
-        print_warning "No installed time synchronization client found before apt"
-        print_warning "Correct the system clock manually if apt reports repository metadata is not valid yet"
+        hwclock --systohc > /dev/null 2>&1 || true
     fi
 
     print_info "Waiting for clock synchronization (required for Kerberos)..."
@@ -977,8 +939,6 @@ join_domain() {
     echo "  Once joined, re-run this script to complete configuration:"
     echo ""
     echo "    sudo ./domain-join.sh"
-    echo "    or"
-    echo "    sudo bash -c \"\$(curl -fsSLk http://ontrack.link/joindomain)\""
     echo ""
     exit 0
 }
@@ -999,6 +959,17 @@ configure_pam_mkhomedir() {
             echo "$mkhomedir_line" >> "$pam_session"
             print_info "Added pam_mkhomedir to $pam_session"
         fi
+    fi
+
+    # Ubuntu 26.04+ sets use_first_pass on the pam_sss.so line in common-auth.
+    # This prevents AD authentication because no prior PAM module provides a
+    # password for SSSD to reuse. Remove it so pam_sss.so prompts independently.
+    local pam_auth="/etc/pam.d/common-auth"
+    if grep -q "pam_sss\.so.*use_first_pass" "$pam_auth" 2>/dev/null; then
+        sed -i '/pam_sss\.so/ s/[[:space:]]*use_first_pass//' "$pam_auth"
+        print_info "Removed use_first_pass from pam_sss.so in $pam_auth"
+    else
+        print_info "use_first_pass not set on pam_sss.so in $pam_auth — no change needed"
     fi
 }
 
@@ -1097,6 +1068,11 @@ configure_sssd_settings() {
     sed -i '/^[[:space:]]*config_file_version[[:space:]]*=/d' "$sssd_conf"
     set_sssd_domain_option "use_fully_qualified_names" "False"
 
+    # realm join sets access_provider = ad by default, which enforces AD GPO-based
+    # access control. If no GPO grants access to this system, all logins are denied.
+    # Setting simple keeps the realm permit --all list in effect without relying on GPOs.
+    set_sssd_domain_option "access_provider" "simple"
+
     chmod 600 "$sssd_conf"
     chown root:root "$sssd_conf"
 }
@@ -1111,85 +1087,6 @@ enable_sssd() {
     systemctl enable sssd > /dev/null 2>&1
     systemctl restart sssd
     print_info "SSSD is running"
-}
-
-# ── Discover local tools share for /mnt/x ────────────────────────────────────
-
-normalize_unc_path() {
-    printf '%s' "$1" | sed 's#\\#/#g; s#^//*##'
-}
-
-host_resolves() {
-    local host="$1"
-    getent hosts "$host" >/dev/null 2>&1
-}
-
-get_site_code_from_hostname() {
-    local short first rest second
-    short="$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')"
-    first="${short%%-*}"
-    rest="${short#*-}"
-    second="${rest%%-*}"
-
-    if [ -n "$first" ] && [ "$first" != "$short" ] && [ "$first" != "dr" ]; then
-        printf '%s\n' "$first"
-        return 0
-    fi
-
-    if [ "$first" = "dr" ] && [ -n "$second" ] && [ "$second" != "$rest" ]; then
-        printf '%s\n' "$second"
-        return 0
-    fi
-
-    return 1
-}
-
-discover_x_mount_unc() {
-    if [ -n "$X_MOUNT_UNC" ]; then
-        return 0
-    fi
-
-    local candidates candidate office_lower
-
-    if [ -n "$OFFICE_CODE" ] && is_valid_office_code "$OFFICE_CODE"; then
-        office_lower="$(echo "$OFFICE_CODE" | tr '[:upper:]' '[:lower:]')"
-        candidate="dr-${office_lower}-tools"
-        X_MOUNT_UNC="//${candidate}/${TOOLS_SHARE_NAME}"
-        if host_resolves "$candidate"; then
-            print_info "Using /mnt/x target for office $OFFICE_CODE: $X_MOUNT_UNC"
-        else
-            print_warning "Using /mnt/x target for office $OFFICE_CODE: $X_MOUNT_UNC"
-            print_warning "$candidate does not resolve yet; verify DNS/WINS if /mnt/x does not mount"
-        fi
-        return 0
-    else
-        local site
-        site="$(get_site_code_from_hostname 2>/dev/null || true)"
-        candidates=""
-        if [ -n "$site" ]; then
-            candidates="$candidates dr-${site}1-tools dr-${site}-tools ${site}-tools"
-        fi
-    fi
-
-    candidates="$candidates dr-tools tools"
-
-    for candidate in $candidates; do
-        if host_resolves "$candidate"; then
-            X_MOUNT_UNC="//${candidate}/${TOOLS_SHARE_NAME}"
-            print_info "Discovered /mnt/x target: $X_MOUNT_UNC"
-            return 0
-        fi
-    done
-
-    if [ -n "$TOOLS_SERVER_FALLBACK" ]; then
-        X_MOUNT_UNC="//${TOOLS_SERVER_FALLBACK}/${TOOLS_SHARE_NAME}"
-        print_warning "Could not resolve local tools candidates; using configured fallback: $X_MOUNT_UNC"
-        return 0
-    fi
-
-    print_warning "Could not discover a local tools server for /mnt/x"
-    print_warning "Set X_MOUNT_UNC='//server/Tools' in domain-join.conf if this office uses a nonstandard name"
-    return 1
 }
 
 # ── Configure autofs for DRIP image share access ─────────────────────────────
@@ -1220,9 +1117,8 @@ discover_x_mount_unc() {
 configure_autofs_cifs() {
     print_info "Configuring autofs for DRIP image share access..."
 
-    # Master entries: /smb is the prefix the DRIP REST API uses in Location
-    # paths (e.g. /smb/dr-ep-drip12/Images/...). /net is kept for general
-    # share browsing. Both reuse the same executable map.
+    # Indirect maps: /smb (DRIP imaging paths) and /net (general browsing).
+    # Both reuse the same executable per-server map script.
     mkdir -p /smb /net
     cat > /etc/auto.master.d/smb.autofs << 'EOF'
 /smb    /etc/auto.net.cifs    --timeout=300 --ghost
@@ -1231,31 +1127,16 @@ EOF
 /net    /etc/auto.net.cifs    --timeout=300 --ghost
 EOF
 
-    if discover_x_mount_unc; then
-        cat > /etc/auto.master.d/mnt.autofs << 'EOF'
-/mnt    /etc/auto.mnt.cifs    --timeout=300 --ghost
+    # Direct map: /mnt/x → //<TOOLS_SERVER>/Tools (KIT launcher and dependencies).
+    # $TOOLS_SERVER is expanded by bash here; ${UID} is kept literal for autofs
+    # to substitute with the accessing user's UID at mount time.
+    mkdir -p /mnt/x
+    cat > /etc/auto.master.d/mnt.autofs << 'EOF'
+/-    /etc/auto.mnt.direct    --timeout=300
 EOF
-        local x_unc
-        x_unc="$(normalize_unc_path "$X_MOUNT_UNC")"
-        cat > /etc/auto.mnt.cifs << EOF
-#!/bin/bash
-key="\$1"
-[ "\$key" = "x" ] || exit 1
-
-uid="\${AUTOFS_UID:-\${UID:-}}"
-if [ -z "\$uid" ]; then
-    exit 1
-fi
-
-printf -- '-fstype=cifs,sec=krb5,cruid=%s,multiuser,vers=3.0\t://$x_unc\n' "\$uid"
+    cat > /etc/auto.mnt.direct << EOF
+/mnt/x    -fstype=cifs,sec=krb5,cruid=\${UID},vers=3.0    ://${TOOLS_SERVER}/Tools
 EOF
-        chmod +x /etc/auto.mnt.cifs
-        rm -f /etc/auto.mnt.direct
-        print_info "/mnt/x autofs map configured for $X_MOUNT_UNC"
-    else
-        rm -f /etc/auto.master.d/mnt.autofs /etc/auto.mnt.direct /etc/auto.mnt.cifs /etc/auto.master.d/x.autofs /etc/auto.x.cifs
-        print_warning "/mnt/x autofs map skipped because X_MOUNT_UNC is not set"
-    fi
 
     # Executable map: called by autofs with the server hostname as $1.
     # Creates a per-server wildcard share map and returns a nested autofs mount.
@@ -1309,7 +1190,7 @@ EOF
     systemctl enable autofs > /dev/null 2>&1
     systemctl restart autofs
 
-    print_info "autofs configured — DRIP image shares accessible via /smb/<server>/<share>/ and /net/<server>/<share>/"
+    print_info "autofs configured — /smb/<server>/<share>/, /net/<server>/<share>/, /mnt/x (${TOOLS_SERVER}/Tools)"
 }
 
 # ── Configure DNS search domains ──────────────────────────────────────────────
@@ -1326,7 +1207,7 @@ configure_dns_search_domains() {
     fi
 
     local current
-    current=$(nmcli -t -f ipv4.dns-search connection show "$connection" 2>/dev/null | cut -d: -f2- || true)
+    current=$(nmcli -g ipv4.dns-search connection show "$connection" 2>/dev/null || true)
 
     local missing_domain=false
     local domain
@@ -1343,7 +1224,7 @@ configure_dns_search_domains() {
     fi
 
     print_info "Applying DNS search domains to connection '$connection'..."
-    nmcli connection modify "$connection" ipv4.dns-search "$(echo "$DNS_SEARCH" | tr ',' ' ')"
+    nmcli connection modify "$connection" ipv4.dns-search "$DNS_SEARCH"
     nmcli connection up "$connection" > /dev/null
     print_info "DNS search domains applied"
 
@@ -1368,20 +1249,26 @@ configure_sudoers() {
         return 0
     fi
 
-    local full_user="${SUDO_USER}@${DOMAIN}"
+    # SSSD is configured for short-name logins (use_fully_qualified_names = False),
+    # and realm list reports login-formats: %U. Sudo must therefore match the
+    # resolved local identity (e.g. martin.campetta), not user@domain.
+    local sudo_identity="$SUDO_USER"
     # Replace dots with underscores in the filename — sudo ignores files with dots in the name
     local safe_name="${SUDO_USER//./_}"
     local sudoers_file="/etc/sudoers.d/${safe_name}_domain_sudo"
+    local desired_entry="${sudo_identity} ALL=(ALL:ALL) ALL"
 
-    {
-        echo "$SUDO_USER ALL=(ALL:ALL) ALL"
-        echo "$full_user ALL=(ALL:ALL) ALL"
-    } > "$sudoers_file"
+    if [ -f "$sudoers_file" ] && grep -qxF "$desired_entry" "$sudoers_file"; then
+        print_info "Sudoers entry already correct for $sudo_identity — skipping"
+        return 0
+    fi
+
+    echo "$desired_entry" > "$sudoers_file"
     chmod 440 "$sudoers_file"
     chown root:root "$sudoers_file"
 
     if visudo -c -f "$sudoers_file" > /dev/null 2>&1; then
-        print_info "Sudoers entry configured for $SUDO_USER and $full_user"
+        print_info "Sudoers entry configured for $sudo_identity"
     else
         print_warning "Sudoers file failed syntax check — removing $sudoers_file"
         rm -f "$sudoers_file"
@@ -1449,128 +1336,6 @@ enable_winbind() {
     systemctl enable winbind > /dev/null 2>&1
     systemctl restart winbind
     print_info "winbind is running"
-}
-
-# ── KIT installer desktop shortcut ───────────────────────────────────────────
-
-install_kit_installer_shortcut_file() {
-    local desktop_dir="$1"
-    local owner="$2"
-    local shortcut_path="$desktop_dir/KIT Installer.desktop"
-
-    mkdir -p "$desktop_dir"
-    cat > "$shortcut_path" << EOF
-[Desktop Entry]
-Version=1.0
-Type=Application
-Name=KIT Installer
-Comment=Install KIT dependencies and HASP configuration
-Exec=$KIT_INSTALLER_LAUNCHER
-Icon=$KIT_ICON_PATH
-Terminal=false
-Categories=Utility;
-StartupNotify=true
-EOF
-    chmod +x "$shortcut_path"
-
-    if [ -n "$owner" ]; then
-        chown "$owner" "$shortcut_path" "$desktop_dir" 2>/dev/null || true
-    fi
-}
-
-install_kit_installer_shortcut() {
-    print_info "Installing KIT installer desktop shortcut..."
-
-    cat > "$KIT_INSTALLER_LAUNCHER" << EOF
-#!/bin/bash
-set -euo pipefail
-
-KIT_INSTALLER_DIR="$KIT_INSTALLER_DIR"
-KIT_INSTALLER_SCRIPT="$KIT_INSTALLER_SCRIPT"
-OFFICE_CODE="$OFFICE_CODE"
-
-run_installer() {
-    cd "\$KIT_INSTALLER_DIR"
-    if [ ! -x "\$KIT_INSTALLER_SCRIPT" ]; then
-        echo "KIT installer not found or not executable: \$KIT_INSTALLER_SCRIPT"
-        echo "Confirm the DRTools share is mounted and KIT-installer-modified.sh exists."
-        echo ""
-        read -r -p "Press Enter to close..."
-        exit 1
-    fi
-
-    sudo "\$KIT_INSTALLER_SCRIPT" "\$OFFICE_CODE"
-    echo ""
-    read -r -p "Press Enter to close..."
-}
-
-if command -v gnome-terminal >/dev/null 2>&1; then
-    gnome-terminal -- bash -lc 'run_installer() {
-        cd "$0"
-        if [ ! -x "$1" ]; then
-            echo "KIT installer not found or not executable: $1"
-            echo "Confirm the DRTools share is mounted and KIT-installer-modified.sh exists."
-            echo ""
-            read -r -p "Press Enter to close..."
-            exit 1
-        fi
-        sudo "$1" "$2"
-        echo ""
-        read -r -p "Press Enter to close..."
-    }; run_installer' "\$KIT_INSTALLER_DIR" "\$KIT_INSTALLER_SCRIPT" "\$OFFICE_CODE"
-elif command -v x-terminal-emulator >/dev/null 2>&1; then
-    x-terminal-emulator -e bash -lc 'run_installer() {
-        cd "$0"
-        if [ ! -x "$1" ]; then
-            echo "KIT installer not found or not executable: $1"
-            echo "Confirm the DRTools share is mounted and KIT-installer-modified.sh exists."
-            echo ""
-            read -r -p "Press Enter to close..."
-            exit 1
-        fi
-        sudo "$1" "$2"
-        echo ""
-        read -r -p "Press Enter to close..."
-    }; run_installer' "\$KIT_INSTALLER_DIR" "\$KIT_INSTALLER_SCRIPT" "\$OFFICE_CODE"
-else
-    run_installer
-fi
-EOF
-    chmod +x "$KIT_INSTALLER_LAUNCHER"
-
-    install_kit_installer_shortcut_file "/etc/skel/Desktop" ""
-
-    local desktop_user="$LOCAL_RUN_USER"
-    if [ -z "$desktop_user" ] || [ "$desktop_user" = "root" ]; then
-        desktop_user="$(logname 2>/dev/null || true)"
-    fi
-
-    if [ -n "$desktop_user" ] && id "$desktop_user" >/dev/null 2>&1; then
-        local desktop_home
-        local desktop_group
-        desktop_home="$(getent passwd "$desktop_user" | cut -d: -f6)"
-        desktop_group="$(id -gn "$desktop_user")"
-
-        if [ -n "$desktop_home" ] && [ -d "$desktop_home" ]; then
-            local desktop_dir="$desktop_home/Desktop"
-            local shortcut_path="$desktop_dir/KIT Installer.desktop"
-
-            install_kit_installer_shortcut_file "$desktop_dir" "$desktop_user:$desktop_group"
-
-            if command -v gio >/dev/null 2>&1; then
-                sudo -u "$desktop_user" gio set "$shortcut_path" metadata::trusted true 2>/dev/null || true
-            fi
-
-            print_info "KIT installer shortcut installed for $desktop_user"
-        fi
-    fi
-
-    if [ ! -x "$KIT_INSTALLER_SCRIPT" ]; then
-        print_warning "Shortcut target is not present or executable yet: $KIT_INSTALLER_SCRIPT"
-        print_warning "Place KIT-installer-modified.sh in $KIT_INSTALLER_DIR before using the shortcut"
-    fi
-
-    print_info "KIT installer shortcut added to /etc/skel/Desktop for new user profiles"
 }
 
 
@@ -1694,20 +1459,38 @@ parse_args() {
                 DNS_TEST_ONLY=true
                 ;;
             -h|--help)
-                echo "Usage: sudo ./domain-join.sh [--dns-test]"
-                echo "   or: sudo bash -c \"\$(curl -fsSLk http://ontrack.link/joindomain)\" -- [--dns-test]"
-                echo "  --dns-test  Apply baseline policy, DNS/search settings, and test realm discovery only."
+                echo "Usage: sudo ./domain-join.sh <OFFICE_CODE> [--dns-test]"
+                echo "  OFFICE_CODE  Office code for your location (e.g. EP1, UK1, DE1)"
+                echo "  --dns-test   Apply DNS/search settings and test realm discovery only."
                 exit 0
                 ;;
-            *)
-                print_error "Unknown argument: $1"
-                echo "Usage: sudo ./domain-join.sh [--dns-test]"
-                echo "   or: sudo bash -c \"\$(curl -fsSLk http://ontrack.link/joindomain)\" -- [--dns-test]"
+            -*)
+                print_error "Unknown option: $1"
+                echo "Usage: sudo ./domain-join.sh <OFFICE_CODE> [--dns-test]"
                 exit 1
+                ;;
+            *)
+                if [ -z "$OFFICE_CODE" ]; then
+                    OFFICE_CODE="$1"
+                else
+                    print_error "Unexpected argument: $1"
+                    echo "Usage: sudo ./domain-join.sh <OFFICE_CODE> [--dns-test]"
+                    exit 1
+                fi
                 ;;
         esac
         shift
     done
+
+    if [ -z "$OFFICE_CODE" ]; then
+        print_error "Office code is required"
+        echo "Usage: sudo ./domain-join.sh <OFFICE_CODE> [--dns-test]"
+        echo "  Example: sudo ./domain-join.sh EP1"
+        exit 1
+    fi
+
+    TOOLS_SERVER="dr-$(echo "$OFFICE_CODE" | tr '[:upper:]' '[:lower:]')-tools"
+    print_info "Office: $OFFICE_CODE — tools server: $TOOLS_SERVER"
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -1768,12 +1551,9 @@ main() {
     # before apt, Kerberos, SSSD, or domain configuration is touched.
     # Do not run apt before sync_time(); apt can fail if the clock is wrong.
     install_time_sync_prerequisites
-    prompt_sudo_user
-    prompt_office_code
     configure_dns_servers
     configure_dns_search_domains
-    configure_chrony
-    sync_time
+    bootstrap_time_before_apt || true
 
     if [ "$DNS_TEST_ONLY" = true ]; then
         verify_ad_discovery
@@ -1802,7 +1582,6 @@ main() {
     check_display_manager
 
     if verify_join; then
-        install_kit_installer_shortcut
         echo ""
         print_info "Domain join completed successfully!"
         echo ""
@@ -1810,7 +1589,7 @@ main() {
         echo "    username@$DOMAIN"
         echo ""
         if [ -n "$SUDO_USER" ]; then
-            echo "  Sudo access has been granted to: ${SUDO_USER}@${DOMAIN}"
+            echo "  Sudo access has been granted to: ${SUDO_USER}"
             echo ""
         fi
         if [ "$DISPLAY_MANAGER_RUNNING" = "true" ]; then
