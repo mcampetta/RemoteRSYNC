@@ -55,6 +55,7 @@ DNS_TEST_ONLY=false
 KIT_PROCESS_PATTERN="${KIT_PROCESS_PATTERN:-KIT}"
 OFFICE_CODE=""
 TOOLS_SERVER=""
+STATE_FILE="/etc/domain-join.conf"
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 
@@ -1476,23 +1477,22 @@ parse_args() {
                 DNS_TEST_ONLY=true
                 ;;
             -h|--help)
-                echo "Usage: sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)" [OFFICE_CODE] [--dns-test]"
-                echo "  OFFICE_CODE  Optional office code for your location (e.g. EP1, UK1, DE1)."
-                echo "               If omitted, the script prompts for it interactively."
+                echo "Usage: sudo bash -c \"$(wget -qO- http://ontrack.link/joindomain)\""
+                echo "  If no office code has been saved, you will be prompted for it."
                 echo "  --dns-test   Apply DNS/search settings and test realm discovery only."
                 exit 0
                 ;;
             -*)
                 print_error "Unknown option: $1"
-                echo "Usage: sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)" [OFFICE_CODE] [--dns-test]"
+                echo "Usage: sudo bash -c \"$(wget -qO- http://ontrack.link/joindomain)\""
                 exit 1
                 ;;
             *)
                 if [ -z "$OFFICE_CODE" ]; then
-                    OFFICE_CODE="$(echo "$1" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"
+                    OFFICE_CODE="$1"
                 else
                     print_error "Unexpected argument: $1"
-                    echo "Usage: sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)" [OFFICE_CODE] [--dns-test]"
+                    echo "Usage: sudo bash -c \"$(wget -qO- http://ontrack.link/joindomain)\""
                     exit 1
                 fi
                 ;;
@@ -1500,9 +1500,38 @@ parse_args() {
         shift
     done
 
-    if [ -z "$OFFICE_CODE" ]; then
-        prompt_office_code
+    # If the office was not provided on the command line, reuse the value saved
+    # during the first run. This prevents the post-join rerun from asking again.
+    if [ -z "$OFFICE_CODE" ] && [ -f "$STATE_FILE" ]; then
+        # shellcheck disable=SC1090
+        . "$STATE_FILE"
+        OFFICE_CODE="${OFFICE_CODE:-}"
+        if [ -n "$OFFICE_CODE" ]; then
+            print_info "Using saved office code: $OFFICE_CODE"
+        fi
     fi
+
+    # If no saved value exists, prompt interactively.
+    if [ -z "$OFFICE_CODE" ]; then
+        echo ""
+        echo "  Enter the office code for this workstation."
+        echo "  Example: EP1"
+        echo ""
+        while [ -z "$OFFICE_CODE" ]; do
+            read -r -p "  Office code: " OFFICE_CODE
+            OFFICE_CODE="$(echo "$OFFICE_CODE" | tr '[:lower:]' '[:upper:]' | xargs)"
+        done
+    fi
+
+    # Normalize and persist the selected office code for future reruns.
+    OFFICE_CODE="$(echo "$OFFICE_CODE" | tr '[:lower:]' '[:upper:]' | xargs)"
+    umask 022
+    cat > "$STATE_FILE" << EOF
+# Saved by domain-join.sh
+OFFICE_CODE="$OFFICE_CODE"
+EOF
+    chmod 644 "$STATE_FILE"
+    chown root:root "$STATE_FILE"
 
     TOOLS_SERVER="dr-$(echo "$OFFICE_CODE" | tr '[:upper:]' '[:lower:]')-tools"
     print_info "Office: $OFFICE_CODE — tools server: $TOOLS_SERVER"
