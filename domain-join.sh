@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.1.2"
+SCRIPT_VERSION="1.1.4"
 set -e  # Exit on error
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -1248,6 +1248,30 @@ Categories=Utility;System;
 EOF
     chmod 644 /usr/share/applications/mount-kit-tools.desktop
 
+    # Unity 7 on Ubuntu 16.04 does not always surface application launchers
+    # clearly. Install a real desktop icon for newly-created domain homes via
+    # /etc/skel, and also copy it into existing user Desktop folders.
+    mkdir -p /etc/skel/Desktop
+    cp /usr/share/applications/mount-kit-tools.desktop "/etc/skel/Desktop/Mount DR Tools.desktop"
+    chmod 755 "/etc/skel/Desktop/Mount DR Tools.desktop"
+    chown root:root "/etc/skel/Desktop/Mount DR Tools.desktop"
+
+    # Add the desktop icon to existing human/domain user homes when present.
+    # This is safe to rerun and skips system homes that do not have Desktop dirs.
+    while IFS=: read -r user _ uid gid _ home _; do
+        [ -z "$home" ] && continue
+        [ "$home" = "/" ] && continue
+        [ "$uid" -lt 1000 ] 2>/dev/null && continue
+
+        desktop_dir="$home/Desktop"
+        if [ -d "$home" ]; then
+            mkdir -p "$desktop_dir"
+            cp /usr/share/applications/mount-kit-tools.desktop "$desktop_dir/Mount DR Tools.desktop"
+            chmod 755 "$desktop_dir/Mount DR Tools.desktop"
+            chown "$uid:$gid" "$desktop_dir" "$desktop_dir/Mount DR Tools.desktop" 2>/dev/null || true
+        fi
+    done < <(getent passwd)
+
     # XDG autostart entry: runs once per graphical login and prompts via pkexec
     # if elevation is required. mount-kit-tools is idempotent, so repeated runs
     # are safe once /mnt/x is already mounted.
@@ -1324,6 +1348,20 @@ EOF
     print_info "DRIP autofs configured — /smb/<server>/<share>/ and /net/<server>/<share>/"
     print_info "KIT tools mount helper configured — run: sudo mount-kit-tools"
     print_info "KIT tools path after helper runs: /mnt/x (${TOOLS_SERVER}/Tools)"
+
+    # If this post-join run is being executed from a logged-in domain user via
+    # sudo, immediately mount the KIT tools share so KIT installation can proceed.
+    # If this run is still under a local admin account without a domain Kerberos
+    # ticket, do not fail the whole script; leave the helper/desktop shortcut in place.
+    if [ -x /usr/local/bin/mount-kit-tools ]; then
+        print_info "Attempting to mount KIT tools share at /mnt/x..."
+        if /usr/local/bin/mount-kit-tools; then
+            print_info "KIT tools share mounted at /mnt/x"
+        else
+            print_warning "KIT tools share was not mounted automatically"
+            print_warning "Log in as a domain user and run: sudo mount-kit-tools"
+        fi
+    fi
 }
 
 # ── Configure DNS search domains ──────────────────────────────────────────────
