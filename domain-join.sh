@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.2"
 set -e  # Exit on error
 
 # ── Constants ────────────────────────────────────────────────────────────────
