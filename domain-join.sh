@@ -331,6 +331,7 @@ install_domain_packages() {
     install_package "samba-common-bin"
     install_package "packagekit"
     install_package "cifs-utils"
+    install_package "smbclient"
     install_package "winbind"
     install_package "chrony"
 
@@ -1090,6 +1091,25 @@ enable_sssd() {
     print_info "SSSD is running"
 }
 
+
+# ── Filesystem path helper ───────────────────────────────────────────────────
+
+ensure_directory_path() {
+    local path="$1"
+
+    # Avoid calling mkdir on an existing autofs trigger/mountpoint. Some
+    # systems report an error when mkdir touches an already-mounted direct map.
+    if [ -e "$path" ]; then
+        if [ -d "$path" ]; then
+            return 0
+        fi
+        print_error "$path exists but is not a directory"
+        return 1
+    fi
+
+    mkdir -p "$path"
+}
+
 # ── Configure autofs for DRIP image share access ─────────────────────────────
 # DRIP image fragment files are stored on Windows file servers. The DRIP REST
 # API returns file paths with /smb/<server>/<share>/... as the mount prefix
@@ -1116,27 +1136,29 @@ enable_sssd() {
 # on modern systems regardless).
 
 configure_autofs_cifs() {
-    print_info "Configuring autofs for DRIP image share access..."
+    print_info "Configuring CIFS access for DRIP and KIT tools..."
 
-    # Indirect maps: /smb (DRIP imaging paths) and /net (general browsing).
-    # Both reuse the same executable per-server map script.
-    mkdir -p /smb /net
+    # DRIP image paths still use dynamic autofs maps:
+    #   /smb/<server>/<share>/...
+    #   /net/<server>/<share>/...
+    #
+    # The fixed KIT tools path is handled by /usr/local/bin/mount-kit-tools
+    # instead of autofs because direct/indirect autofs maps for /mnt/x proved
+    # unreliable on tested Ubuntu builds, while an explicit Kerberos CIFS mount
+    # was reliable.
+    ensure_dir "/smb"
+    ensure_dir "/net"
+    ensure_dir "/mnt"
+    ensure_dir "/mnt/x"
+
+    # Remove old /mnt/x autofs configuration from earlier script versions.
+    rm -f /etc/auto.master.d/mnt.autofs /etc/auto.mnt.direct /etc/auto.mnt
+
     cat > /etc/auto.master.d/smb.autofs << 'EOF'
 /smb    /etc/auto.net.cifs    --timeout=300 --ghost
 EOF
     cat > /etc/auto.master.d/net.autofs << 'EOF'
 /net    /etc/auto.net.cifs    --timeout=300 --ghost
-EOF
-
-    # Direct map: /mnt/x → //<TOOLS_SERVER>/Tools (KIT launcher and dependencies).
-    # $TOOLS_SERVER is expanded by bash here; ${UID} is kept literal for autofs
-    # to substitute with the accessing user's UID at mount time.
-    mkdir -p /mnt/x
-    cat > /etc/auto.master.d/mnt.autofs << 'EOF'
-/-    /etc/auto.mnt.direct    --timeout=300
-EOF
-    cat > /etc/auto.mnt.direct << EOF
-/mnt/x    -fstype=cifs,sec=krb5,cruid=\${UID},vers=3.0    ://${TOOLS_SERVER}/Tools
 EOF
 
     # Executable map: called by autofs with the server hostname as $1.
@@ -1159,6 +1181,113 @@ EOF
 
     chmod +x /etc/auto.net.cifs
 
+    # Fixed KIT tools mount helper. This preserves the expected path:
+    #   /mnt/x -> //TOOLS_SERVER/Tools
+    # but avoids depending on autofs for the fixed mount point.
+    cat > /usr/local/bin/mount-kit-tools << EOF
+#!/bin/bash
+set -e
+
+TOOLS_SERVER="${TOOLS_SERVER}"
+MOUNT_POINT="/mnt/x"
+SHARE="//\${TOOLS_SERVER}/Tools"
+
+# Determine the logged-in domain user whose Kerberos ticket should be used.
+# sudo sets SUDO_UID; pkexec sets PKEXEC_UID. Fall back to the current UID for
+# direct execution.
+if [ -n "\${SUDO_UID:-}" ]; then
+    CRUID="\$SUDO_UID"
+elif [ -n "\${PKEXEC_UID:-}" ]; then
+    CRUID="\$PKEXEC_UID"
+else
+    CRUID="\$(id -u)"
+fi
+
+mkdir -p "\$MOUNT_POINT"
+
+if mountpoint -q "\$MOUNT_POINT"; then
+    exit 0
+fi
+
+if ! command -v klist >/dev/null 2>&1; then
+    echo "klist not found. Kerberos tools are not installed." >&2
+    exit 1
+fi
+
+if ! KRB5CCNAME="FILE:/tmp/krb5cc_\$CRUID" klist -s 2>/dev/null && ! klist -s 2>/dev/null; then
+    echo "No valid Kerberos ticket found for UID \$CRUID. Log in as a domain user or run kinit first." >&2
+    exit 1
+fi
+
+mount -t cifs "\$SHARE" "\$MOUNT_POINT" -o sec=krb5,cruid=\$CRUID,vers=3.0
+EOF
+    chmod +x /usr/local/bin/mount-kit-tools
+
+    cat > /usr/local/bin/umount-kit-tools << 'EOF'
+#!/bin/bash
+set -e
+if mountpoint -q /mnt/x; then
+    umount /mnt/x
+fi
+EOF
+    chmod +x /usr/local/bin/umount-kit-tools
+
+    # Graphical launcher for all users.
+    mkdir -p /usr/share/applications /etc/xdg/autostart /usr/share/polkit-1/actions
+
+    cat > /usr/share/applications/mount-kit-tools.desktop << 'EOF'
+[Desktop Entry]
+Name=Mount DR Tools
+Comment=Mount the DR Tools share at /mnt/x
+Exec=pkexec /usr/local/bin/mount-kit-tools
+Icon=drive-network
+Terminal=false
+Type=Application
+Categories=Utility;System;
+EOF
+    chmod 644 /usr/share/applications/mount-kit-tools.desktop
+
+    # XDG autostart entry: runs once per graphical login and prompts via pkexec
+    # if elevation is required. mount-kit-tools is idempotent, so repeated runs
+    # are safe once /mnt/x is already mounted.
+    cat > /etc/xdg/autostart/mount-kit-tools.desktop << 'EOF'
+[Desktop Entry]
+Name=Mount DR Tools
+Comment=Mount the DR Tools share at /mnt/x
+Exec=pkexec /usr/local/bin/mount-kit-tools
+Icon=drive-network
+Terminal=false
+Type=Application
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+EOF
+    chmod 644 /etc/xdg/autostart/mount-kit-tools.desktop
+
+    # PolicyKit policy so the graphical prompt clearly identifies this action.
+    # Users must still authenticate; this does not grant passwordless root.
+    cat > /usr/share/polkit-1/actions/com.ontrack.mount-kit-tools.policy << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Ontrack</vendor>
+  <vendor_url>http://ontrack.link</vendor_url>
+  <action id="com.ontrack.mount-kit-tools">
+    <description>Mount DR Tools share</description>
+    <message>Authentication is required to mount the DR Tools share.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/mount-kit-tools</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>
+EOF
+    chmod 644 /usr/share/polkit-1/actions/com.ontrack.mount-kit-tools.policy
+
     # Ensure the credential cache is at a predictable path for systems that
     # do not populate the kernel keyring (no-op on modern SSSD/kernel combos).
     local sssd_conf="/etc/sssd/sssd.conf"
@@ -1173,8 +1302,7 @@ EOF
 
     # Ensure 'files' is first in the automount nsswitch lookup order.
     # realm join often sets "automount: sss", which causes autofs to query LDAP
-    # for the master map and ignore /etc/auto.master.d/ entirely — silently
-    # breaking the configuration above.
+    # for the master map and ignore /etc/auto.master.d/ entirely.
     local nsswitch="/etc/nsswitch.conf"
     local automount_line
     automount_line=$(grep '^automount:' "$nsswitch" 2>/dev/null || true)
@@ -1188,10 +1316,13 @@ EOF
         print_info "automount lookup order already correct in $nsswitch"
     fi
 
+    systemctl daemon-reload
     systemctl enable autofs > /dev/null 2>&1
     systemctl restart autofs
 
-    print_info "autofs configured — /smb/<server>/<share>/, /net/<server>/<share>/, /mnt/x (${TOOLS_SERVER}/Tools)"
+    print_info "DRIP autofs configured — /smb/<server>/<share>/ and /net/<server>/<share>/"
+    print_info "KIT tools mount helper configured — run: sudo mount-kit-tools"
+    print_info "KIT tools path after helper runs: /mnt/x (${TOOLS_SERVER}/Tools)"
 }
 
 # ── Configure DNS search domains ──────────────────────────────────────────────
@@ -1631,6 +1762,10 @@ main() {
         echo ""
         echo "  Log in as a domain user with:"
         echo "    username@$DOMAIN"
+        echo ""
+        echo "  KIT tools can be mounted at /mnt/x using the desktop shortcut:"
+        echo "    Mount DR Tools"
+        echo "  The same mount helper also runs automatically at graphical login."
         echo ""
         if [ -n "$SUDO_USER" ]; then
             echo "  Sudo access has been granted to: ${SUDO_USER}"
