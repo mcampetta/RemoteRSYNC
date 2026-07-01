@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.5.1"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -450,7 +450,7 @@ save_state() {
     chmod 755 "$STATE_DIR"
 
     cat > "$STATE_FILE" << EOF
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.5.1"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STAGE="${1:-UNKNOWN}"
@@ -944,9 +944,10 @@ print_machine_status() {
 
 prompt_sudo_user() {
     echo ""
-    echo "  Optionally grant sudo access to a domain user on this machine."
+    echo "  Enter the domain user who will use this workstation."
+    echo "  This user will receive the limited Mount DR Tools permission."
     echo "  Enter the short account name only (e.g. jsmith — not jsmith@$DOMAIN)."
-    echo "  Leave blank to skip — sudo access can be added manually later."
+    echo "  Leave blank only if no domain user is available yet."
     echo ""
     read -r -p "  Domain username for sudo access (or press Enter to skip): " DOMAIN_SUDO_USER
 
@@ -1927,6 +1928,11 @@ SHARE="//\${TOOLS_SERVER}/Tools"
 # requiring the user to type sudo while still keeping root limited to this one
 # helper.
 if [ "\$(id -u)" -ne 0 ]; then
+    if ! sudo -n -l /usr/local/bin/mount-kit-tools >/dev/null 2>&1; then
+        echo "This user does not have passwordless permission to run /usr/local/bin/mount-kit-tools." >&2
+        echo "Rerun the domain-join script post-join and enter this domain username when prompted." >&2
+        exit 1
+    fi
     exec sudo -n /usr/local/bin/mount-kit-tools
 fi
 
@@ -1967,15 +1973,73 @@ EOF
     # users mount /mnt/x without opening a terminal or typing sudo.
     cat > /usr/local/bin/mount-kit-tools-desktop << 'EOF'
 #!/bin/bash
-set -e
+
+RUNNER="/usr/local/bin/mount-kit-tools-desktop-runner"
+
+if command -v x-terminal-emulator >/dev/null 2>&1; then
+    exec x-terminal-emulator -e "$RUNNER"
+fi
+
+if command -v gnome-terminal >/dev/null 2>&1; then
+    exec gnome-terminal -- "$RUNNER"
+fi
+
+if command -v mate-terminal >/dev/null 2>&1; then
+    exec mate-terminal -e "$RUNNER"
+fi
+
+if command -v xfce4-terminal >/dev/null 2>&1; then
+    exec xfce4-terminal -e "$RUNNER"
+fi
+
+exec "$RUNNER"
+EOF
+    chmod +x /usr/local/bin/mount-kit-tools-desktop
+
+    cat > /usr/local/bin/mount-kit-tools-desktop-runner << 'EOF'
+#!/bin/bash
+
+echo "Mount DR Tools"
+echo "=============="
+echo ""
 
 if mountpoint -q /mnt/x; then
+    echo "/mnt/x is already mounted."
+    echo ""
+    read -r -p "Press Enter to close..."
     exit 0
 fi
 
-exec /usr/local/bin/mount-kit-tools
+/usr/local/bin/mount-kit-tools
+status=$?
+
+echo ""
+if [ "$status" -eq 0 ]; then
+    echo "DR Tools mounted successfully at /mnt/x"
+    echo ""
+    ls -la /mnt/x 2>/dev/null || true
+else
+    echo "Mount failed with exit code $status"
+    echo ""
+    echo "Diagnostics:"
+    echo "  Current user: $(id -un)"
+    echo "  UID: $(id -u)"
+    echo ""
+    echo "  sudo permission check:"
+    sudo -n -l /usr/local/bin/mount-kit-tools 2>&1 || true
+    echo ""
+    echo "  Kerberos ticket:"
+    klist 2>&1 || true
+    echo ""
+    echo "Try from terminal:"
+    echo "  mount-kit-tools"
+fi
+
+echo ""
+read -r -p "Press Enter to close..."
+exit "$status"
 EOF
-    chmod +x /usr/local/bin/mount-kit-tools-desktop
+    chmod +x /usr/local/bin/mount-kit-tools-desktop-runner
 
     # Allow permitted domain users to run only the mount helper without a password.
     # This does NOT grant broad passwordless sudo. It only permits:
@@ -1994,6 +2058,16 @@ EOF
         chown root:root "$mount_sudoers_file"
         if visudo -cf "$mount_sudoers_file" >/dev/null 2>&1; then
             print_info "Configured passwordless mount permission for $mount_user"
+            if getent passwd "$mount_user" >/dev/null 2>&1; then
+                if su - "$mount_user" -c 'sudo -n -l /usr/local/bin/mount-kit-tools >/dev/null 2>&1'; then
+                    print_info "Validated mount helper sudo permission for $mount_user"
+                else
+                    print_warning "Could not validate passwordless mount helper permission for $mount_user"
+                    print_warning "Desktop shortcut may fail until sudoers/SSSD identity is corrected"
+                fi
+            else
+                print_warning "Domain user $mount_user is not resolvable yet; skipping mount helper permission validation"
+            fi
         else
             print_warning "Mount helper sudoers validation failed; removing $mount_sudoers_file"
             rm -f "$mount_sudoers_file"
