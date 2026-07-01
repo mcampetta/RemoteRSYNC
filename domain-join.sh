@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.5.7"
+SCRIPT_VERSION="1.5.8"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -990,14 +990,56 @@ suggest_hostname() {
     echo "\${prefix}-\${number}"
 }
 
+domain_to_base_dn() {
+    echo "\$DOMAIN" | awk -F. '{
+        for (i = 1; i <= NF; i++) {
+            if (i > 1) printf ",";
+            printf "DC=%s", \$i;
+        }
+        printf "\n";
+    }'
+}
+
 ad_computer_exists() {
     local candidate="\$1"
+    local sam
+    local base_dn
+    local output
+    local rc
 
-    # Authoritative check: AD computer object presence.
-    if adcli show-computer "\$candidate" -D "\$DOMAIN" >/dev/null 2>&1; then
+    sam="\$(echo "\$candidate" | tr '[:lower:]' '[:upper:]')\$"
+    base_dn="\$(domain_to_base_dn)"
+
+    # Authoritative check: search AD for the computer object's sAMAccountName.
+    # DNS is intentionally not used for allocation because stale/missing DNS
+    # records do not reliably represent AD computer-object state.
+    set +e
+    output="\$(ldapsearch -LLL -Y GSSAPI -H "ldap://\$DOMAIN" -b "\$base_dn" "(&(objectClass=computer)(sAMAccountName=\$sam))" dn 2>&1)"
+    rc=\$?
+    set -e
+
+    if [ "\$rc" -ne 0 ]; then
+        print_error "LDAP computer-object query failed while checking \$candidate."
+        echo "\$output" >&2
+        print_error "Refusing to allocate a hostname when AD cannot be queried authoritatively."
+        exit 1
+    fi
+
+    if echo "\$output" | grep -qi '^dn:'; then
+        echo "    AD: computer object exists for \$candidate" >&2
+        echo "\$output" | sed 's/^/      /' >&2
         return 0
     fi
 
+    # Secondary AD check using adcli. This is not the primary authority because
+    # some adcli show-computer failures are ambiguous, but a positive result
+    # still proves the object exists.
+    if adcli show-computer "\$candidate" -D "\$DOMAIN" >/dev/null 2>&1; then
+        echo "    AD: adcli also found computer object for \$candidate" >&2
+        return 0
+    fi
+
+    echo "    AD: no computer object found for \$candidate" >&2
     return 1
 }
 
@@ -1078,7 +1120,7 @@ if [ "\$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-for required in realm adcli kinit hostnamectl; do
+for required in realm adcli kinit hostnamectl ldapsearch; do
     if ! command -v "\$required" >/dev/null 2>&1; then
         print_error "Required command not found: \$required"
         print_error "Have the technician rerun the provisioning script to complete package installation."
@@ -1470,6 +1512,7 @@ install_domain_packages() {
     install_package "krb5-user"   # provides klist for keytab and ticket diagnostics
 
     install_package "dnsutils"    # provides host/nslookup for DNS diagnostics
+    install_package "ldap-utils"  # provides ldapsearch for authoritative AD computer-object checks
     install_package "autofs"      # on-demand CIFS mount daemon for DRIP image share access
     install_package "openssh-server"
     install_package "unattended-upgrades"
