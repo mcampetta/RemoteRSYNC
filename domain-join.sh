@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 set -e  # Exit on error
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -269,11 +269,75 @@ is_valid_ad_hostname() {
     return 0
 }
 
+office_hostname_prefix() {
+    case "$(echo "${OFFICE_CODE:-}" | tr '[:lower:]' '[:upper:]')" in
+        EP|EP1)
+            echo "ep-cr-kit"
+            ;;
+        MSP)
+            echo "msp-cr-kit"
+            ;;
+        CHI)
+            echo "chi-cr-kit"
+            ;;
+        ATL)
+            echo "atl-cr-kit"
+            ;;
+        LON|UK|UK1)
+            echo "lon-cr-kit"
+            ;;
+        DE|DE1)
+            echo "de-cr-kit"
+            ;;
+        *)
+            local office_lower
+            office_lower="$(echo "${OFFICE_CODE:-kit}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
+            [ -n "$office_lower" ] || office_lower="kit"
+            echo "${office_lower}-cr-kit" | cut -c1-12 | sed 's/-$//'
+            ;;
+    esac
+}
+
 suggest_hostname() {
-    local office_lower
-    office_lower="$(echo "${OFFICE_CODE:-kit}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
-    [ -n "$office_lower" ] || office_lower="kit"
-    echo "${office_lower}-kit-test01" | cut -c1-15 | sed 's/-$//'
+    local prefix="$1"
+    local number="$2"
+
+    number="$(echo "$number" | tr -cd '0-9')"
+    [ -n "$number" ] || number="01"
+
+    # Normalize to two digits when possible.
+    if [ "${#number}" -eq 1 ]; then
+        number="0${number}"
+    fi
+
+    echo "${prefix}-${number}"
+}
+
+prompt_for_ad_hostname() {
+    local prefix
+    prefix="$(office_hostname_prefix)"
+
+    echo "  Hostname prefix: $prefix"
+    echo ""
+    echo "  Enter the workstation number for this machine."
+    echo "  Example: 7 becomes ${prefix}-07"
+    echo ""
+
+    local number
+    local proposed
+
+    while true; do
+        read -r -p "  Workstation number: " number
+        proposed="$(suggest_hostname "$prefix" "$number")"
+
+        if is_valid_ad_hostname "$proposed"; then
+            echo "$proposed"
+            return 0
+        fi
+
+        print_warning "Generated hostname '$proposed' is not AD-safe."
+        print_warning "Use a shorter office code/prefix or a smaller workstation number."
+    done
 }
 
 validate_or_fix_hostname() {
@@ -292,17 +356,21 @@ validate_or_fix_hostname() {
     echo ""
 
     local suggested
-    suggested="$(suggest_hostname)"
+    suggested="$(suggest_hostname "$(office_hostname_prefix)" "01")"
 
-    echo "  Suggested hostname: $suggested"
+    echo "  Suggested format: $(office_hostname_prefix)-NN"
+    echo "  Example hostname: $suggested"
     echo ""
-    read -r -p "  Rename this machine to '$suggested' now? [Y/n]: " answer
+
+    read -r -p "  Rename this machine now using the office naming convention? [Y/n]: " answer
     answer="${answer:-Y}"
 
     case "$answer" in
         y|Y|yes|YES)
-            print_info "Setting hostname to $suggested"
-            hostnamectl set-hostname "$suggested"
+            local new_hostname
+            new_hostname="$(prompt_for_ad_hostname)"
+            print_info "Setting hostname to $new_hostname"
+            hostnamectl set-hostname "$new_hostname"
             print_warning "A reboot is recommended before the domain admin performs the join."
             return 0
             ;;
