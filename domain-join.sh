@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.5.3"
+SCRIPT_VERSION="1.5.5"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -64,7 +64,7 @@ DNS_TEST_ONLY=false
 KIT_PROCESS_PATTERN="${KIT_PROCESS_PATTERN:-KIT}"
 OFFICE_CODE=""
 TOOLS_SERVER=""
-STATE_FILE="/etc/domain-join.conf"
+CONFIG_FILE="/etc/domain-join.conf"
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 
@@ -450,7 +450,7 @@ save_state() {
     chmod 755 "$STATE_DIR"
 
     cat > "$STATE_FILE" << EOF
-SCRIPT_VERSION="1.5.3"
+SCRIPT_VERSION="$SCRIPT_VERSION"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STAGE="${1:-UNKNOWN}"
@@ -664,15 +664,15 @@ prompt_for_ad_hostname() {
     local suggested
     suggested="$(suggest_hostname "$prefix" "01")"
 
-    echo "  Suggested starting hostname:"
+    echo "  Temporary starting hostname:"
     echo "    $suggested"
     echo ""
-    echo "  You may accept this as a temporary local hostname, or enter a different"
-    echo "  workstation number/hostname. The domain admin helper will validate AD"
-    echo "  and may adjust the hostname before joining."
+    echo "  This is only a local starting hostname for the technician phase."
+    echo "  It is not an availability claim. The domain admin helper will query"
+    echo "  Active Directory and allocate the final hostname before joining."
     echo ""
 
-    read -r -p "  Use this starting hostname? [Y/n]: " use_suggested
+    read -r -p "  Apply this temporary starting hostname? [Y/n]: " use_suggested
     use_suggested="${use_suggested:-Y}"
 
     case "$use_suggested" in
@@ -709,10 +709,11 @@ prompt_for_ad_hostname() {
 
         echo ""
         echo "------------------------------------------"
-        echo "  Proposed starting hostname: $proposed"
+        echo "  Proposed temporary starting hostname: $proposed"
         echo "------------------------------------------"
-        echo "  AD collision checking will be performed by the domain-admin helper."
-        read -r -p "  Use this starting hostname? [Y/n]: " confirm
+        echo "  This is not an availability claim. Final hostname allocation will"
+        echo "  be performed by the domain-admin helper using Active Directory."
+        read -r -p "  Apply this temporary starting hostname? [Y/n]: " confirm
         confirm="${confirm:-Y}"
 
         case "$confirm" in
@@ -849,6 +850,7 @@ validate_existing_join() {
 install_domain_admin_join_helper() {
     local helper="/usr/local/sbin/dr-domain-admin-join"
     local motd="/etc/update-motd.d/99-dr-domain-join"
+    local profiled="/etc/profile.d/dr-domain-join.sh"
 
     mkdir -p /usr/local/sbin
 
@@ -860,10 +862,26 @@ DOMAIN="$DOMAIN"
 REALM="$REALM"
 OFFICE_CODE="${OFFICE_CODE:-EP1}"
 SCRIPT_VERSION="$SCRIPT_VERSION"
+STATE_DIR="$STATE_DIR"
+STATE_FILE="$STATE_FILE"
 
 print_info() { echo "[INFO] \$*"; }
 print_warn() { echo "[WARN] \$*" >&2; }
 print_error() { echo "[ERROR] \$*" >&2; }
+
+save_join_state() {
+    mkdir -p "\$STATE_DIR"
+    chmod 755 "\$STATE_DIR"
+    cat > "\$STATE_FILE" << STATEEOF
+SCRIPT_VERSION="\$SCRIPT_VERSION"
+STAGE="\${1:-DOMAIN_JOIN_COMPLETE}"
+OFFICE_CODE="\$OFFICE_CODE"
+DOMAIN="\$DOMAIN"
+TARGET_HOSTNAME="\${2:-}"
+HOSTNAME_CHANGED="1"
+STATEEOF
+    chmod 600 "\$STATE_FILE"
+}
 
 office_hostname_prefix() {
     case "\$(echo "\${OFFICE_CODE:-}" | tr '[:lower:]' '[:upper:]')" in
@@ -902,23 +920,25 @@ suggest_hostname() {
 
 ad_computer_exists() {
     local candidate="\$1"
-    local admin_user="\$2"
 
-    # Authoritative AD check. This may prompt for the admin password.
-    if adcli show-computer "\$candidate" -D "\$DOMAIN" -U "\$admin_user" >/dev/null 2>&1; then
-        return 0
-    fi
-
-    # DNS is secondary only; AD object presence is the real source of truth.
-    if getent hosts "\${candidate}.\${DOMAIN}" >/dev/null 2>&1 || getent hosts "\$candidate" >/dev/null 2>&1; then
+    # Authoritative check: AD computer object presence.
+    if adcli show-computer "\$candidate" -D "\$DOMAIN" >/dev/null 2>&1; then
         return 0
     fi
 
     return 1
 }
 
+show_dns_diagnostic() {
+    local candidate="\$1"
+    if getent hosts "\${candidate}.\${DOMAIN}" >/dev/null 2>&1 || getent hosts "\$candidate" >/dev/null 2>&1; then
+        echo "    DNS: record exists for \$candidate (diagnostic only; AD remains authoritative)" >&2
+    else
+        echo "    DNS: no record found for \$candidate (diagnostic only)" >&2
+    fi
+}
+
 find_next_available_ad_hostname() {
-    local admin_user="\$1"
     local prefix
     local n
     local candidate
@@ -928,8 +948,9 @@ find_next_available_ad_hostname() {
     for n in \$(seq 1 99); do
         candidate="\$(suggest_hostname "\$prefix" "\$n")"
         is_valid_ad_hostname "\$candidate" || continue
-        echo "  checking \$candidate..." >&2
-        if ! ad_computer_exists "\$candidate" "\$admin_user"; then
+        echo "  checking AD computer object: \$candidate" >&2
+        show_dns_diagnostic "\$candidate"
+        if ! ad_computer_exists "\$candidate"; then
             echo "\$candidate"
             return 0
         fi
@@ -941,17 +962,18 @@ find_next_available_ad_hostname() {
 update_hosts_for_hostname_admin() {
     local new_hostname="\$1"
     local hosts_file="/etc/hosts"
+    local fqdn="\${new_hostname}.\${DOMAIN}"
     local tmp_file
 
     touch "\$hosts_file"
     cp "\$hosts_file" "\${hosts_file}.dr-domain-admin-join.bak.\$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
 
     tmp_file="\$(mktemp)"
-    awk -v hn="\$new_hostname" '
+    awk -v hn="\$new_hostname" -v fqdn="\$fqdn" '
         BEGIN { replaced=0 }
         /^127[.]0[.]1[.]1[[:space:]]+/ {
             if (!replaced) {
-                print "127.0.1.1    " hn
+                print "127.0.1.1    " fqdn "    " hn
                 replaced=1
             }
             next
@@ -959,7 +981,7 @@ update_hosts_for_hostname_admin() {
         { print }
         END {
             if (!replaced) {
-                print "127.0.1.1    " hn
+                print "127.0.1.1    " fqdn "    " hn
             }
         }
     ' "\$hosts_file" > "\$tmp_file"
@@ -968,11 +990,15 @@ update_hosts_for_hostname_admin() {
     rm -f "\$tmp_file"
 }
 
-echo "=========================================="
-echo "  DR Domain Admin Join Helper"
-echo "  Version \$SCRIPT_VERSION"
-echo "=========================================="
-echo ""
+print_banner() {
+    echo "=========================================="
+    echo "  DR Domain Admin Join Helper"
+    echo "  Version \$SCRIPT_VERSION"
+    echo "=========================================="
+    echo ""
+}
+
+print_banner
 
 if [ "\$(id -u)" -ne 0 ]; then
     print_error "Run this helper with sudo:"
@@ -980,10 +1006,19 @@ if [ "\$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+for required in realm adcli kinit hostnamectl; do
+    if ! command -v "\$required" >/dev/null 2>&1; then
+        print_error "Required command not found: \$required"
+        print_error "Have the technician rerun the provisioning script to complete package installation."
+        exit 1
+    fi
+done
+
 current_host="\$(hostnamectl --static 2>/dev/null || hostname)"
 echo "Current hostname: \$current_host"
 echo "Domain:           \$DOMAIN"
 echo "Office code:      \$OFFICE_CODE"
+echo "Hostname policy:  \$(office_hostname_prefix)-##"
 echo ""
 
 if realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
@@ -993,6 +1028,7 @@ if realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
     print_info "Validating existing machine account..."
     if adcli testjoin -D "\$DOMAIN"; then
         print_info "Join is OK."
+        save_join_state "DOMAIN_JOIN_COMPLETE" "\$current_host"
         exit 0
     fi
     echo ""
@@ -1010,7 +1046,7 @@ if realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
     esac
 fi
 
-echo "Enter the domain admin username that has permission to join machines."
+echo "Enter the domain admin username that has permission to query and join AD computer objects."
 read -r -p "Domain admin username: " admin_user
 
 if [ -z "\$admin_user" ]; then
@@ -1018,12 +1054,26 @@ if [ -z "\$admin_user" ]; then
     exit 1
 fi
 
+case "\$admin_user" in
+    *@*) kerberos_principal="\$admin_user" ;;
+    *) kerberos_principal="\${admin_user}@\${REALM}" ;;
+esac
+
 echo ""
-print_info "Querying Active Directory for the next available managed hostname..."
+print_info "Authenticating to Active Directory as \$kerberos_principal for authoritative hostname allocation..."
+print_info "You may be prompted for the domain admin password."
+kdestroy >/dev/null 2>&1 || true
+if ! kinit "\$kerberos_principal"; then
+    print_error "Kerberos authentication failed. Cannot query AD authoritatively."
+    exit 1
+fi
+
+echo ""
+print_info "Querying Active Directory for the first unused managed hostname..."
 next_host=""
 
-if next_host="\$(find_next_available_ad_hostname "\$admin_user")"; then
-    print_info "Next available AD hostname appears to be: \$next_host"
+if next_host="\$(find_next_available_ad_hostname)"; then
+    print_info "Allocated hostname from AD: \$next_host"
 else
     print_error "No available managed hostname found from 01 through 99."
     exit 1
@@ -1032,7 +1082,7 @@ fi
 if [ "\$current_host" != "\$next_host" ]; then
     echo ""
     print_warn "Current hostname:      \$current_host"
-    print_warn "AD-available hostname: \$next_host"
+    print_warn "AD-allocated hostname: \$next_host"
     read -r -p "Rename this machine to \$next_host before joining? [Y/n]: " rename_answer
     rename_answer="\${rename_answer:-Y}"
     case "\$rename_answer" in
@@ -1047,19 +1097,28 @@ if [ "\$current_host" != "\$next_host" ]; then
             exit 1
             ;;
     esac
+else
+    update_hosts_for_hostname_admin "\$next_host"
+    print_info "Hostname already matches AD allocation. /etc/hosts refreshed."
 fi
 
 echo ""
 print_info "Joining \$current_host to \$DOMAIN..."
-realm join -v "\$DOMAIN" -U "\$admin_user"
+print_info "You may be prompted for the domain admin password again by realmd."
+if ! realm join -v "\$DOMAIN" -U "\$admin_user"; then
+    print_error "realm join failed."
+    exit 1
+fi
 
 echo ""
 print_info "Validating machine account with adcli testjoin..."
 if adcli testjoin -D "\$DOMAIN"; then
     print_info "Join is OK."
+    save_join_state "DOMAIN_JOIN_COMPLETE" "\$current_host"
 else
     print_error "Domain join command completed, but machine-account validation failed."
     print_error "Do not continue with workstation post-join steps until this is resolved."
+    save_join_state "DOMAIN_JOIN_FAILED" "\$current_host"
     exit 1
 fi
 
@@ -1096,8 +1155,7 @@ if [ -x /usr/local/sbin/dr-domain-admin-join ]; then
     echo "=========================================="
     echo "  DR Domain Join Pending"
     echo "=========================================="
-    echo "  Run:"
-    echo "    sudo /usr/local/sbin/dr-domain-admin-join"
+    echo "  Run: sudo /usr/local/sbin/dr-domain-admin-join"
     echo "=========================================="
     echo ""
 fi
@@ -1105,8 +1163,34 @@ EOF
     chmod 755 "$motd"
     chown root:root "$motd"
 
+    cat > "$profiled" << 'EOF'
+#!/bin/sh
+case "$-" in
+    *i*) ;;
+    *) return 0 2>/dev/null || exit 0 ;;
+esac
+
+if [ -x /usr/local/sbin/dr-domain-admin-join ]; then
+    if command -v realm >/dev/null 2>&1 && realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+        if command -v adcli >/dev/null 2>&1 && adcli testjoin -D dr.kodr.local >/dev/null 2>&1; then
+            return 0 2>/dev/null || exit 0
+        fi
+    fi
+    echo ""
+    echo "DR Domain Join Pending: sudo /usr/local/sbin/dr-domain-admin-join"
+    echo ""
+fi
+EOF
+    chmod 644 "$profiled"
+    chown root:root "$profiled"
+
+    cat > /etc/motd << 'EOF'
+DR Domain Join Pending
+Run: sudo /usr/local/sbin/dr-domain-admin-join
+EOF
+
     print_info "Installed domain admin join helper: $helper"
-    print_info "Installed SSH login reminder: $motd"
+    print_info "Installed SSH login reminders: $motd, $profiled, /etc/motd"
 }
 
 print_domain_admin_join_instructions() {
@@ -1909,13 +1993,15 @@ join_domain() {
     echo ""
     echo "  This machine is not yet joined to the domain."
     print_ssh_handoff
-    echo "  A domain admin must SSH into this machine and run:"
+    install_domain_admin_join_helper
+    save_state "WAITING_FOR_ADMIN"
+    echo "  A domain admin must SSH into this machine and run exactly one command:"
     echo ""
-    echo "    sudo realm join $DOMAIN -U <admin_username>"
+    echo "    sudo /usr/local/sbin/dr-domain-admin-join"
     echo ""
-    echo "  Note: realmd uses -U for the admin username option."
+    echo "  The helper will allocate the final hostname from Active Directory, rename the workstation, join the domain, and validate with adcli testjoin."
     echo ""
-    echo "  Once joined, re-run this script to complete configuration:"
+    echo "  Once the helper reports 'Join is OK', re-run this script to complete configuration:"
     echo ""
     echo '    sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)"'
     echo ""
@@ -2790,15 +2876,14 @@ parse_args() {
         done
     fi
 
-    # Normalize and persist the selected office code for future reruns.
+    # Normalize and persist the selected office code for future reruns without
+    # clobbering the installer state machine.
     OFFICE_CODE="$(echo "$OFFICE_CODE" | tr '[:lower:]' '[:upper:]' | xargs)"
-    umask 022
-    cat > "$STATE_FILE" << EOF
-# Saved by domain-join.sh
-OFFICE_CODE="$OFFICE_CODE"
-EOF
-    chmod 644 "$STATE_FILE"
-    chown root:root "$STATE_FILE"
+    if [ ! -f "$STATE_FILE" ]; then
+        save_state "OFFICE_CODE_SELECTED"
+    else
+        save_state "${STAGE:-OFFICE_CODE_SELECTED}"
+    fi
 
     TOOLS_SERVER="dr-$(echo "$OFFICE_CODE" | tr '[:upper:]' '[:lower:]')-tools"
     print_info "Office: $OFFICE_CODE — tools server: $TOOLS_SERVER"
@@ -2813,13 +2898,14 @@ main() {
   echo "=========================================="
     echo ""
 
+    check_privileges
     load_state || true
-parse_args "$@"
-print_resume_state
-ensure_local_pam_survives_sssd_failure
-disable_sssd_if_not_joined
-print_machine_status
-validate_or_fix_hostname || exit 1
+    parse_args "$@"
+    print_resume_state
+    ensure_local_pam_survives_sssd_failure
+    disable_sssd_if_not_joined
+    print_machine_status
+    validate_or_fix_hostname || exit 1
 
 if [ -f "$STATE_FILE" ] && grep -q 'STAGE="REBOOT_REQUIRED_AFTER_HOSTNAME"' "$STATE_FILE" 2>/dev/null; then
     current_hn="$(hostnamectl --static 2>/dev/null || hostname)"
@@ -2831,7 +2917,6 @@ fi
 
 
     # --- Checks and upfront prompts (interactive) ---
-    check_privileges
     detect_os
     load_config
 
@@ -2883,6 +2968,9 @@ fi
     configure_dns_search_domains
     bootstrap_time_before_apt || true
 
+    print_info "Pre-flight package manager check: verifying apt/dpkg are not locked before installation..."
+    wait_for_apt_locks || exit 1
+
     if [ "$DNS_TEST_ONLY" = true ]; then
         verify_ad_discovery
         print_info "DNS/domain discovery test completed. No domain join attempted."
@@ -2911,6 +2999,8 @@ fi
 
     if verify_join; then
         echo ""
+        save_state "POSTJOIN_COMPLETE"
+        rm -f /etc/motd 2>/dev/null || true
         print_info "Domain join completed successfully!"
         echo ""
         echo "  Log in as a domain user with:"
