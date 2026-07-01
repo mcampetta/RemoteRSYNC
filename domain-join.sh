@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.5.8"
+SCRIPT_VERSION="1.5.9"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -1000,6 +1000,42 @@ domain_to_base_dn() {
     }'
 }
 
+discover_ldap_dc() {
+    local srv_line
+    local dc_host=""
+
+    # Kerberos/GSSAPI LDAP binds must target a real DC hostname with a valid
+    # ldap/<dc-fqdn> service principal. Binding to the domain alias
+    # ldap://dr.kodr.local can fail with "Server not found in Kerberos database".
+    if command -v dig >/dev/null 2>&1; then
+        srv_line="\$(dig +short _ldap._tcp.\$DOMAIN SRV 2>/dev/null | sort -n -k1,1 -k2,2 | head -1 || true)"
+        dc_host="\$(echo "\$srv_line" | awk '{print \$4}' | sed 's/[.]\$//')"
+    fi
+
+    if [ -z "\$dc_host" ] && command -v host >/dev/null 2>&1; then
+        srv_line="\$(host -t SRV _ldap._tcp.\$DOMAIN 2>/dev/null | head -1 || true)"
+        dc_host="\$(echo "\$srv_line" | awk '{print \$NF}' | sed 's/[.]\$//')"
+    fi
+
+    if [ -z "\$dc_host" ]; then
+        print_error "Unable to discover an LDAP domain controller from _ldap._tcp.\$DOMAIN."
+        return 1
+    fi
+
+    echo "\$dc_host"
+}
+
+ldap_search_computer_object() {
+    local ldap_dc="\$1"
+    local base_dn="\$2"
+    local sam="\$3"
+
+    # Disable reverse-DNS canonicalization for this process. Some lab/DC
+    # networks lack matching PTR records, and rdns canonicalization can make
+    # GSSAPI request the wrong service principal.
+    KRB5_CONFIG=/tmp/dr-domain-admin-krb5.conf ldapsearch -LLL -Y GSSAPI -N         -H "ldap://\$ldap_dc"         -b "\$base_dn"         "(&(objectClass=computer)(sAMAccountName=\$sam))" dn
+}
+
 ad_computer_exists() {
     local candidate="\$1"
     local sam
@@ -1014,7 +1050,7 @@ ad_computer_exists() {
     # DNS is intentionally not used for allocation because stale/missing DNS
     # records do not reliably represent AD computer-object state.
     set +e
-    output="\$(ldapsearch -LLL -Y GSSAPI -H "ldap://\$DOMAIN" -b "\$base_dn" "(&(objectClass=computer)(sAMAccountName=\$sam))" dn 2>&1)"
+    output="\$(ldap_search_computer_object "\$LDAP_DC" "\$base_dn" "\$sam" 2>&1)"
     rc=\$?
     set -e
 
@@ -1181,6 +1217,27 @@ if ! kinit "\$kerberos_principal"; then
     print_error "Kerberos authentication failed. Cannot query AD authoritatively."
     exit 1
 fi
+
+LDAP_DC="\$(discover_ldap_dc)"
+if [ -z "\$LDAP_DC" ]; then
+    print_error "Cannot query AD authoritatively without a discovered LDAP domain controller."
+    exit 1
+fi
+print_info "Using LDAP domain controller for AD queries: \$LDAP_DC"
+
+cat > /tmp/dr-domain-admin-krb5.conf << KRB5EOF
+[libdefaults]
+    default_realm = \$REALM
+    rdns = false
+    dns_canonicalize_hostname = false
+    udp_preference_limit = 0
+
+[domain_realm]
+    .\$DOMAIN = \$REALM
+    \$DOMAIN = \$REALM
+KRB5EOF
+chmod 600 /tmp/dr-domain-admin-krb5.conf
+trap 'rm -f /tmp/dr-domain-admin-krb5.conf' EXIT
 
 echo ""
 print_info "Querying Active Directory for the first unused managed hostname..."
