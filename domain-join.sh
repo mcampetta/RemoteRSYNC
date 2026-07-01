@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.5.5"
+SCRIPT_VERSION="1.5.6"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -646,6 +646,55 @@ find_next_available_hostname() {
     done
 
     return 1
+}
+
+hostname_matches_managed_policy() {
+    local hn="$1"
+    local prefix
+    prefix="$(office_hostname_prefix)"
+
+    is_valid_ad_hostname "$hn" || return 1
+    echo "$hn" | grep -Eq "^${prefix}-[0-9][0-9]$" || return 1
+    return 0
+}
+
+machine_has_domain_identity() {
+    # Treat either a configured realm or a populated machine keytab as domain
+    # identity. This protects already-joined machines from silent hostname
+    # changes that would invalidate the AD computer account/SPNs.
+    if command -v realm >/dev/null 2>&1 && realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+        return 0
+    fi
+
+    if [ -s /etc/krb5.keytab ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+verify_hostname_applied() {
+    local expected="$1"
+    local static_host short_host
+
+    static_host="$(hostnamectl --static 2>/dev/null || hostname 2>/dev/null || true)"
+    short_host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+
+    if [ "$static_host" != "$expected" ] && [ "$short_host" != "$expected" ]; then
+        print_error "Hostname did not apply cleanly."
+        print_error "Expected: $expected"
+        print_error "hostnamectl: ${static_host:-unknown}"
+        print_error "hostname -s: ${short_host:-unknown}"
+        return 1
+    fi
+
+    if ! grep -Eq "^[[:space:]]*127[.]0[.]1[.]1[[:space:]]+.*(^|[[:space:]])${expected}([[:space:]]|$)" /etc/hosts 2>/dev/null; then
+        print_warning "/etc/hosts does not yet show $expected on 127.0.1.1; attempting repair"
+        update_hosts_for_hostname "$expected" || return 1
+    fi
+
+    print_info "Hostname verified locally: $expected"
+    return 0
 }
 
 
