@@ -42,7 +42,13 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.3.3"
+SCRIPT_VERSION="1.4.0"
+STATE_DIR="/var/lib/dr-domain-join"
+STATE_FILE="$STATE_DIR/state"
+DOMAIN_TARGET_HOSTNAME=""
+HOSTNAME_CHANGED=0
+# TODO: implement reboot resume flow using /var/lib/dr-domain-join/state
+#       and a temporary one-shot systemd service after hostname changes.
 set -e  # Exit on error
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -327,6 +333,110 @@ install_package() {
 # Collect all interactive input before the automated steps begin so the
 # remainder of the script can run unattended.
 
+
+# ── Persistent installer state ──────────────────────────────────────────────
+save_state() {
+    mkdir -p "$STATE_DIR"
+    chmod 755 "$STATE_DIR"
+
+    cat > "$STATE_FILE" << EOF
+SCRIPT_VERSION="$SCRIPT_VERSION"
+STAGE="${1:-UNKNOWN}"
+OFFICE_CODE="${OFFICE_CODE:-}"
+DOMAIN="${DOMAIN:-}"
+TARGET_HOSTNAME="${DOMAIN_TARGET_HOSTNAME:-}"
+DOMAIN_SUDO_USER="${DOMAIN_SUDO_USER:-}"
+HOSTNAME_CHANGED="${HOSTNAME_CHANGED:-0}"
+EOF
+    chmod 600 "$STATE_FILE"
+}
+
+load_state() {
+    [ -f "$STATE_FILE" ] || return 1
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+
+    [ -n "${OFFICE_CODE:-}" ] && OFFICE_CODE="$OFFICE_CODE"
+    [ -n "${DOMAIN_SUDO_USER:-}" ] && DOMAIN_SUDO_USER="$DOMAIN_SUDO_USER"
+    [ -n "${TARGET_HOSTNAME:-}" ] && DOMAIN_TARGET_HOSTNAME="$TARGET_HOSTNAME"
+    return 0
+}
+
+clear_state() {
+    rm -f "$STATE_FILE"
+}
+
+print_resume_state() {
+    [ -f "$STATE_FILE" ] || return 0
+    echo ""
+    print_info "Found prior DR Domain Join state:"
+    sed 's/^/  /' "$STATE_FILE" 2>/dev/null || true
+    echo ""
+}
+
+update_hosts_for_hostname() {
+    local new_hostname="$1"
+    local hosts_file="/etc/hosts"
+    local tmp_file
+
+    if ! is_valid_ad_hostname "$new_hostname"; then
+        print_error "Refusing to update /etc/hosts with invalid hostname: $new_hostname"
+        return 1
+    fi
+
+    touch "$hosts_file"
+    cp "$hosts_file" "${hosts_file}.domain-join.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+
+    tmp_file="$(mktemp)"
+    awk -v hn="$new_hostname" '
+        BEGIN { replaced=0 }
+        /^127[.]0[.]1[.]1[[:space:]]+/ {
+            if (!replaced) {
+                print "127.0.1.1    " hn
+                replaced=1
+            }
+            next
+        }
+        { print }
+        END {
+            if (!replaced) {
+                print "127.0.1.1    " hn
+            }
+        }
+    ' "$hosts_file" > "$tmp_file"
+
+    cat "$tmp_file" > "$hosts_file"
+    rm -f "$tmp_file"
+
+    if getent hosts "$new_hostname" >/dev/null 2>&1; then
+        print_info "Updated /etc/hosts 127.0.1.1 entry for $new_hostname"
+    else
+        print_warning "Updated /etc/hosts, but local hostname lookup did not validate immediately"
+    fi
+}
+
+ensure_local_pam_survives_sssd_failure() {
+    local acct="/etc/pam.d/common-account"
+
+    [ -f "$acct" ] || return 0
+    cp "$acct" "${acct}.domain-join.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+
+    if grep -q 'pam_sss.so' "$acct"; then
+        sed -i -E 's/^account[[:space:]]+\[[^]]*\][[:space:]]+pam_sss\.so.*/account [success=ok new_authtok_reqd=done ignore=ignore user_unknown=ignore default=ignore] pam_sss.so/' "$acct"
+        sed -i -E 's/^account[[:space:]]+required[[:space:]]+pam_sss\.so.*/account [success=ok new_authtok_reqd=done ignore=ignore user_unknown=ignore default=ignore] pam_sss.so/' "$acct"
+        print_info "Hardened PAM account handling so local graphical login survives SSSD outages"
+    fi
+}
+
+disable_sssd_if_not_joined() {
+    if ! realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+        if systemctl list-unit-files 2>/dev/null | grep -q '^sssd\.service'; then
+            print_warning "Machine is not joined; disabling/stopping SSSD to protect local graphical login"
+            systemctl disable --now sssd >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
 # ── Hostname / AD machine-account preflight ────────────────────────────────
 is_valid_ad_hostname() {
     local hn="$1"
@@ -391,65 +501,36 @@ prompt_for_ad_hostname() {
 
     local number
     local proposed
+    local confirm
 
     while true; do
         read -r -p "  Workstation number: " number
         proposed="$(suggest_hostname "$prefix" "$number")"
 
-        if is_valid_ad_hostname "$proposed"; then
-            echo "$proposed"
-            return 0
+        if ! is_valid_ad_hostname "$proposed"; then
+            print_warning "Generated hostname '$proposed' is not AD-safe."
+            print_warning "Use a shorter office code/prefix or a smaller workstation number."
+            continue
         fi
 
-        print_warning "Generated hostname '$proposed' is not AD-safe."
-        print_warning "Use a shorter office code/prefix or a smaller workstation number."
+        echo ""
+        echo "------------------------------------------"
+        echo "  Proposed hostname: $proposed"
+        echo "------------------------------------------"
+        read -r -p "  Use this hostname? [Y/n]: " confirm
+        confirm="${confirm:-Y}"
+
+        case "$confirm" in
+            y|Y|yes|YES)
+                DOMAIN_TARGET_HOSTNAME="$proposed"
+                return 0
+                ;;
+            *)
+                echo ""
+                print_info "Let's choose another workstation number."
+                ;;
+        esac
     done
-}
-
-
-update_hosts_for_hostname() {
-    local new_hostname="$1"
-    local hosts_file="/etc/hosts"
-
-    touch "$hosts_file"
-    cp "$hosts_file" "${hosts_file}.domain-join.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-
-    if grep -qE '^127\.0\.1\.1\s+' "$hosts_file"; then
-        sed -i "s/^127\.0\.1\.1.*/127.0.1.1    ${new_hostname}/" "$hosts_file"
-    else
-        printf '\n127.0.1.1    %s\n' "$new_hostname" >> "$hosts_file"
-    fi
-
-    print_info "Updated /etc/hosts 127.0.1.1 entry for $new_hostname"
-}
-
-ensure_local_pam_survives_sssd_failure() {
-    # Safety guard: local graphical login must not be bricked if SSSD is down,
-    # a join failed, or a machine was removed from the domain.
-    #
-    # We keep pam_sss enabled for domain users, but make sure account handling
-    # ignores SSSD connection failures. This prevents gdm-launch-environment
-    # and local accounts from failing when SSSD is temporarily unavailable.
-    local acct="/etc/pam.d/common-account"
-
-    [ -f "$acct" ] || return 0
-    cp "$acct" "${acct}.domain-join.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-
-    if grep -q 'pam_sss.so' "$acct"; then
-        sed -i -E 's/^account[[:space:]]+\[[^]]*\][[:space:]]+pam_sss\.so.*/account [success=ok new_authtok_reqd=done ignore=ignore user_unknown=ignore default=ignore] pam_sss.so/' "$acct"
-        sed -i -E 's/^account[[:space:]]+required[[:space:]]+pam_sss\.so.*/account [success=ok new_authtok_reqd=done ignore=ignore user_unknown=ignore default=ignore] pam_sss.so/' "$acct"
-        print_info "Hardened PAM account handling so local graphical login survives SSSD outages"
-    fi
-}
-
-disable_sssd_if_not_joined() {
-    # If the machine is not joined, SSSD should not be allowed to break local GUI login.
-    if ! realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
-        if systemctl list-unit-files 2>/dev/null | grep -q '^sssd\.service'; then
-            print_warning "Machine is not joined; disabling/stopping SSSD to protect local graphical login"
-            systemctl disable --now sssd >/dev/null 2>&1 || true
-        fi
-    fi
 }
 
 validate_or_fix_hostname() {
@@ -479,13 +560,22 @@ validate_or_fix_hostname() {
 
     case "$answer" in
         y|Y|yes|YES)
-            local new_hostname
-            new_hostname="$(prompt_for_ad_hostname)"
-            print_info "Setting hostname to $new_hostname"
-            hostnamectl set-hostname "$new_hostname"
-            update_hosts_for_hostname "$new_hostname"
+            prompt_for_ad_hostname
+
+            if [ -z "$DOMAIN_TARGET_HOSTNAME" ]; then
+                print_error "Internal error: hostname prompt did not set DOMAIN_TARGET_HOSTNAME."
+                return 1
+            fi
+
+            print_info "Setting hostname to $DOMAIN_TARGET_HOSTNAME"
+            hostnamectl set-hostname "$DOMAIN_TARGET_HOSTNAME"
+            update_hosts_for_hostname "$DOMAIN_TARGET_HOSTNAME"
             ensure_local_pam_survives_sssd_failure
             disable_sssd_if_not_joined
+
+            HOSTNAME_CHANGED=1
+            save_state "REBOOT_REQUIRED_AFTER_HOSTNAME"
+
             print_warning "Hostname changed. A reboot is required before the domain admin performs the join."
             print_warning "Please reboot, then rerun this script."
             exit 20
@@ -2095,11 +2185,22 @@ main() {
   echo "=========================================="
     echo ""
 
-    parse_args "$@"
+    load_state || true
+parse_args "$@"
+print_resume_state
 ensure_local_pam_survives_sssd_failure
 disable_sssd_if_not_joined
 print_machine_status
 validate_or_fix_hostname || exit 1
+
+if [ -f "$STATE_FILE" ] && grep -q 'STAGE="REBOOT_REQUIRED_AFTER_HOSTNAME"' "$STATE_FILE" 2>/dev/null; then
+    current_hn="$(hostnamectl --static 2>/dev/null || hostname)"
+    if [ -n "${DOMAIN_TARGET_HOSTNAME:-}" ] && [ "$current_hn" = "$DOMAIN_TARGET_HOSTNAME" ]; then
+        print_info "Hostname reboot requirement satisfied for $current_hn"
+        save_state "PREJOIN_AFTER_HOSTNAME_REBOOT"
+    fi
+fi
+
 
     # --- Checks and upfront prompts (interactive) ---
     check_privileges
