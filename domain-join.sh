@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.3.2"
+SCRIPT_VERSION="1.3.3"
 set -e  # Exit on error
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -406,6 +406,52 @@ prompt_for_ad_hostname() {
     done
 }
 
+
+update_hosts_for_hostname() {
+    local new_hostname="$1"
+    local hosts_file="/etc/hosts"
+
+    touch "$hosts_file"
+    cp "$hosts_file" "${hosts_file}.domain-join.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+
+    if grep -qE '^127\.0\.1\.1\s+' "$hosts_file"; then
+        sed -i "s/^127\.0\.1\.1.*/127.0.1.1    ${new_hostname}/" "$hosts_file"
+    else
+        printf '\n127.0.1.1    %s\n' "$new_hostname" >> "$hosts_file"
+    fi
+
+    print_info "Updated /etc/hosts 127.0.1.1 entry for $new_hostname"
+}
+
+ensure_local_pam_survives_sssd_failure() {
+    # Safety guard: local graphical login must not be bricked if SSSD is down,
+    # a join failed, or a machine was removed from the domain.
+    #
+    # We keep pam_sss enabled for domain users, but make sure account handling
+    # ignores SSSD connection failures. This prevents gdm-launch-environment
+    # and local accounts from failing when SSSD is temporarily unavailable.
+    local acct="/etc/pam.d/common-account"
+
+    [ -f "$acct" ] || return 0
+    cp "$acct" "${acct}.domain-join.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+
+    if grep -q 'pam_sss.so' "$acct"; then
+        sed -i -E 's/^account[[:space:]]+\[[^]]*\][[:space:]]+pam_sss\.so.*/account [success=ok new_authtok_reqd=done ignore=ignore user_unknown=ignore default=ignore] pam_sss.so/' "$acct"
+        sed -i -E 's/^account[[:space:]]+required[[:space:]]+pam_sss\.so.*/account [success=ok new_authtok_reqd=done ignore=ignore user_unknown=ignore default=ignore] pam_sss.so/' "$acct"
+        print_info "Hardened PAM account handling so local graphical login survives SSSD outages"
+    fi
+}
+
+disable_sssd_if_not_joined() {
+    # If the machine is not joined, SSSD should not be allowed to break local GUI login.
+    if ! realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+        if systemctl list-unit-files 2>/dev/null | grep -q '^sssd\.service'; then
+            print_warning "Machine is not joined; disabling/stopping SSSD to protect local graphical login"
+            systemctl disable --now sssd >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
 validate_or_fix_hostname() {
     local hn
     hn="$(hostnamectl --static 2>/dev/null || hostname 2>/dev/null || true)"
@@ -437,8 +483,12 @@ validate_or_fix_hostname() {
             new_hostname="$(prompt_for_ad_hostname)"
             print_info "Setting hostname to $new_hostname"
             hostnamectl set-hostname "$new_hostname"
-            print_warning "A reboot is recommended before the domain admin performs the join."
-            return 0
+            update_hosts_for_hostname "$new_hostname"
+            ensure_local_pam_survives_sssd_failure
+            disable_sssd_if_not_joined
+            print_warning "Hostname changed. A reboot is required before the domain admin performs the join."
+            print_warning "Please reboot, then rerun this script."
+            exit 20
             ;;
         *)
             print_error "Cannot safely continue with hostname '$hn'."
@@ -462,6 +512,7 @@ validate_existing_join() {
 
     if adcli testjoin -D "$DOMAIN" >/dev/null 2>&1; then
         print_info "Machine account validation succeeded"
+        systemctl enable --now sssd >/dev/null 2>&1 || true
         return 0
     fi
 
@@ -473,6 +524,7 @@ validate_existing_join() {
     print_error "  sudo rm -f /etc/krb5.keytab"
     print_error "  sudo rm -rf /var/lib/sss/db/* /var/lib/sss/mc/*"
     print_error "Then ensure the hostname is AD-safe and rejoin the domain."
+    ensure_local_pam_survives_sssd_failure
     return 1
 }
 
@@ -2044,6 +2096,8 @@ main() {
     echo ""
 
     parse_args "$@"
+ensure_local_pam_survives_sssd_failure
+disable_sssd_if_not_joined
 print_machine_status
 validate_or_fix_hostname || exit 1
 
