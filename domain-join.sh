@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.4.5"
+SCRIPT_VERSION="1.5.0"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -450,7 +450,7 @@ save_state() {
     chmod 755 "$STATE_DIR"
 
     cat > "$STATE_FILE" << EOF
-SCRIPT_VERSION="1.4.5"
+SCRIPT_VERSION="1.5.0"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STAGE="${1:-UNKNOWN}"
@@ -601,27 +601,122 @@ suggest_hostname() {
     echo "${prefix}-${number}"
 }
 
+hostname_candidate_exists() {
+    local candidate="$1"
+    local fqdn="${candidate}.${DOMAIN}"
+
+    # DNS collision check. This catches existing joined machines with DNS records.
+    if getent hosts "$fqdn" >/dev/null 2>&1 || getent hosts "$candidate" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if command -v host >/dev/null 2>&1; then
+        if host "$fqdn" >/dev/null 2>&1 || host "$candidate" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    # AD computer object check when adcli is already available. This may fail
+    # without credentials on some domains, so DNS remains the primary pre-join check.
+    if command -v adcli >/dev/null 2>&1; then
+        if adcli show-computer "$candidate" -D "$DOMAIN" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+find_next_available_hostname() {
+    local prefix="$1"
+    local max_number="${2:-99}"
+    local n
+    local candidate
+
+    for n in $(seq 1 "$max_number"); do
+        candidate="$(suggest_hostname "$prefix" "$n")"
+        if ! is_valid_ad_hostname "$candidate"; then
+            continue
+        fi
+
+        if ! hostname_candidate_exists "$candidate"; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+
 prompt_for_ad_hostname() {
     local prefix
     prefix="$(office_hostname_prefix)"
 
     echo "  Hostname prefix: $prefix"
-    echo ""
-    echo "  Enter the workstation number for this machine."
-    echo "  Example: 7 becomes ${prefix}-07"
+    echo "  Managed names are assigned sequentially and checked for DNS/AD collisions."
     echo ""
 
-    local number
+    local suggested_available=""
+    if suggested_available="$(find_next_available_hostname "$prefix" 99)"; then
+        echo "  Suggested next available hostname:"
+        echo "    $suggested_available"
+        echo ""
+        read -r -p "  Use this hostname? [Y/n]: " use_suggested
+        use_suggested="${use_suggested:-Y}"
+
+        case "$use_suggested" in
+            y|Y|yes|YES)
+                DOMAIN_TARGET_HOSTNAME="$suggested_available"
+                return 0
+                ;;
+        esac
+    else
+        print_warning "No available hostname found from ${prefix}-01 through ${prefix}-99."
+        print_warning "Manual hostname entry is required."
+        echo ""
+    fi
+
+    echo "  Enter a workstation number or a full hostname."
+    echo "  Examples:"
+    echo "    7 becomes ${prefix}-07"
+    echo "    ${prefix}-12 is accepted directly"
+    echo ""
+
+    local input
     local proposed
     local confirm
 
     while true; do
-        read -r -p "  Workstation number: " number
-        proposed="$(suggest_hostname "$prefix" "$number")"
+        read -r -p "  Workstation number or hostname: " input
+
+        if echo "$input" | grep -Eq '^[0-9]+$'; then
+            proposed="$(suggest_hostname "$prefix" "$input")"
+        else
+            proposed="$(echo "$input" | tr '[:upper:]' '[:lower:]')"
+        fi
 
         if ! is_valid_ad_hostname "$proposed"; then
-            print_warning "Generated hostname '$proposed' is not AD-safe."
-            print_warning "Use a shorter office code/prefix or a smaller workstation number."
+            print_warning "Hostname '$proposed' is not AD-safe."
+            print_warning "Use 15 characters or fewer, letters/numbers/hyphens only."
+            continue
+        fi
+
+        if hostname_candidate_exists "$proposed"; then
+            print_warning "Hostname '$proposed' appears to already exist in DNS or Active Directory."
+            read -r -p "  Choose a different hostname? [Y/n]: " choose_different
+            choose_different="${choose_different:-Y}"
+            case "$choose_different" in
+                n|N|no|NO)
+                    read -r -p "  Override and use '$proposed' anyway? [y/N]: " override
+                    case "$override" in
+                        y|Y|yes|YES)
+                            DOMAIN_TARGET_HOSTNAME="$proposed"
+                            return 0
+                            ;;
+                    esac
+                    ;;
+            esac
             continue
         fi
 
@@ -639,35 +734,71 @@ prompt_for_ad_hostname() {
                 ;;
             *)
                 echo ""
-                print_info "Let's choose another workstation number."
+                print_info "Let's choose another workstation number or hostname."
                 ;;
         esac
     done
+}
+
+hostname_matches_managed_policy() {
+    local hn="$1"
+    local prefix
+    prefix="$(office_hostname_prefix)"
+    echo "$hn" | grep -Eq "^${prefix}-[0-9]{2}$"
+}
+
+verify_hostname_applied() {
+    local expected="$1"
+    local static_hn
+    local runtime_hn
+
+    static_hn="$(hostnamectl --static 2>/dev/null || true)"
+    runtime_hn="$(hostname 2>/dev/null || true)"
+
+    if [ "$static_hn" = "$expected" ] && [ "$runtime_hn" = "$expected" ]; then
+        print_info "Hostname verified: $expected"
+        return 0
+    fi
+
+    print_error "Hostname verification failed."
+    print_error "Expected: $expected"
+    print_error "hostnamectl --static: ${static_hn:-<empty>}"
+    print_error "hostname: ${runtime_hn:-<empty>}"
+    return 1
+}
+
+machine_has_domain_identity() {
+    realm list 2>/dev/null | grep -q "configured: kerberos-member" && return 0
+    [ -s /etc/krb5.keytab ] && return 0
+    return 1
 }
 
 validate_or_fix_hostname() {
     local hn
     hn="$(hostnamectl --static 2>/dev/null || hostname 2>/dev/null || true)"
 
-    if is_valid_ad_hostname "$hn"; then
-        print_info "Hostname is AD-safe: $hn"
+    if is_valid_ad_hostname "$hn" && hostname_matches_managed_policy "$hn"; then
+        print_info "Hostname is AD-safe and follows managed naming policy: $hn"
         return 0
     fi
 
     echo ""
-    print_warning "Current hostname may break Active Directory/Kerberos joins: $hn"
-    print_warning "Hostnames should be 15 characters or fewer and contain only letters, numbers, and hyphens."
-    print_warning "Long hostnames can be truncated in AD, causing machine-account/keytab failures."
+    echo "=========================================="
+    echo "  Hostname Policy"
+    echo "=========================================="
+    echo "  Current hostname: $hn"
+    echo "  Required pattern: $(office_hostname_prefix)-NN"
     echo ""
 
-    local suggested
-    suggested="$(suggest_hostname "$(office_hostname_prefix)" "01")"
+    if ! is_valid_ad_hostname "$hn"; then
+        print_warning "Current hostname is not AD-safe."
+        print_warning "Hostnames should be 15 characters or fewer and contain only letters, numbers, and hyphens."
+    elif ! hostname_matches_managed_policy "$hn"; then
+        print_warning "Current hostname is AD-safe but does not follow the managed workstation naming policy."
+    fi
 
-    echo "  Suggested format: $(office_hostname_prefix)-NN"
-    echo "  Example hostname: $suggested"
     echo ""
-
-    read -r -p "  Rename this machine now using the office naming convention? [Y/n]: " answer
+    read -r -p "  Apply managed hostname policy now? [Y/n]: " answer
     answer="${answer:-Y}"
 
     case "$answer" in
@@ -679,26 +810,54 @@ validate_or_fix_hostname() {
                 return 1
             fi
 
+            if machine_has_domain_identity; then
+                print_warning "Existing domain identity or keytab detected."
+                print_warning "Changing hostname on an already-joined machine requires cleanup/reboot before rejoin."
+                print_warning "The script will set the hostname, update /etc/hosts, save state, and stop."
+                print_warning "After reboot, remove/rejoin the machine through the domain-admin handoff flow."
+                read -r -p "  Continue with hostname change anyway? [y/N]: " joined_answer
+                case "$joined_answer" in
+                    y|Y|yes|YES) ;;
+                    *)
+                        print_error "Hostname change cancelled."
+                        return 1
+                        ;;
+                esac
+            fi
+
             print_info "Setting hostname to $DOMAIN_TARGET_HOSTNAME"
             hostnamectl set-hostname "$DOMAIN_TARGET_HOSTNAME"
             update_hosts_for_hostname "$DOMAIN_TARGET_HOSTNAME"
-            ensure_local_pam_survives_sssd_failure
-            disable_sssd_if_not_joined
+            verify_hostname_applied "$DOMAIN_TARGET_HOSTNAME" || return 1
 
             HOSTNAME_CHANGED=1
-            save_state "REBOOT_REQUIRED_AFTER_HOSTNAME"
 
-            print_warning "Hostname changed. A reboot is required before the domain admin performs the join."
-            print_warning "Please reboot, then rerun this script."
-            exit 20
+            if machine_has_domain_identity; then
+                ensure_local_pam_survives_sssd_failure
+                disable_sssd_if_not_joined
+                save_state "REBOOT_REQUIRED_AFTER_HOSTNAME"
+                print_warning "Hostname changed on a machine with existing domain identity."
+                print_warning "A reboot is required before continuing."
+                exit 20
+            fi
+
+            save_state "PREJOIN_HOSTNAME_APPLIED"
+            print_info "Hostname applied before first domain join; continuing without reboot."
+            return 0
             ;;
         *)
+            if is_valid_ad_hostname "$hn"; then
+                print_warning "Proceeding with existing AD-safe hostname outside managed policy: $hn"
+                return 0
+            fi
+
             print_error "Cannot safely continue with hostname '$hn'."
-            print_error "Please set a 15-character-or-shorter hostname, reboot, and rerun this script."
+            print_error "Please choose a managed AD-safe hostname and rerun this script."
             return 1
             ;;
     esac
 }
+
 
 validate_existing_join() {
     if ! realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
@@ -730,6 +889,37 @@ validate_existing_join() {
     return 1
 }
 
+
+print_domain_admin_join_instructions() {
+    local fqdn ip_list ssh_user first_ip
+    fqdn="$(hostname -f 2>/dev/null || hostname)"
+    ip_list="$(hostname -I 2>/dev/null | xargs 2>/dev/null || true)"
+    ssh_user="${SUDO_USER:-}"
+    [ -z "$ssh_user" ] || [ "$ssh_user" = "root" ] && ssh_user="$(logname 2>/dev/null || whoami)"
+
+    echo ""
+    echo "=========================================="
+    echo "  Domain Admin Action Required"
+    echo "=========================================="
+    echo "  Hostname: $(hostname)"
+    echo "  Domain:   $DOMAIN"
+    echo "  IP(s):    ${ip_list:-<unable to determine>}"
+    echo ""
+    echo "  Domain admin should SSH in and run:"
+    echo ""
+    if [ -n "$ip_list" ]; then
+        first_ip="$(echo "$ip_list" | awk '{print $1}')"
+        echo "    ssh ${ssh_user}@${first_ip}"
+    else
+        echo "    ssh ${ssh_user}@${fqdn}"
+    fi
+    echo "    sudo realm join -v $DOMAIN -U <domain_admin_username>"
+    echo "    sudo adcli testjoin -D $DOMAIN"
+    echo ""
+    echo "  Continue only if testjoin returns: Join is OK"
+    echo "=========================================="
+    echo ""
+}
 print_machine_status() {
     echo ""
     echo "=========================================="
