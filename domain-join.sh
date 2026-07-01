@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.3.1"
+SCRIPT_VERSION="1.3.2"
 set -e  # Exit on error
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -151,7 +151,7 @@ is_package_installed() {
 wait_for_apt_locks() {
     local waited=0
     local interval=10
-    local max_wait=600
+    local max_wait=300
     local lock_files=(
         /var/lib/dpkg/lock-frontend
         /var/lib/dpkg/lock
@@ -159,9 +159,9 @@ wait_for_apt_locks() {
         /var/cache/apt/archives/lock
     )
 
-    get_lock_holders() {
+    get_lock_holder_pids() {
         local lock
-        local holders=""
+        local all_pids=""
 
         for lock in "${lock_files[@]}"; do
             [ -e "$lock" ] || continue
@@ -170,35 +170,102 @@ wait_for_apt_locks() {
                 local pids
                 pids=$(fuser "$lock" 2>/dev/null | xargs 2>/dev/null || true)
                 if [ -n "$pids" ]; then
-                    local pid
-                    for pid in $pids; do
-                        local cmd
-                        local args
-                        cmd=$(ps -p "$pid" -o comm= 2>/dev/null || true)
-                        args=$(ps -p "$pid" -o args= 2>/dev/null || true)
-                        holders="${holders}\n    PID $pid (${cmd:-unknown}): ${args:-unknown} [lock: $lock]"
-                    done
+                    all_pids="$all_pids $pids"
                 fi
-            elif command -v lsof >/dev/null 2>&1; then
-                local lines
-                lines=$(lsof "$lock" 2>/dev/null | awk 'NR>1 {print "    PID "$2" ("$1"): "$0" [lock: " lock "]"}' lock="$lock" || true)
-                [ -n "$lines" ] && holders="${holders}\n$lines"
             fi
         done
 
-        if [ -z "$holders" ]; then
-            local proc_lines
-            proc_lines=$(ps -eo pid=,comm=,args= | awk '/apt|apt-get|dpkg|unattended-upgrade|packagekit/ && !/awk/ {print "    PID "$1" ("$2"): "$0}' || true)
-            [ -n "$proc_lines" ] && holders="\n$proc_lines"
+        # Fallback when fuser identifies no lock owner but apt/dpkg appears active.
+        if [ -z "$(echo "$all_pids" | xargs 2>/dev/null)" ]; then
+            ps -eo pid=,comm=,args= | awk '/apt|apt-get|dpkg|unattended-upgrade|packagekit/ && !/awk/ {print $1}' | xargs 2>/dev/null || true
+        else
+            echo "$all_pids" | xargs -n1 2>/dev/null | sort -u | xargs 2>/dev/null || true
+        fi
+    }
+
+    get_lock_holders() {
+        local pids
+        pids="$(get_lock_holder_pids)"
+
+        if [ -z "$pids" ]; then
+            return 0
         fi
 
-        printf "%b" "$holders"
+        local pid
+        for pid in $pids; do
+            local cmd args elapsed
+            cmd=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+            args=$(ps -p "$pid" -o args= 2>/dev/null || true)
+            elapsed=$(ps -p "$pid" -o etimes= 2>/dev/null | xargs 2>/dev/null || true)
+
+            [ -n "$cmd$args" ] || continue
+
+            echo "    PID $pid (${cmd:-unknown}, ${elapsed:-?}s): ${args:-unknown}"
+        done
     }
 
     apt_locks_held() {
-        local holders
-        holders=$(get_lock_holders)
-        [ -n "$holders" ]
+        [ -n "$(get_lock_holder_pids)" ]
+    }
+
+    force_clear_apt_locks() {
+        local pids
+        pids="$(get_lock_holder_pids)"
+
+        if [ -z "$pids" ]; then
+            print_info "No active apt/dpkg lock holders found."
+            return 0
+        fi
+
+        print_warning "Force-clearing apt/dpkg locks can interrupt Ubuntu updates."
+        print_warning "Only continue if the listed process is clearly stuck or blocking deployment."
+        echo ""
+        print_warning "Current lock holder(s):"
+        get_lock_holders
+        echo ""
+        read -r -p "  Stop these package-manager process(es) and repair dpkg? [y/N]: " answer
+
+        case "$answer" in
+            y|Y|yes|YES)
+                ;;
+            *)
+                print_error "Package manager is still locked; aborting by user choice."
+                return 1
+                ;;
+        esac
+
+        local pid
+        for pid in $pids; do
+            if kill -0 "$pid" 2>/dev/null; then
+                print_warning "Requesting process $pid to stop..."
+                kill "$pid" 2>/dev/null || true
+            fi
+        done
+
+        sleep 5
+
+        for pid in $pids; do
+            if kill -0 "$pid" 2>/dev/null; then
+                print_warning "Process $pid did not stop; sending SIGKILL..."
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        done
+
+        sleep 2
+
+        print_info "Repairing package manager state..."
+        dpkg --configure -a || return 1
+        apt-get -f install -y || return 1
+
+        if apt_locks_held; then
+            print_error "Package manager still appears locked after force clear."
+            print_error "Remaining holder(s):"
+            get_lock_holders
+            return 1
+        fi
+
+        print_info "Package manager lock cleared and dpkg state repaired."
+        return 0
     }
 
     if apt_locks_held; then
@@ -209,10 +276,9 @@ wait_for_apt_locks() {
 
     while apt_locks_held; do
         if [ "$waited" -ge "$max_wait" ]; then
-            print_error "Timed out waiting for apt/dpkg locks after ${max_wait} seconds"
-            print_error "Remaining lock holder(s):"
-            get_lock_holders
-            return 1
+            print_warning "Package manager lock has persisted for ${max_wait} seconds."
+            force_clear_apt_locks || return 1
+            break
         fi
 
         sleep "$interval"
@@ -223,7 +289,7 @@ wait_for_apt_locks() {
         get_lock_holders
     done
 
-    if [ "$waited" -gt 0 ]; then
+    if [ "$waited" -gt 0 ] && ! apt_locks_held; then
         print_info "Package manager locks released after ${waited} seconds"
     fi
 
