@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.4.2"
+SCRIPT_VERSION="1.4.4"
 STATE_DIR="/var/lib/dr-domain-join"
 STATE_FILE="$STATE_DIR/state"
 DOMAIN_TARGET_HOSTNAME=""
@@ -157,7 +157,11 @@ is_package_installed() {
 wait_for_apt_locks() {
     local waited=0
     local interval=10
-    local max_wait=300
+    local quiet_wait=30
+    local pid_detail_wait=60
+    local offer_clear_wait=120
+    local showed_update_msg=0
+
     local lock_files=(
         /var/lib/dpkg/lock-frontend
         /var/lib/dpkg/lock
@@ -171,6 +175,8 @@ wait_for_apt_locks() {
         apt-daily-upgrade.service
         unattended-upgrades.service
         packagekit.service
+        packagekit.socket
+        packagekit-offline-update.service
     )
     local stopped_units=""
 
@@ -184,30 +190,49 @@ wait_for_apt_locks() {
             if command -v fuser >/dev/null 2>&1; then
                 local pids
                 pids=$(fuser "$lock" 2>/dev/null | xargs 2>/dev/null || true)
-                if [ -n "$pids" ]; then
-                    all_pids="$all_pids $pids"
-                fi
+                [ -n "$pids" ] && all_pids="$all_pids $pids"
             fi
         done
 
         if [ -z "$(echo "$all_pids" | xargs 2>/dev/null)" ]; then
-            ps -eo pid=,comm=,args= | awk '/apt|apt-get|dpkg|unattended-upgrade|packagekit/ && !/awk/ {print $1}' | xargs 2>/dev/null || true
+            ps -eo pid=,comm=,args= | awk '/apt|apt-get|dpkg|unattended-upgrade|packagekit|PackageKit/ && !/awk/ {print $1}' | xargs 2>/dev/null || true
         else
             echo "$all_pids" | xargs -n1 2>/dev/null | sort -u | xargs 2>/dev/null || true
         fi
+    }
+
+    classify_lock_holder() {
+        local args="$1"
+        local cmd="$2"
+
+        case "$args $cmd" in
+            *unattended-upgrade*|*apt.systemd.daily*|*apt-daily*|*apt-daily-upgrade*)
+                echo "Ubuntu automatic update"
+                ;;
+            *packagekit*|*PackageKit*)
+                echo "Software Center / PackageKit"
+                ;;
+            *dpkg*)
+                echo "dpkg package configuration"
+                ;;
+            *apt-get*|*apt\ *)
+                echo "apt package operation"
+                ;;
+            *)
+                echo "package manager process"
+                ;;
+        esac
     }
 
     get_lock_holders() {
         local pids
         pids="$(get_lock_holder_pids)"
 
-        if [ -z "$pids" ]; then
-            return 0
-        fi
+        [ -z "$pids" ] && return 0
 
         local pid
         for pid in $pids; do
-            local cmd args elapsed ppid parent
+            local cmd args elapsed ppid parent class
             cmd=$(ps -p "$pid" -o comm= 2>/dev/null || true)
             args=$(ps -p "$pid" -o args= 2>/dev/null || true)
             elapsed=$(ps -p "$pid" -o etimes= 2>/dev/null | xargs 2>/dev/null || true)
@@ -216,8 +241,14 @@ wait_for_apt_locks() {
             [ -n "$ppid" ] && parent=$(ps -p "$ppid" -o comm= 2>/dev/null || true)
 
             [ -n "$cmd$args" ] || continue
+            class="$(classify_lock_holder "$args" "$cmd")"
 
-            echo "    PID $pid (${cmd:-unknown}, ${elapsed:-?}s, parent: ${parent:-unknown}/$ppid): ${args:-unknown}"
+            echo "    Type:    $class"
+            echo "    PID:     $pid"
+            echo "    Running: ${elapsed:-?} seconds"
+            echo "    Parent:  ${parent:-unknown}/${ppid:-?}"
+            echo "    Command: ${args:-unknown}"
+            echo ""
         done
     }
 
@@ -239,24 +270,49 @@ wait_for_apt_locks() {
                 fi
             fi
         done
+
+        # PackageKit can respawn via D-Bus/socket activation. Mask it temporarily
+        # during package installation so packagekitd does not keep retaking locks.
+        for unit in packagekit.service packagekit.socket packagekit-offline-update.service; do
+            if systemctl list-unit-files "$unit" >/dev/null 2>&1 || systemctl list-units "$unit" >/dev/null 2>&1; then
+                print_warning "Temporarily masking $unit to prevent PackageKit respawn"
+                systemctl stop "$unit" >/dev/null 2>&1 || true
+                systemctl mask "$unit" >/dev/null 2>&1 || true
+                case " $stopped_units " in
+                    *" $unit "*) ;;
+                    *) stopped_units="$stopped_units $unit" ;;
+                esac
+            fi
+        done
     }
 
     restore_apt_respawn_units() {
         local unit
 
-        [ -n "$stopped_units" ] || return 0
+        [ -z "$stopped_units" ] && return 0
 
-        print_info "Re-enabling apt timers/services that were stopped by this script..."
+        print_info "Restoring apt/PackageKit timers and services that were stopped by this script..."
+
+        # Unmask PackageKit components first so enable/start can work again.
+        for unit in packagekit.service packagekit.socket packagekit-offline-update.service; do
+            if systemctl list-unit-files "$unit" >/dev/null 2>&1 || systemctl list-units "$unit" >/dev/null 2>&1; then
+                systemctl unmask "$unit" >/dev/null 2>&1 || true
+            fi
+        done
 
         for unit in $stopped_units; do
             case "$unit" in
-                *.timer)
+                apt-daily.timer|apt-daily-upgrade.timer)
                     systemctl enable --now "$unit" >/dev/null 2>&1 || true
                     ;;
-                unattended-upgrades.service)
+                packagekit.socket)
+                    systemctl enable --now "$unit" >/dev/null 2>&1 || true
+                    ;;
+                unattended-upgrades.service|packagekit.service)
                     systemctl enable "$unit" >/dev/null 2>&1 || true
                     ;;
-                packagekit.service)
+                packagekit-offline-update.service)
+                    # Do not start offline-update manually.
                     systemctl enable "$unit" >/dev/null 2>&1 || true
                     ;;
                 *)
@@ -268,15 +324,16 @@ wait_for_apt_locks() {
         done
     }
 
+
     force_clear_apt_locks() {
         local pids
 
-        print_warning "Force-clearing apt/dpkg locks can interrupt Ubuntu updates."
-        print_warning "Only continue if the listed process is clearly stuck or blocking deployment."
+        print_warning "Package manager lock has persisted for ${offer_clear_wait} seconds."
+        print_warning "This is commonly caused by Ubuntu automatic updates on fresh installs."
+        print_warning "Force-clearing can interrupt updates, but the script will repair dpkg afterward."
         echo ""
         print_warning "Current lock holder(s):"
         get_lock_holders
-        echo ""
         read -r -p "  Stop apt services/timers, terminate lock holder(s), and repair dpkg? [y/N]: " answer
 
         case "$answer" in
@@ -340,25 +397,21 @@ wait_for_apt_locks() {
         return 0
     }
 
-    if apt_locks_held; then
-        print_info "Ubuntu package manager is currently busy; waiting for apt/dpkg locks..."
-        print_info "Current lock holder(s):"
-        get_lock_holders
-    fi
-
     while apt_locks_held; do
-        if [ "$waited" -ge "$max_wait" ]; then
-            print_warning "Package manager lock has persisted for ${max_wait} seconds."
-            force_clear_apt_locks || return 1
-            break
-        fi
-
         sleep "$interval"
         waited=$((waited + interval))
 
-        print_info "Still waiting for apt/dpkg locks... (${waited}s elapsed)"
-        print_info "Current lock holder(s):"
-        get_lock_holders
+        if [ "$waited" -ge "$offer_clear_wait" ]; then
+            force_clear_apt_locks || return 1
+            break
+        elif [ "$waited" -ge "$pid_detail_wait" ]; then
+            print_info "Package manager is still busy (${waited}s elapsed)."
+            print_info "Current lock holder(s):"
+            get_lock_holders
+        elif [ "$waited" -ge "$quiet_wait" ] && [ "$showed_update_msg" -eq 0 ]; then
+            print_info "Ubuntu is still performing package/update work; waiting for apt/dpkg locks..."
+            showed_update_msg=1
+        fi
     done
 
     if [ "$waited" -gt 0 ] && ! apt_locks_held; then
@@ -406,7 +459,7 @@ save_state() {
     chmod 755 "$STATE_DIR"
 
     cat > "$STATE_FILE" << EOF
-SCRIPT_VERSION="1.4.2"
+SCRIPT_VERSION="1.4.4"
 STAGE="${1:-UNKNOWN}"
 OFFICE_CODE="${OFFICE_CODE:-}"
 DOMAIN="${DOMAIN:-}"
