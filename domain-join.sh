@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.5.1"
+SCRIPT_VERSION="1.5.2"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -450,7 +450,7 @@ save_state() {
     chmod 755 "$STATE_DIR"
 
     cat > "$STATE_FILE" << EOF
-SCRIPT_VERSION="1.5.1"
+SCRIPT_VERSION="1.5.2"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STAGE="${1:-UNKNOWN}"
@@ -890,22 +890,173 @@ validate_existing_join() {
 }
 
 
+
+install_domain_admin_join_helper() {
+    local helper="/usr/local/sbin/dr-domain-admin-join"
+    local motd="/etc/update-motd.d/99-dr-domain-join"
+
+    mkdir -p /usr/local/sbin
+
+    cat > "$helper" << EOF
+#!/bin/bash
+set -euo pipefail
+
+DOMAIN="$DOMAIN"
+REALM="$REALM"
+SCRIPT_VERSION="$SCRIPT_VERSION"
+
+print_info() { echo "[INFO] \$*"; }
+print_warn() { echo "[WARN] \$*" >&2; }
+print_error() { echo "[ERROR] \$*" >&2; }
+
+echo "=========================================="
+echo "  DR Domain Admin Join Helper"
+echo "  Version \$SCRIPT_VERSION"
+echo "=========================================="
+echo ""
+
+if [ "\$(id -u)" -ne 0 ]; then
+    print_error "Run this helper with sudo:"
+    echo "  sudo /usr/local/sbin/dr-domain-admin-join"
+    exit 1
+fi
+
+current_host="\$(hostnamectl --static 2>/dev/null || hostname)"
+echo "Hostname: \$current_host"
+echo "Domain:   \$DOMAIN"
+echo ""
+
+if realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+    print_warn "This machine already appears joined to a realm."
+    realm list || true
+    echo ""
+    print_info "Validating existing machine account..."
+    if adcli testjoin -D "\$DOMAIN"; then
+        print_info "Join is OK."
+        exit 0
+    fi
+    echo ""
+    print_warn "Existing join is not valid. You may need to leave/rejoin."
+    read -r -p "Attempt to leave and rejoin? [y/N]: " rejoin
+    case "\$rejoin" in
+        y|Y|yes|YES)
+            realm leave "\$DOMAIN" || true
+            rm -f /etc/krb5.keytab
+            rm -rf /var/lib/sss/db/* /var/lib/sss/mc/* 2>/dev/null || true
+            ;;
+        *)
+            exit 1
+            ;;
+    esac
+fi
+
+echo "Enter the domain admin username that has permission to join machines."
+read -r -p "Domain admin username: " admin_user
+
+if [ -z "\$admin_user" ]; then
+    print_error "Domain admin username is required."
+    exit 1
+fi
+
+echo ""
+print_info "Joining \$current_host to \$DOMAIN..."
+realm join -v "\$DOMAIN" -U "\$admin_user"
+
+echo ""
+print_info "Validating machine account with adcli testjoin..."
+if adcli testjoin -D "\$DOMAIN"; then
+    print_info "Join is OK."
+else
+    print_error "Domain join command completed, but machine-account validation failed."
+    print_error "Do not continue with workstation post-join steps until this is resolved."
+    exit 1
+fi
+
+echo ""
+print_info "Restarting SSSD..."
+systemctl enable --now sssd >/dev/null 2>&1 || systemctl restart sssd || true
+
+echo ""
+echo "=========================================="
+echo "  Domain join validated"
+echo "=========================================="
+echo ""
+echo "Return to the local technician and have them rerun:"
+echo '  sudo bash -c "\$(wget -qO- http://ontrack.link/joindomain)"'
+echo ""
+EOF
+
+    chmod 755 "$helper"
+    chown root:root "$helper"
+
+    # SSH/MOTD reminder for domain admins. This is intentionally short and only
+    # appears while the machine is not yet validly joined.
+    mkdir -p /etc/update-motd.d
+    cat > "$motd" << 'EOF'
+#!/bin/sh
+if command -v realm >/dev/null 2>&1 && realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+    if command -v adcli >/dev/null 2>&1 && adcli testjoin -D dr.kodr.local >/dev/null 2>&1; then
+        exit 0
+    fi
+fi
+
+if [ -x /usr/local/sbin/dr-domain-admin-join ]; then
+    echo ""
+    echo "=========================================="
+    echo "  DR Domain Join Pending"
+    echo "=========================================="
+    echo "  Run:"
+    echo "    sudo /usr/local/sbin/dr-domain-admin-join"
+    echo "=========================================="
+    echo ""
+fi
+EOF
+    chmod 755 "$motd"
+    chown root:root "$motd"
+
+    print_info "Installed domain admin join helper: $helper"
+    print_info "Installed SSH login reminder: $motd"
+}
+
 print_domain_admin_join_instructions() {
-    local fqdn ip_list ssh_user first_ip
+    local short_host
+    local fqdn
+    local ip_list
+    local ssh_user
+    local first_ip
+
+    install_domain_admin_join_helper
+
+    short_host="$(hostname -s 2>/dev/null || hostname)"
     fqdn="$(hostname -f 2>/dev/null || hostname)"
     ip_list="$(hostname -I 2>/dev/null | xargs 2>/dev/null || true)"
     ssh_user="${SUDO_USER:-}"
-    [ -z "$ssh_user" ] || [ "$ssh_user" = "root" ] && ssh_user="$(logname 2>/dev/null || whoami)"
+
+    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" = "root" ]; then
+        ssh_user="$(logname 2>/dev/null || whoami)"
+    elif [ -z "$ssh_user" ]; then
+        ssh_user="$(logname 2>/dev/null || whoami)"
+    fi
 
     echo ""
     echo "=========================================="
     echo "  Domain Admin Action Required"
     echo "=========================================="
-    echo "  Hostname: $(hostname)"
-    echo "  Domain:   $DOMAIN"
-    echo "  IP(s):    ${ip_list:-<unable to determine>}"
     echo ""
-    echo "  Domain admin should SSH in and run:"
+    echo "  This machine is prepared but is not joined to:"
+    echo "    $DOMAIN"
+    echo ""
+    echo "  Hostname:"
+    echo "    $short_host"
+    echo ""
+    echo "  Reachable address(es):"
+    if [ -n "$ip_list" ]; then
+        echo "    $ip_list"
+    else
+        echo "    <unable to determine IP address>"
+    fi
+    echo ""
+    echo "  Ask a domain admin to SSH into this machine and run:"
     echo ""
     if [ -n "$ip_list" ]; then
         first_ip="$(echo "$ip_list" | awk '{print $1}')"
@@ -913,10 +1064,14 @@ print_domain_admin_join_instructions() {
     else
         echo "    ssh ${ssh_user}@${fqdn}"
     fi
-    echo "    sudo realm join -v $DOMAIN -U <domain_admin_username>"
-    echo "    sudo adcli testjoin -D $DOMAIN"
+    echo "    sudo /usr/local/sbin/dr-domain-admin-join"
     echo ""
-    echo "  Continue only if testjoin returns: Join is OK"
+    echo "  The same command will also be shown to the admin after SSH login."
+    echo ""
+    echo "  After the helper reports 'Join is OK', rerun this script locally:"
+    echo ""
+    echo '    sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)"'
+    echo ""
     echo "=========================================="
     echo ""
 }
