@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.5.9"
+SCRIPT_VERSION="1.5.12"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -1033,7 +1033,13 @@ ldap_search_computer_object() {
     # Disable reverse-DNS canonicalization for this process. Some lab/DC
     # networks lack matching PTR records, and rdns canonicalization can make
     # GSSAPI request the wrong service principal.
-    KRB5_CONFIG=/tmp/dr-domain-admin-krb5.conf ldapsearch -LLL -Y GSSAPI -N         -H "ldap://\$ldap_dc"         -b "\$base_dn"         "(&(objectClass=computer)(sAMAccountName=\$sam))" dn
+    #
+    # Important: this search must be completely non-interactive. On some
+    # OpenLDAP builds, referrals/SASL chatter can appear to hang at the first
+    # no-match result. -Q suppresses SASL progress output, referrals=false
+    # prevents referral chasing, timeout bounds the query, and </dev/null
+    # guarantees ldapsearch cannot wait for keyboard input.
+    timeout 15s env KRB5_CONFIG=/tmp/dr-domain-admin-krb5.conf         ldapsearch -LLL -Q -Y GSSAPI -N         -o nettimeout=10         -o timelimit=10         -o referrals=false         -H "ldap://\$ldap_dc"         -b "\$base_dn"         -s sub         "(&(objectClass=computer)(sAMAccountName=\$sam))" dn </dev/null
 }
 
 ad_computer_exists() {
@@ -1067,14 +1073,9 @@ ad_computer_exists() {
         return 0
     fi
 
-    # Secondary AD check using adcli. This is not the primary authority because
-    # some adcli show-computer failures are ambiguous, but a positive result
-    # still proves the object exists.
-    if adcli show-computer "\$candidate" -D "\$DOMAIN" >/dev/null 2>&1; then
-        echo "    AD: adcli also found computer object for \$candidate" >&2
-        return 0
-    fi
-
+    # LDAP is the allocator authority. Do not fall back to DNS or adcli here:
+    # adcli show-computer can be ambiguous in this environment, and DNS is not
+    # authoritative for AD computer-object allocation.
     echo "    AD: no computer object found for \$candidate" >&2
     return 1
 }
@@ -2427,12 +2428,18 @@ TOOLS_SERVER="${TOOLS_SERVER}"
 MOUNT_POINT="/mnt/x"
 SHARE="//\${TOOLS_SERVER}/Tools"
 
+# Used by the installer and desktop wrapper to prove sudo can execute this
+# helper without prompting. It must run before any mount side effects.
+if [ "\${1:-}" = "--sudo-self-test" ]; then
+    exit 0
+fi
+
 # If a domain user runs this directly, re-exec through the tightly scoped
 # passwordless sudoers rule installed by the domain-join script. This avoids
 # requiring the user to type sudo while still keeping root limited to this one
 # helper.
 if [ "\$(id -u)" -ne 0 ]; then
-    if ! sudo -n -l /usr/local/bin/mount-kit-tools >/dev/null 2>&1; then
+    if ! sudo -n /usr/local/bin/mount-kit-tools --sudo-self-test >/dev/null 2>&1; then
         echo "This user does not have passwordless permission to run /usr/local/bin/mount-kit-tools." >&2
         echo "Rerun the domain-join script post-join and enter this domain username when prompted." >&2
         exit 1
@@ -2529,7 +2536,10 @@ else
     echo "  Current user: $(id -un)"
     echo "  UID: $(id -u)"
     echo ""
-    echo "  sudo permission check:"
+    echo "  sudo execution check:"
+    sudo -n /usr/local/bin/mount-kit-tools --sudo-self-test 2>&1 || true
+    echo ""
+    echo "  sudo permission listing:"
     sudo -n -l /usr/local/bin/mount-kit-tools 2>&1 || true
     echo ""
     echo "  Kerberos ticket:"
@@ -2552,8 +2562,16 @@ EOF
     # The script prompts once for the optional sudo/domain user in post-join.
     # Use that same short-name identity because SSSD is configured for short names.
     mount_user="${DOMAIN_SUDO_USER:-}"
+    # Remove historical filenames from earlier installer versions before writing
+    # the final late-loading rule. This keeps reruns deterministic.
+    rm -f /etc/sudoers.d/dr_mount_kit_tools /etc/sudoers.d/99-dr_mount_kit_tools
     if [ -n "$mount_user" ] && [ "$mount_user" != "root" ]; then
-        mount_sudoers_file="/etc/sudoers.d/dr_mount_kit_tools"
+        # Must sort late in /etc/sudoers.d. If this user also has a broader
+        # password-required sudo rule, sudo's later matching entry wins.
+        # Prefixing with zz makes this file sort after per-user/domain sudoers files
+        # such as martin_campetta_domain_sudo. In sudoers, later matching entries
+        # can override earlier tags, so this must load last to preserve NOPASSWD.
+        mount_sudoers_file="/etc/sudoers.d/zz-dr_mount_kit_tools"
         cat > "$mount_sudoers_file" << EOF
 # Managed by DR Domain Join
 $mount_user ALL=(root) NOPASSWD: /usr/local/bin/mount-kit-tools
@@ -2561,9 +2579,9 @@ EOF
         chmod 440 "$mount_sudoers_file"
         chown root:root "$mount_sudoers_file"
         if visudo -cf "$mount_sudoers_file" >/dev/null 2>&1; then
-            print_info "Configured passwordless mount permission for $mount_user"
+            print_info "Configured passwordless mount permission for $mount_user using final sudoers rule"
             if getent passwd "$mount_user" >/dev/null 2>&1; then
-                if su - "$mount_user" -c 'sudo -n -l /usr/local/bin/mount-kit-tools >/dev/null 2>&1'; then
+                if su - "$mount_user" -c 'sudo -n /usr/local/bin/mount-kit-tools --sudo-self-test >/dev/null 2>&1'; then
                     print_info "Validated mount helper sudo permission for $mount_user"
                 else
                     print_warning "Could not validate passwordless mount helper permission for $mount_user"
