@@ -42,7 +42,9 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.4.4"
+SCRIPT_VERSION="1.4.5"
+APT_BACKGROUND_GUARD_ACTIVE=0
+APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
 STATE_FILE="$STATE_DIR/state"
 DOMAIN_TARGET_HOSTNAME=""
@@ -178,7 +180,6 @@ wait_for_apt_locks() {
         packagekit.socket
         packagekit-offline-update.service
     )
-    local stopped_units=""
 
     get_lock_holder_pids() {
         local lock
@@ -227,7 +228,6 @@ wait_for_apt_locks() {
     get_lock_holders() {
         local pids
         pids="$(get_lock_holder_pids)"
-
         [ -z "$pids" ] && return 0
 
         local pid
@@ -259,28 +259,29 @@ wait_for_apt_locks() {
     stop_apt_respawn_units() {
         local unit
 
-        print_warning "Stopping apt/unattended-upgrade timers and services so lock holders do not respawn..."
+        print_warning "Pausing apt/unattended-upgrade/PackageKit services for this deployment step..."
 
         for unit in "${apt_units[@]}"; do
             if systemctl list-unit-files "$unit" >/dev/null 2>&1 || systemctl list-units "$unit" >/dev/null 2>&1; then
                 if systemctl is-active --quiet "$unit" 2>/dev/null || systemctl is-enabled --quiet "$unit" 2>/dev/null; then
                     print_info "Stopping $unit"
                     systemctl stop "$unit" >/dev/null 2>&1 || true
-                    stopped_units="$stopped_units $unit"
+                    case " $APT_BACKGROUND_STOPPED_UNITS " in
+                        *" $unit "*) ;;
+                        *) APT_BACKGROUND_STOPPED_UNITS="$APT_BACKGROUND_STOPPED_UNITS $unit" ;;
+                    esac
                 fi
             fi
         done
 
-        # PackageKit can respawn via D-Bus/socket activation. Mask it temporarily
-        # during package installation so packagekitd does not keep retaking locks.
         for unit in packagekit.service packagekit.socket packagekit-offline-update.service; do
             if systemctl list-unit-files "$unit" >/dev/null 2>&1 || systemctl list-units "$unit" >/dev/null 2>&1; then
                 print_warning "Temporarily masking $unit to prevent PackageKit respawn"
                 systemctl stop "$unit" >/dev/null 2>&1 || true
                 systemctl mask "$unit" >/dev/null 2>&1 || true
-                case " $stopped_units " in
+                case " $APT_BACKGROUND_STOPPED_UNITS " in
                     *" $unit "*) ;;
-                    *) stopped_units="$stopped_units $unit" ;;
+                    *) APT_BACKGROUND_STOPPED_UNITS="$APT_BACKGROUND_STOPPED_UNITS $unit" ;;
                 esac
             fi
         done
@@ -289,18 +290,17 @@ wait_for_apt_locks() {
     restore_apt_respawn_units() {
         local unit
 
-        [ -z "$stopped_units" ] && return 0
+        [ -z "$APT_BACKGROUND_STOPPED_UNITS" ] && return 0
 
-        print_info "Restoring apt/PackageKit timers and services that were stopped by this script..."
+        print_info "Restoring apt/PackageKit timers and services that were paused by this script..."
 
-        # Unmask PackageKit components first so enable/start can work again.
         for unit in packagekit.service packagekit.socket packagekit-offline-update.service; do
             if systemctl list-unit-files "$unit" >/dev/null 2>&1 || systemctl list-units "$unit" >/dev/null 2>&1; then
                 systemctl unmask "$unit" >/dev/null 2>&1 || true
             fi
         done
 
-        for unit in $stopped_units; do
+        for unit in $APT_BACKGROUND_STOPPED_UNITS; do
             case "$unit" in
                 apt-daily.timer|apt-daily-upgrade.timer)
                     systemctl enable --now "$unit" >/dev/null 2>&1 || true
@@ -312,29 +312,27 @@ wait_for_apt_locks() {
                     systemctl enable "$unit" >/dev/null 2>&1 || true
                     ;;
                 packagekit-offline-update.service)
-                    # Do not start offline-update manually.
                     systemctl enable "$unit" >/dev/null 2>&1 || true
                     ;;
                 *)
-                    # Do not manually start apt-daily.service or apt-daily-upgrade.service;
-                    # timers will start them normally later.
                     :
                     ;;
             esac
         done
-    }
 
+        APT_BACKGROUND_STOPPED_UNITS=""
+    }
 
     force_clear_apt_locks() {
         local pids
 
         print_warning "Package manager lock has persisted for ${offer_clear_wait} seconds."
         print_warning "This is commonly caused by Ubuntu automatic updates on fresh installs."
-        print_warning "Force-clearing can interrupt updates, but the script will repair dpkg afterward."
+        print_warning "To avoid repeating this delay for every package, the script can pause Ubuntu's background package services until domain-package installation is complete."
         echo ""
         print_warning "Current lock holder(s):"
         get_lock_holders
-        read -r -p "  Stop apt services/timers, terminate lock holder(s), and repair dpkg? [y/N]: " answer
+        read -r -p "  Pause background package services, terminate lock holder(s), and repair dpkg? [y/N]: " answer
 
         case "$answer" in
             y|Y|yes|YES)
@@ -345,13 +343,14 @@ wait_for_apt_locks() {
                 ;;
         esac
 
+        APT_BACKGROUND_GUARD_ACTIVE=1
         stop_apt_respawn_units
         sleep 2
 
         pids="$(get_lock_holder_pids)"
 
         if [ -z "$pids" ]; then
-            print_info "No active apt/dpkg lock holders found after stopping apt services."
+            print_info "No active apt/dpkg lock holders found after pausing background services."
         else
             local pid
             for pid in $pids; do
@@ -375,25 +374,17 @@ wait_for_apt_locks() {
         sleep 2
 
         print_info "Repairing package manager state..."
-        dpkg --configure -a || {
-            restore_apt_respawn_units
-            return 1
-        }
-        apt-get -f install -y || {
-            restore_apt_respawn_units
-            return 1
-        }
+        dpkg --configure -a || return 1
+        apt-get -f install -y || return 1
 
         if apt_locks_held; then
             print_error "Package manager still appears locked after force clear."
             print_error "Remaining holder(s):"
             get_lock_holders
-            restore_apt_respawn_units
             return 1
         fi
 
         print_info "Package manager lock cleared and dpkg state repaired."
-        restore_apt_respawn_units
         return 0
     }
 
@@ -459,7 +450,9 @@ save_state() {
     chmod 755 "$STATE_DIR"
 
     cat > "$STATE_FILE" << EOF
-SCRIPT_VERSION="1.4.4"
+SCRIPT_VERSION="1.4.5"
+APT_BACKGROUND_GUARD_ACTIVE=0
+APT_BACKGROUND_STOPPED_UNITS=""
 STAGE="${1:-UNKNOWN}"
 OFFICE_CODE="${OFFICE_CODE:-}"
 DOMAIN="${DOMAIN:-}"
@@ -861,8 +854,9 @@ $/, ""); print; exit}')
 
 install_domain_packages() {
     print_info "Installing domain packages..."
+    trap 'if [ "$APT_BACKGROUND_GUARD_ACTIVE" -eq 1 ]; then restore_apt_respawn_units; APT_BACKGROUND_GUARD_ACTIVE=0; fi' RETURN
 
-    wait_for_apt_locks
+    wait_for_apt_locks || return 1
     apt-get update -qq
 
     install_package "realmd"
@@ -896,6 +890,11 @@ install_domain_packages() {
         install_package "oddjob-mkhomedir"
     else
         install_package "libpam-mkhomedir"
+    fi
+
+    if [ "$APT_BACKGROUND_GUARD_ACTIVE" -eq 1 ]; then
+        restore_apt_respawn_units
+        APT_BACKGROUND_GUARD_ACTIVE=0
     fi
 }
 
