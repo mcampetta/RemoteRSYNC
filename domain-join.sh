@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.5.12"
+SCRIPT_VERSION="1.5.13"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -1000,29 +1000,41 @@ domain_to_base_dn() {
     }'
 }
 
-discover_ldap_dc() {
-    local srv_line
-    local dc_host=""
+discover_ldap_dcs() {
+    local dc_hosts=""
 
-    # Kerberos/GSSAPI LDAP binds must target a real DC hostname with a valid
-    # ldap/<dc-fqdn> service principal. Binding to the domain alias
-    # ldap://dr.kodr.local can fail with "Server not found in Kerberos database".
+    # Kerberos/GSSAPI LDAP binds must target real DC hostnames with valid
+    # ldap/<dc-fqdn> service principals. Query every discovered DC because AD
+    # replication lag can make one DC falsely report that a recently-created
+    # computer object does not exist.
     if command -v dig >/dev/null 2>&1; then
-        srv_line="\$(dig +short _ldap._tcp.\$DOMAIN SRV 2>/dev/null | sort -n -k1,1 -k2,2 | head -1 || true)"
-        dc_host="\$(echo "\$srv_line" | awk '{print \$4}' | sed 's/[.]\$//')"
+        dc_hosts="\$(dig +short _ldap._tcp.\$DOMAIN SRV 2>/dev/null \
+            | sort -n -k1,1 -k2,2 \
+            | awk '{print \$4}' \
+            | sed 's/[.]\$//' \
+            | awk 'NF && !seen[\$0]++' || true)"
     fi
 
-    if [ -z "\$dc_host" ] && command -v host >/dev/null 2>&1; then
-        srv_line="\$(host -t SRV _ldap._tcp.\$DOMAIN 2>/dev/null | head -1 || true)"
-        dc_host="\$(echo "\$srv_line" | awk '{print \$NF}' | sed 's/[.]\$//')"
+    if [ -z "\$dc_hosts" ] && command -v host >/dev/null 2>&1; then
+        dc_hosts="\$(host -t SRV _ldap._tcp.\$DOMAIN 2>/dev/null \
+            | awk '{print \$NF}' \
+            | sed 's/[.]\$//' \
+            | awk 'NF && !seen[\$0]++' || true)"
     fi
 
-    if [ -z "\$dc_host" ]; then
-        print_error "Unable to discover an LDAP domain controller from _ldap._tcp.\$DOMAIN."
+    if [ -z "\$dc_hosts" ]; then
+        print_error "Unable to discover LDAP domain controllers from _ldap._tcp.\$DOMAIN."
         return 1
     fi
 
-    echo "\$dc_host"
+    echo "\$dc_hosts"
+}
+
+join_dc() {
+    # Use the first reachable DC from the allocator list for join-time validation
+    # attempts. realmd may still choose its own DC internally, so post-join
+    # validation includes retries to allow AD replication to settle.
+    echo "\$LDAP_DCS" | awk 'NF {print; exit}'
 }
 
 ldap_search_computer_object() {
@@ -1048,35 +1060,51 @@ ad_computer_exists() {
     local base_dn
     local output
     local rc
+    local dc
+    local successful_queries=0
+    local failed_queries=0
 
     sam="\$(echo "\$candidate" | tr '[:lower:]' '[:upper:]')\$"
     base_dn="\$(domain_to_base_dn)"
 
-    # Authoritative check: search AD for the computer object's sAMAccountName.
-    # DNS is intentionally not used for allocation because stale/missing DNS
-    # records do not reliably represent AD computer-object state.
-    set +e
-    output="\$(ldap_search_computer_object "\$LDAP_DC" "\$base_dn" "\$sam" 2>&1)"
-    rc=\$?
-    set -e
+    # Authoritative check: search every discovered AD DC for the computer
+    # object's sAMAccountName. A single positive match means the hostname is
+    # occupied. This prevents replication-lag collisions where one DC says
+    # "not found" while another DC already has the object.
+    for dc in \$LDAP_DCS; do
+        set +e
+        output="\$(ldap_search_computer_object "\$dc" "\$base_dn" "\$sam" 2>&1)"
+        rc=\$?
+        set -e
 
-    if [ "\$rc" -ne 0 ]; then
-        print_error "LDAP computer-object query failed while checking \$candidate."
-        echo "\$output" >&2
+        if [ "\$rc" -ne 0 ]; then
+            failed_queries=\$((failed_queries + 1))
+            echo "    AD: query failed on \$dc while checking \$candidate" >&2
+            echo "\$output" | sed 's/^/      /' >&2
+            continue
+        fi
+
+        successful_queries=\$((successful_queries + 1))
+
+        if echo "\$output" | grep -qi '^dn:'; then
+            echo "    AD: computer object exists for \$candidate on \$dc" >&2
+            echo "\$output" | sed 's/^/      /' >&2
+            return 0
+        fi
+    done
+
+    if [ "\$successful_queries" -eq 0 ]; then
+        print_error "LDAP computer-object query failed on every discovered DC while checking \$candidate."
         print_error "Refusing to allocate a hostname when AD cannot be queried authoritatively."
         exit 1
     fi
 
-    if echo "\$output" | grep -qi '^dn:'; then
-        echo "    AD: computer object exists for \$candidate" >&2
-        echo "\$output" | sed 's/^/      /' >&2
-        return 0
+    if [ "\$failed_queries" -gt 0 ]; then
+        print_warn "One or more DCs could not be queried while checking \$candidate."
+        print_warn "Continuing because at least one authoritative LDAP query completed successfully."
     fi
 
-    # LDAP is the allocator authority. Do not fall back to DNS or adcli here:
-    # adcli show-computer can be ambiguous in this environment, and DNS is not
-    # authoritative for AD computer-object allocation.
-    echo "    AD: no computer object found for \$candidate" >&2
+    echo "    AD: no computer object found for \$candidate on any queried DC" >&2
     return 1
 }
 
@@ -1219,12 +1247,14 @@ if ! kinit "\$kerberos_principal"; then
     exit 1
 fi
 
-LDAP_DC="\$(discover_ldap_dc)"
-if [ -z "\$LDAP_DC" ]; then
-    print_error "Cannot query AD authoritatively without a discovered LDAP domain controller."
+LDAP_DCS="\$(discover_ldap_dcs)"
+if [ -z "\$LDAP_DCS" ]; then
+    print_error "Cannot query AD authoritatively without discovered LDAP domain controllers."
     exit 1
 fi
-print_info "Using LDAP domain controller for AD queries: \$LDAP_DC"
+print_info "Using LDAP domain controller(s) for AD queries:"
+echo "\$LDAP_DCS" | sed 's/^/  /'
+JOIN_DC="\$(join_dc)"
 
 cat > /tmp/dr-domain-admin-krb5.conf << KRB5EOF
 [libdefaults]
@@ -1275,6 +1305,14 @@ else
 fi
 
 echo ""
+print_info "Performing final pre-join collision check across discovered DCs..."
+if ad_computer_exists "\$current_host"; then
+    print_error "Hostname \$current_host is no longer available in Active Directory."
+    print_error "Another join may have created this object, or AD replication has caught up."
+    print_error "Rerun this helper to allocate the next managed hostname."
+    exit 1
+fi
+
 print_info "Joining \$current_host to \$DOMAIN..."
 print_info "You may be prompted for the domain admin password again by realmd."
 if ! realm join -v "\$DOMAIN" -U "\$admin_user"; then
@@ -1284,11 +1322,22 @@ fi
 
 echo ""
 print_info "Validating machine account with adcli testjoin..."
-if adcli testjoin -D "\$DOMAIN"; then
+validation_ok=0
+for attempt in 1 2 3 4 5 6; do
+    if adcli testjoin -D "\$DOMAIN"; then
+        validation_ok=1
+        break
+    fi
+    print_warn "Machine-account validation failed on attempt \$attempt; waiting for AD replication/SSSD to settle..."
+    systemctl restart sssd >/dev/null 2>&1 || true
+    sleep 10
+done
+
+if [ "\$validation_ok" -eq 1 ]; then
     print_info "Join is OK."
     save_join_state "DOMAIN_JOIN_COMPLETE" "\$current_host"
 else
-    print_error "Domain join command completed, but machine-account validation failed."
+    print_error "Domain join command completed, but machine-account validation failed after retries."
     print_error "Do not continue with workstation post-join steps until this is resolved."
     save_join_state "DOMAIN_JOIN_FAILED" "\$current_host"
     exit 1
