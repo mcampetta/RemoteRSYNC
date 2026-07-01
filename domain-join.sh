@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.2.2"
+SCRIPT_VERSION="1.3.0"
 set -e  # Exit on error
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -261,16 +261,119 @@ install_package() {
 # Collect all interactive input before the automated steps begin so the
 # remainder of the script can run unattended.
 
+# ── Hostname / AD machine-account preflight ────────────────────────────────
+is_valid_ad_hostname() {
+    local hn="$1"
+    [ "${#hn}" -le 15 ] || return 1
+    echo "$hn" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$' || return 1
+    return 0
+}
+
+suggest_hostname() {
+    local office_lower
+    office_lower="$(echo "${OFFICE_CODE:-kit}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
+    [ -n "$office_lower" ] || office_lower="kit"
+    echo "${office_lower}-kit-test01" | cut -c1-15 | sed 's/-$//'
+}
+
+validate_or_fix_hostname() {
+    local hn
+    hn="$(hostnamectl --static 2>/dev/null || hostname 2>/dev/null || true)"
+
+    if is_valid_ad_hostname "$hn"; then
+        print_info "Hostname is AD-safe: $hn"
+        return 0
+    fi
+
+    echo ""
+    print_warning "Current hostname may break Active Directory/Kerberos joins: $hn"
+    print_warning "Hostnames should be 15 characters or fewer and contain only letters, numbers, and hyphens."
+    print_warning "Long hostnames can be truncated in AD, causing machine-account/keytab failures."
+    echo ""
+
+    local suggested
+    suggested="$(suggest_hostname)"
+
+    echo "  Suggested hostname: $suggested"
+    echo ""
+    read -r -p "  Rename this machine to '$suggested' now? [Y/n]: " answer
+    answer="${answer:-Y}"
+
+    case "$answer" in
+        y|Y|yes|YES)
+            print_info "Setting hostname to $suggested"
+            hostnamectl set-hostname "$suggested"
+            print_warning "A reboot is recommended before the domain admin performs the join."
+            return 0
+            ;;
+        *)
+            print_error "Cannot safely continue with hostname '$hn'."
+            print_error "Please set a 15-character-or-shorter hostname, reboot, and rerun this script."
+            return 1
+            ;;
+    esac
+}
+
+validate_existing_join() {
+    if ! realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+        return 1
+    fi
+
+    print_info "Existing domain membership detected; validating machine account..."
+
+    if ! command -v adcli >/dev/null 2>&1; then
+        print_warning "adcli is not available yet; skipping machine-account validation"
+        return 0
+    fi
+
+    if adcli testjoin -D "$DOMAIN" >/dev/null 2>&1; then
+        print_info "Machine account validation succeeded"
+        return 0
+    fi
+
+    print_error "Machine appears joined, but AD machine-account validation failed."
+    print_error "This commonly occurs after VM snapshot rollback, hostname truncation, or deleted AD computer objects."
+    print_error "Do not continue with post-join configuration until this is fixed."
+    print_error "Recommended cleanup:"
+    print_error "  sudo realm leave $DOMAIN"
+    print_error "  sudo rm -f /etc/krb5.keytab"
+    print_error "  sudo rm -rf /var/lib/sss/db/* /var/lib/sss/mc/*"
+    print_error "Then ensure the hostname is AD-safe and rejoin the domain."
+    return 1
+}
+
+print_machine_status() {
+    echo ""
+    echo "=========================================="
+    echo "  Machine Status"
+    echo "=========================================="
+    echo "  Hostname: $(hostnamectl --static 2>/dev/null || hostname)"
+    echo "  Domain:   $DOMAIN"
+    if realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+        echo "  Realm:    Joined"
+        if command -v adcli >/dev/null 2>&1 && adcli testjoin -D "$DOMAIN" >/dev/null 2>&1; then
+            echo "  Machine Account: VALID"
+        else
+            echo "  Machine Account: NOT VALIDATED"
+        fi
+    else
+        echo "  Realm:    Not joined"
+        echo "  Machine Account: Not present"
+    fi
+    echo "=========================================="
+    echo ""
+}
+
 prompt_sudo_user() {
     echo ""
     echo "  Optionally grant sudo access to a domain user on this machine."
     echo "  Enter the short account name only (e.g. jsmith — not jsmith@$DOMAIN)."
     echo "  Leave blank to skip — sudo access can be added manually later."
     echo ""
-    read -r -p "  Domain username for sudo access (or press Enter to skip): " SUDO_USER
+    read -r -p "  Domain username for sudo access (or press Enter to skip): " DOMAIN_SUDO_USER
 
     # Strip any domain suffix if accidentally included
-    SUDO_USER="${SUDO_USER%%@*}"
+    DOMAIN_SUDO_USER="${DOMAIN_SUDO_USER%%@*}"
 }
 
 # ── Install domain packages ───────────────────────────────────────────────────
@@ -1296,7 +1399,7 @@ EOF
     #
     # The script prompts once for the optional sudo/domain user in post-join.
     # Use that same short-name identity because SSSD is configured for short names.
-    mount_user="${SUDO_USER:-}"
+    mount_user="${DOMAIN_SUDO_USER:-}"
     if [ -n "$mount_user" ] && [ "$mount_user" != "root" ]; then
         mount_sudoers_file="/etc/sudoers.d/dr_mount_kit_tools"
         cat > "$mount_sudoers_file" << EOF
@@ -1506,7 +1609,7 @@ configure_dns_search_domains() {
 # usernames contain dots (e.g. lyle.bergman), the filename uses underscores instead.
 
 configure_sudoers() {
-    if [ -z "$SUDO_USER" ]; then
+    if [ -z "$DOMAIN_SUDO_USER" ]; then
         print_info "No sudo user specified — skipping sudoers configuration"
         return 0
     fi
@@ -1514,9 +1617,9 @@ configure_sudoers() {
     # SSSD is configured for short-name logins (use_fully_qualified_names = False),
     # and realm list reports login-formats: %U. Sudo must therefore match the
     # resolved local identity (e.g. martin.campetta), not user@domain.
-    local sudo_identity="$SUDO_USER"
+    local sudo_identity="$DOMAIN_SUDO_USER"
     # Replace dots with underscores in the filename — sudo ignores files with dots in the name
-    local safe_name="${SUDO_USER//./_}"
+    local safe_name="${DOMAIN_SUDO_USER//./_}"
     local sudoers_file="/etc/sudoers.d/${safe_name}_domain_sudo"
     local desired_entry="${sudo_identity} ALL=(ALL:ALL) ALL"
 
@@ -1807,6 +1910,8 @@ main() {
     echo ""
 
     parse_args "$@"
+print_machine_status
+validate_or_fix_hostname || exit 1
 
     # --- Checks and upfront prompts (interactive) ---
     check_privileges
@@ -1815,6 +1920,7 @@ main() {
 
     # --- Summary ---
     if realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+    validate_existing_join || exit 1
         echo "  This machine is already joined to $DOMAIN."
         echo "  This run will complete all remaining post-join configuration."
         echo "  You will be prompted once during the run to optionally grant"
@@ -1897,8 +2003,8 @@ main() {
         echo "    Mount DR Tools"
         echo "  After domain login, /mnt/x should mount automatically. If needed, use the Mount DR Tools desktop icon."
         echo ""
-        if [ -n "$SUDO_USER" ]; then
-            echo "  Sudo access has been granted to: ${SUDO_USER}"
+        if [ -n "$DOMAIN_SUDO_USER" ]; then
+            echo "  Sudo access has been granted to: ${DOMAIN_SUDO_USER}"
             echo ""
         fi
         if [ "$DISPLAY_MANAGER_RUNNING" = "true" ]; then
