@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.2"
 set -e  # Exit on error
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -149,43 +149,85 @@ is_package_installed() {
 
 
 wait_for_apt_locks() {
-    # Fresh installs may have apt-daily/unattended apt already running.
-    # Wait for those locks instead of failing the domain-join run.
-    local timeout=600
     local waited=0
-    local lock_files="/var/lib/apt/lists/lock /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock"
+    local interval=10
+    local max_wait=600
+    local lock_files=(
+        /var/lib/dpkg/lock-frontend
+        /var/lib/dpkg/lock
+        /var/lib/apt/lists/lock
+        /var/cache/apt/archives/lock
+    )
 
-    while true; do
-        local locked=false
+    get_lock_holders() {
+        local lock
+        local holders=""
 
-        if command -v fuser >/dev/null 2>&1; then
-            if fuser $lock_files >/dev/null 2>&1; then
-                locked=true
+        for lock in "${lock_files[@]}"; do
+            [ -e "$lock" ] || continue
+
+            if command -v fuser >/dev/null 2>&1; then
+                local pids
+                pids=$(fuser "$lock" 2>/dev/null | xargs 2>/dev/null || true)
+                if [ -n "$pids" ]; then
+                    local pid
+                    for pid in $pids; do
+                        local cmd
+                        local args
+                        cmd=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+                        args=$(ps -p "$pid" -o args= 2>/dev/null || true)
+                        holders="${holders}\n    PID $pid (${cmd:-unknown}): ${args:-unknown} [lock: $lock]"
+                    done
+                fi
+            elif command -v lsof >/dev/null 2>&1; then
+                local lines
+                lines=$(lsof "$lock" 2>/dev/null | awk 'NR>1 {print "    PID "$2" ("$1"): "$0" [lock: " lock "]"}' lock="$lock" || true)
+                [ -n "$lines" ] && holders="${holders}\n$lines"
             fi
-        elif pgrep -x apt >/dev/null 2>&1 || \
-             pgrep -x apt-get >/dev/null 2>&1 || \
-             pgrep -x dpkg >/dev/null 2>&1 || \
-             pgrep -x unattended-upgrade >/dev/null 2>&1; then
-            locked=true
+        done
+
+        if [ -z "$holders" ]; then
+            local proc_lines
+            proc_lines=$(ps -eo pid=,comm=,args= | awk '/apt|apt-get|dpkg|unattended-upgrade|packagekit/ && !/awk/ {print "    PID "$1" ("$2"): "$0}' || true)
+            [ -n "$proc_lines" ] && holders="\n$proc_lines"
         fi
 
-        if [ "$locked" = false ]; then
-            return 0
-        fi
+        printf "%b" "$holders"
+    }
 
-        if [ "$waited" -eq 0 ]; then
-            print_warning "Another apt/dpkg process is running — waiting for package manager locks"
-        fi
+    apt_locks_held() {
+        local holders
+        holders=$(get_lock_holders)
+        [ -n "$holders" ]
+    }
 
-        if [ "$waited" -ge "$timeout" ]; then
-            print_error "Timed out waiting for apt/dpkg locks after ${timeout}s"
-            print_error "Check running package processes with: ps -ef | grep -E 'apt|dpkg'"
+    if apt_locks_held; then
+        print_info "Ubuntu package manager is currently busy; waiting for apt/dpkg locks..."
+        print_info "Current lock holder(s):"
+        get_lock_holders
+    fi
+
+    while apt_locks_held; do
+        if [ "$waited" -ge "$max_wait" ]; then
+            print_error "Timed out waiting for apt/dpkg locks after ${max_wait} seconds"
+            print_error "Remaining lock holder(s):"
+            get_lock_holders
             return 1
         fi
 
-        sleep 5
-        waited=$((waited + 5))
+        sleep "$interval"
+        waited=$((waited + interval))
+
+        print_info "Still waiting for apt/dpkg locks... (${waited}s elapsed)"
+        print_info "Current lock holder(s):"
+        get_lock_holders
     done
+
+    if [ "$waited" -gt 0 ]; then
+        print_info "Package manager locks released after ${waited} seconds"
+    fi
+
+    return 0
 }
 
 install_package() {
@@ -1193,6 +1235,14 @@ TOOLS_SERVER="${TOOLS_SERVER}"
 MOUNT_POINT="/mnt/x"
 SHARE="//\${TOOLS_SERVER}/Tools"
 
+# If a domain user runs this directly, re-exec through the tightly scoped
+# passwordless sudoers rule installed by the domain-join script. This avoids
+# requiring the user to type sudo while still keeping root limited to this one
+# helper.
+if [ "\$(id -u)" -ne 0 ]; then
+    exec sudo -n /usr/local/bin/mount-kit-tools
+fi
+
 # Determine the logged-in domain user whose Kerberos ticket should be used.
 # sudo sets SUDO_UID; pkexec sets PKEXEC_UID. Fall back to the current UID for
 # direct execution.
@@ -1236,7 +1286,7 @@ if mountpoint -q /mnt/x; then
     exit 0
 fi
 
-exec sudo -n /usr/local/bin/mount-kit-tools
+exec /usr/local/bin/mount-kit-tools
 EOF
     chmod +x /usr/local/bin/mount-kit-tools-desktop
 
@@ -1246,7 +1296,7 @@ EOF
     #
     # The script prompts once for the optional sudo/domain user in post-join.
     # Use that same short-name identity because SSSD is configured for short names.
-    mount_user="${DOMAIN_SUDO_USER:-${SUDO_USER:-}}"
+    mount_user="${SUDO_USER:-}"
     if [ -n "$mount_user" ] && [ "$mount_user" != "root" ]; then
         mount_sudoers_file="/etc/sudoers.d/dr_mount_kit_tools"
         cat > "$mount_sudoers_file" << EOF
