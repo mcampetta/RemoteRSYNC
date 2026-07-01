@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.2"
 STATE_DIR="/var/lib/dr-domain-join"
 STATE_FILE="$STATE_DIR/state"
 DOMAIN_TARGET_HOSTNAME=""
@@ -164,6 +164,15 @@ wait_for_apt_locks() {
         /var/lib/apt/lists/lock
         /var/cache/apt/archives/lock
     )
+    local apt_units=(
+        apt-daily.timer
+        apt-daily-upgrade.timer
+        apt-daily.service
+        apt-daily-upgrade.service
+        unattended-upgrades.service
+        packagekit.service
+    )
+    local stopped_units=""
 
     get_lock_holder_pids() {
         local lock
@@ -181,7 +190,6 @@ wait_for_apt_locks() {
             fi
         done
 
-        # Fallback when fuser identifies no lock owner but apt/dpkg appears active.
         if [ -z "$(echo "$all_pids" | xargs 2>/dev/null)" ]; then
             ps -eo pid=,comm=,args= | awk '/apt|apt-get|dpkg|unattended-upgrade|packagekit/ && !/awk/ {print $1}' | xargs 2>/dev/null || true
         else
@@ -199,14 +207,17 @@ wait_for_apt_locks() {
 
         local pid
         for pid in $pids; do
-            local cmd args elapsed
+            local cmd args elapsed ppid parent
             cmd=$(ps -p "$pid" -o comm= 2>/dev/null || true)
             args=$(ps -p "$pid" -o args= 2>/dev/null || true)
             elapsed=$(ps -p "$pid" -o etimes= 2>/dev/null | xargs 2>/dev/null || true)
+            ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | xargs 2>/dev/null || true)
+            parent=""
+            [ -n "$ppid" ] && parent=$(ps -p "$ppid" -o comm= 2>/dev/null || true)
 
             [ -n "$cmd$args" ] || continue
 
-            echo "    PID $pid (${cmd:-unknown}, ${elapsed:-?}s): ${args:-unknown}"
+            echo "    PID $pid (${cmd:-unknown}, ${elapsed:-?}s, parent: ${parent:-unknown}/$ppid): ${args:-unknown}"
         done
     }
 
@@ -214,14 +225,51 @@ wait_for_apt_locks() {
         [ -n "$(get_lock_holder_pids)" ]
     }
 
+    stop_apt_respawn_units() {
+        local unit
+
+        print_warning "Stopping apt/unattended-upgrade timers and services so lock holders do not respawn..."
+
+        for unit in "${apt_units[@]}"; do
+            if systemctl list-unit-files "$unit" >/dev/null 2>&1 || systemctl list-units "$unit" >/dev/null 2>&1; then
+                if systemctl is-active --quiet "$unit" 2>/dev/null || systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+                    print_info "Stopping $unit"
+                    systemctl stop "$unit" >/dev/null 2>&1 || true
+                    stopped_units="$stopped_units $unit"
+                fi
+            fi
+        done
+    }
+
+    restore_apt_respawn_units() {
+        local unit
+
+        [ -n "$stopped_units" ] || return 0
+
+        print_info "Re-enabling apt timers/services that were stopped by this script..."
+
+        for unit in $stopped_units; do
+            case "$unit" in
+                *.timer)
+                    systemctl enable --now "$unit" >/dev/null 2>&1 || true
+                    ;;
+                unattended-upgrades.service)
+                    systemctl enable "$unit" >/dev/null 2>&1 || true
+                    ;;
+                packagekit.service)
+                    systemctl enable "$unit" >/dev/null 2>&1 || true
+                    ;;
+                *)
+                    # Do not manually start apt-daily.service or apt-daily-upgrade.service;
+                    # timers will start them normally later.
+                    :
+                    ;;
+            esac
+        done
+    }
+
     force_clear_apt_locks() {
         local pids
-        pids="$(get_lock_holder_pids)"
-
-        if [ -z "$pids" ]; then
-            print_info "No active apt/dpkg lock holders found."
-            return 0
-        fi
 
         print_warning "Force-clearing apt/dpkg locks can interrupt Ubuntu updates."
         print_warning "Only continue if the listed process is clearly stuck or blocking deployment."
@@ -229,7 +277,7 @@ wait_for_apt_locks() {
         print_warning "Current lock holder(s):"
         get_lock_holders
         echo ""
-        read -r -p "  Stop these package-manager process(es) and repair dpkg? [y/N]: " answer
+        read -r -p "  Stop apt services/timers, terminate lock holder(s), and repair dpkg? [y/N]: " answer
 
         case "$answer" in
             y|Y|yes|YES)
@@ -240,37 +288,55 @@ wait_for_apt_locks() {
                 ;;
         esac
 
-        local pid
-        for pid in $pids; do
-            if kill -0 "$pid" 2>/dev/null; then
-                print_warning "Requesting process $pid to stop..."
-                kill "$pid" 2>/dev/null || true
-            fi
-        done
+        stop_apt_respawn_units
+        sleep 2
 
-        sleep 5
+        pids="$(get_lock_holder_pids)"
 
-        for pid in $pids; do
-            if kill -0 "$pid" 2>/dev/null; then
-                print_warning "Process $pid did not stop; sending SIGKILL..."
-                kill -9 "$pid" 2>/dev/null || true
-            fi
-        done
+        if [ -z "$pids" ]; then
+            print_info "No active apt/dpkg lock holders found after stopping apt services."
+        else
+            local pid
+            for pid in $pids; do
+                if kill -0 "$pid" 2>/dev/null; then
+                    print_warning "Requesting process $pid to stop..."
+                    kill "$pid" 2>/dev/null || true
+                fi
+            done
+
+            sleep 5
+
+            pids="$(get_lock_holder_pids)"
+            for pid in $pids; do
+                if kill -0 "$pid" 2>/dev/null; then
+                    print_warning "Process $pid did not stop; sending SIGKILL..."
+                    kill -9 "$pid" 2>/dev/null || true
+                fi
+            done
+        fi
 
         sleep 2
 
         print_info "Repairing package manager state..."
-        dpkg --configure -a || return 1
-        apt-get -f install -y || return 1
+        dpkg --configure -a || {
+            restore_apt_respawn_units
+            return 1
+        }
+        apt-get -f install -y || {
+            restore_apt_respawn_units
+            return 1
+        }
 
         if apt_locks_held; then
             print_error "Package manager still appears locked after force clear."
             print_error "Remaining holder(s):"
             get_lock_holders
+            restore_apt_respawn_units
             return 1
         fi
 
         print_info "Package manager lock cleared and dpkg state repaired."
+        restore_apt_respawn_units
         return 0
     }
 
@@ -340,7 +406,7 @@ save_state() {
     chmod 755 "$STATE_DIR"
 
     cat > "$STATE_FILE" << EOF
-SCRIPT_VERSION="$SCRIPT_VERSION"
+SCRIPT_VERSION="1.4.2"
 STAGE="${1:-UNKNOWN}"
 OFFICE_CODE="${OFFICE_CODE:-}"
 DOMAIN="${DOMAIN:-}"
