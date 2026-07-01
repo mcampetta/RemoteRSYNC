@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.5.2"
+SCRIPT_VERSION="1.5.3"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -450,7 +450,7 @@ save_state() {
     chmod 755 "$STATE_DIR"
 
     cat > "$STATE_FILE" << EOF
-SCRIPT_VERSION="1.5.2"
+SCRIPT_VERSION="1.5.3"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STAGE="${1:-UNKNOWN}"
@@ -654,28 +654,33 @@ prompt_for_ad_hostname() {
     prefix="$(office_hostname_prefix)"
 
     echo "  Hostname prefix: $prefix"
-    echo "  Managed names are assigned sequentially and checked for DNS/AD collisions."
+    echo "  Managed names are assigned sequentially."
+    echo ""
+    echo "  Important:"
+    echo "    Final AD collision checking happens in the domain-admin helper."
+    echo "    The local pre-join script cannot reliably see all AD computer objects."
     echo ""
 
-    local suggested_available=""
-    if suggested_available="$(find_next_available_hostname "$prefix" 99)"; then
-        echo "  Suggested next available hostname:"
-        echo "    $suggested_available"
-        echo ""
-        read -r -p "  Use this hostname? [Y/n]: " use_suggested
-        use_suggested="${use_suggested:-Y}"
+    local suggested
+    suggested="$(suggest_hostname "$prefix" "01")"
 
-        case "$use_suggested" in
-            y|Y|yes|YES)
-                DOMAIN_TARGET_HOSTNAME="$suggested_available"
-                return 0
-                ;;
-        esac
-    else
-        print_warning "No available hostname found from ${prefix}-01 through ${prefix}-99."
-        print_warning "Manual hostname entry is required."
-        echo ""
-    fi
+    echo "  Suggested starting hostname:"
+    echo "    $suggested"
+    echo ""
+    echo "  You may accept this as a temporary local hostname, or enter a different"
+    echo "  workstation number/hostname. The domain admin helper will validate AD"
+    echo "  and may adjust the hostname before joining."
+    echo ""
+
+    read -r -p "  Use this starting hostname? [Y/n]: " use_suggested
+    use_suggested="${use_suggested:-Y}"
+
+    case "$use_suggested" in
+        y|Y|yes|YES)
+            DOMAIN_TARGET_HOSTNAME="$suggested"
+            return 0
+            ;;
+    esac
 
     echo "  Enter a workstation number or a full hostname."
     echo "  Examples:"
@@ -702,29 +707,12 @@ prompt_for_ad_hostname() {
             continue
         fi
 
-        if hostname_candidate_exists "$proposed"; then
-            print_warning "Hostname '$proposed' appears to already exist in DNS or Active Directory."
-            read -r -p "  Choose a different hostname? [Y/n]: " choose_different
-            choose_different="${choose_different:-Y}"
-            case "$choose_different" in
-                n|N|no|NO)
-                    read -r -p "  Override and use '$proposed' anyway? [y/N]: " override
-                    case "$override" in
-                        y|Y|yes|YES)
-                            DOMAIN_TARGET_HOSTNAME="$proposed"
-                            return 0
-                            ;;
-                    esac
-                    ;;
-            esac
-            continue
-        fi
-
         echo ""
         echo "------------------------------------------"
-        echo "  Proposed hostname: $proposed"
+        echo "  Proposed starting hostname: $proposed"
         echo "------------------------------------------"
-        read -r -p "  Use this hostname? [Y/n]: " confirm
+        echo "  AD collision checking will be performed by the domain-admin helper."
+        read -r -p "  Use this starting hostname? [Y/n]: " confirm
         confirm="${confirm:-Y}"
 
         case "$confirm" in
@@ -738,39 +726,6 @@ prompt_for_ad_hostname() {
                 ;;
         esac
     done
-}
-
-hostname_matches_managed_policy() {
-    local hn="$1"
-    local prefix
-    prefix="$(office_hostname_prefix)"
-    echo "$hn" | grep -Eq "^${prefix}-[0-9]{2}$"
-}
-
-verify_hostname_applied() {
-    local expected="$1"
-    local static_hn
-    local runtime_hn
-
-    static_hn="$(hostnamectl --static 2>/dev/null || true)"
-    runtime_hn="$(hostname 2>/dev/null || true)"
-
-    if [ "$static_hn" = "$expected" ] && [ "$runtime_hn" = "$expected" ]; then
-        print_info "Hostname verified: $expected"
-        return 0
-    fi
-
-    print_error "Hostname verification failed."
-    print_error "Expected: $expected"
-    print_error "hostnamectl --static: ${static_hn:-<empty>}"
-    print_error "hostname: ${runtime_hn:-<empty>}"
-    return 1
-}
-
-machine_has_domain_identity() {
-    realm list 2>/dev/null | grep -q "configured: kerberos-member" && return 0
-    [ -s /etc/krb5.keytab ] && return 0
-    return 1
 }
 
 validate_or_fix_hostname() {
@@ -903,11 +858,115 @@ set -euo pipefail
 
 DOMAIN="$DOMAIN"
 REALM="$REALM"
+OFFICE_CODE="${OFFICE_CODE:-EP1}"
 SCRIPT_VERSION="$SCRIPT_VERSION"
 
 print_info() { echo "[INFO] \$*"; }
 print_warn() { echo "[WARN] \$*" >&2; }
 print_error() { echo "[ERROR] \$*" >&2; }
+
+office_hostname_prefix() {
+    case "\$(echo "\${OFFICE_CODE:-}" | tr '[:lower:]' '[:upper:]')" in
+        EP|EP1) echo "ep-cr-kit" ;;
+        MSP) echo "msp-cr-kit" ;;
+        CHI) echo "chi-cr-kit" ;;
+        ATL) echo "atl-cr-kit" ;;
+        LON|UK|UK1) echo "lon-cr-kit" ;;
+        DE|DE1) echo "de-cr-kit" ;;
+        *)
+            local office_lower
+            office_lower="\$(echo "\${OFFICE_CODE:-kit}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
+            [ -n "\$office_lower" ] || office_lower="kit"
+            echo "\${office_lower}-cr-kit" | cut -c1-12 | sed 's/-\$//'
+            ;;
+    esac
+}
+
+is_valid_ad_hostname() {
+    local hn="\$1"
+    [ "\${#hn}" -le 15 ] || return 1
+    echo "\$hn" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\$' || return 1
+    return 0
+}
+
+suggest_hostname() {
+    local prefix="\$1"
+    local number="\$2"
+    number="\$(echo "\$number" | tr -cd '0-9')"
+    [ -n "\$number" ] || number="01"
+    if [ "\${#number}" -eq 1 ]; then
+        number="0\${number}"
+    fi
+    echo "\${prefix}-\${number}"
+}
+
+ad_computer_exists() {
+    local candidate="\$1"
+    local admin_user="\$2"
+
+    # Authoritative AD check. This may prompt for the admin password.
+    if adcli show-computer "\$candidate" -D "\$DOMAIN" -U "\$admin_user" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # DNS is secondary only; AD object presence is the real source of truth.
+    if getent hosts "\${candidate}.\${DOMAIN}" >/dev/null 2>&1 || getent hosts "\$candidate" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    return 1
+}
+
+find_next_available_ad_hostname() {
+    local admin_user="\$1"
+    local prefix
+    local n
+    local candidate
+
+    prefix="\$(office_hostname_prefix)"
+
+    for n in \$(seq 1 99); do
+        candidate="\$(suggest_hostname "\$prefix" "\$n")"
+        is_valid_ad_hostname "\$candidate" || continue
+        echo "  checking \$candidate..." >&2
+        if ! ad_computer_exists "\$candidate" "\$admin_user"; then
+            echo "\$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+update_hosts_for_hostname_admin() {
+    local new_hostname="\$1"
+    local hosts_file="/etc/hosts"
+    local tmp_file
+
+    touch "\$hosts_file"
+    cp "\$hosts_file" "\${hosts_file}.dr-domain-admin-join.bak.\$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+
+    tmp_file="\$(mktemp)"
+    awk -v hn="\$new_hostname" '
+        BEGIN { replaced=0 }
+        /^127[.]0[.]1[.]1[[:space:]]+/ {
+            if (!replaced) {
+                print "127.0.1.1    " hn
+                replaced=1
+            }
+            next
+        }
+        { print }
+        END {
+            if (!replaced) {
+                print "127.0.1.1    " hn
+            }
+        }
+    ' "\$hosts_file" > "\$tmp_file"
+
+    cat "\$tmp_file" > "\$hosts_file"
+    rm -f "\$tmp_file"
+}
 
 echo "=========================================="
 echo "  DR Domain Admin Join Helper"
@@ -922,8 +981,9 @@ if [ "\$(id -u)" -ne 0 ]; then
 fi
 
 current_host="\$(hostnamectl --static 2>/dev/null || hostname)"
-echo "Hostname: \$current_host"
-echo "Domain:   \$DOMAIN"
+echo "Current hostname: \$current_host"
+echo "Domain:           \$DOMAIN"
+echo "Office code:      \$OFFICE_CODE"
 echo ""
 
 if realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
@@ -956,6 +1016,37 @@ read -r -p "Domain admin username: " admin_user
 if [ -z "\$admin_user" ]; then
     print_error "Domain admin username is required."
     exit 1
+fi
+
+echo ""
+print_info "Querying Active Directory for the next available managed hostname..."
+next_host=""
+
+if next_host="\$(find_next_available_ad_hostname "\$admin_user")"; then
+    print_info "Next available AD hostname appears to be: \$next_host"
+else
+    print_error "No available managed hostname found from 01 through 99."
+    exit 1
+fi
+
+if [ "\$current_host" != "\$next_host" ]; then
+    echo ""
+    print_warn "Current hostname:      \$current_host"
+    print_warn "AD-available hostname: \$next_host"
+    read -r -p "Rename this machine to \$next_host before joining? [Y/n]: " rename_answer
+    rename_answer="\${rename_answer:-Y}"
+    case "\$rename_answer" in
+        y|Y|yes|YES)
+            hostnamectl set-hostname "\$next_host"
+            update_hosts_for_hostname_admin "\$next_host"
+            current_host="\$next_host"
+            print_info "Hostname updated to \$current_host"
+            ;;
+        *)
+            print_error "Refusing to join with a hostname that was not allocated from AD."
+            exit 1
+            ;;
+    esac
 fi
 
 echo ""
