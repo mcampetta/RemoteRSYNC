@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.5.6"
+SCRIPT_VERSION="1.5.7"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -158,11 +158,34 @@ is_package_installed() {
 
 wait_for_apt_locks() {
     local waited=0
-    local interval=10
-    local quiet_wait=30
-    local pid_detail_wait=60
-    local offer_clear_wait=120
+    local interval="${APT_LOCK_POLL_INTERVAL:-10}"
+    local quiet_wait="${APT_LOCK_QUIET_WAIT:-30}"
+    local pid_detail_wait="${APT_LOCK_PID_WAIT:-60}"
+    local offer_clear_wait="${APT_LOCK_OVERRIDE_WAIT:-120}"
     local showed_update_msg=0
+
+    # Test/development override support:
+    #   sudo APT_LOCK_OVERRIDE_WAIT=10 bash -c "$(wget -qO- http://ontrack.link/joindomain)"
+    # Production remains unchanged unless these environment variables are set.
+    case "$interval:$quiet_wait:$pid_detail_wait:$offer_clear_wait" in
+        *[!0-9:]*|:*|*::*)
+            print_warning "Invalid apt lock timing override detected; using production defaults."
+            interval=10
+            quiet_wait=30
+            pid_detail_wait=60
+            offer_clear_wait=120
+            ;;
+    esac
+
+    # Keep thresholds coherent when a short override is used for testing.
+    # Example: APT_LOCK_OVERRIDE_WAIT=10 should offer the user override at 10s,
+    # not wait for the normal 30s/60s informational thresholds first.
+    if [ "$offer_clear_wait" -lt "$quiet_wait" ]; then
+        quiet_wait="$offer_clear_wait"
+    fi
+    if [ "$offer_clear_wait" -lt "$pid_detail_wait" ]; then
+        pid_detail_wait="$offer_clear_wait"
+    fi
 
     local lock_files=(
         /var/lib/dpkg/lock-frontend
