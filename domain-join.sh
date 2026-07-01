@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.5.13"
+SCRIPT_VERSION="1.6.1"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -62,6 +62,9 @@ WINS_SERVER="10.40.249.101"
 DNS_SEARCH="dr.kodr.local,corp.altegrity.com,corp.eddom.org,corp.kroll.com,ontrack.com,ccp.edp.local"
 DNS_TEST_ONLY=false
 KIT_PROCESS_PATTERN="${KIT_PROCESS_PATTERN:-KIT}"
+KIT_INSTALLER_PATH="${KIT_INSTALLER_PATH:-/mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/KIT-installer-modified.sh}"
+BRAND_WALLPAPER_SOURCE="${BRAND_WALLPAPER_SOURCE:-}"
+BRAND_WALLPAPER_DEST="/usr/share/backgrounds/dr-company-wallpaper"
 OFFICE_CODE=""
 TOOLS_SERVER=""
 CONFIG_FILE="/etc/domain-join.conf"
@@ -2578,6 +2581,18 @@ if [ "$status" -eq 0 ]; then
     echo "DR Tools mounted successfully at /mnt/x"
     echo ""
     ls -la /mnt/x 2>/dev/null || true
+    echo ""
+    if [ -x /usr/local/sbin/dr-post-mount-provision ]; then
+        echo "Running post-mount provisioning: KIT installer and company branding..."
+        if sudo -n /usr/local/sbin/dr-post-mount-provision; then
+            echo "Post-mount provisioning completed."
+        else
+            pm_status=$?
+            echo "Post-mount provisioning failed with exit code $pm_status."
+            echo "See /var/log/dr-post-mount-provision.log for details."
+            status=$pm_status
+        fi
+    fi
 else
     echo "Mount failed with exit code $status"
     echo ""
@@ -2646,6 +2661,8 @@ EOF
     else
         print_warning "No domain user available for passwordless mount helper rule"
     fi
+
+    install_post_mount_provision_helper
 
     cat > /usr/local/bin/umount-kit-tools << 'EOF'
 #!/bin/bash
@@ -2780,11 +2797,223 @@ EOF
         print_info "Attempting to mount KIT tools share at /mnt/x..."
         if /usr/local/bin/mount-kit-tools; then
             print_info "KIT tools share mounted at /mnt/x"
+            if [ -x /usr/local/sbin/dr-post-mount-provision ]; then
+                print_info "Running post-mount provisioning: KIT installer and company branding..."
+                if /usr/local/sbin/dr-post-mount-provision; then
+                    print_info "Post-mount provisioning completed"
+                else
+                    print_warning "Post-mount provisioning failed; see /var/log/dr-post-mount-provision.log"
+                fi
+            fi
         else
             print_warning "KIT tools share was not mounted automatically"
             print_warning "Log in as a domain user and run: mount-kit-tools"
         fi
     fi
+
+
+install_post_mount_provision_helper() {
+    print_info "Installing post-mount provisioning helper for KIT installer and workstation branding..."
+
+    cat > /usr/local/sbin/dr-post-mount-provision << EOF
+#!/bin/bash
+set -euo pipefail
+
+KIT_INSTALLER_PATH="${KIT_INSTALLER_PATH}"
+BRAND_WALLPAPER_SOURCE="${BRAND_WALLPAPER_SOURCE}"
+BRAND_WALLPAPER_DEST="${BRAND_WALLPAPER_DEST}"
+STATE_DIR="${STATE_DIR}"
+LOG_FILE="/var/log/dr-post-mount-provision.log"
+
+log() {
+    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$*" | tee -a "\$LOG_FILE"
+}
+
+state_mark() {
+    mkdir -p "\$STATE_DIR"
+    touch "\$STATE_DIR/\$1"
+}
+
+state_has() {
+    [ -f "\$STATE_DIR/\$1" ]
+}
+
+if [ "\${1:-}" = "--sudo-self-test" ]; then
+    exit 0
+fi
+
+if [ "\$(id -u)" -ne 0 ]; then
+    exec sudo -n /usr/local/sbin/dr-post-mount-provision "\$@"
+fi
+
+mkdir -p "\$STATE_DIR"
+touch "\$LOG_FILE"
+chmod 644 "\$LOG_FILE" 2>/dev/null || true
+
+if ! mountpoint -q /mnt/x; then
+    log "DR Tools share is not mounted at /mnt/x; skipping post-mount provisioning."
+    exit 0
+fi
+
+install_kit() {
+    if state_has "KIT_INSTALL_COMPLETE"; then
+        log "KIT installer already marked complete; skipping."
+        return 0
+    fi
+
+    if [ ! -f "\$KIT_INSTALLER_PATH" ]; then
+        log "KIT installer not found: \$KIT_INSTALLER_PATH"
+        log "Skipping KIT install; rerun after the installer is available on /mnt/x."
+        return 0
+    fi
+
+    log "Starting KIT installer: \$KIT_INSTALLER_PATH"
+    if bash "\$KIT_INSTALLER_PATH" >> "\$LOG_FILE" 2>&1; then
+        state_mark "KIT_INSTALL_COMPLETE"
+        log "KIT installer completed successfully."
+    else
+        rc=\$?
+        log "KIT installer failed with exit code \$rc."
+        exit "\$rc"
+    fi
+}
+
+find_wallpaper_source() {
+    if [ -n "\$BRAND_WALLPAPER_SOURCE" ] && [ -f "\$BRAND_WALLPAPER_SOURCE" ]; then
+        echo "\$BRAND_WALLPAPER_SOURCE"
+        return 0
+    fi
+
+    for candidate in \
+        /mnt/x/DRTools/Branding/Wallpaper/1080p_ontrackwallpaper.jpg \
+        /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/company-wallpaper.png \
+        /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/company-wallpaper.jpg \
+        /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/ontrack-wallpaper.png \
+        /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/ontrack-wallpaper.jpg \
+        /mnt/x/DRTools/Wallpapers/company-wallpaper.png \
+        /mnt/x/DRTools/Wallpapers/company-wallpaper.jpg \
+        /mnt/x/DRTools/Wallpapers/ontrack-wallpaper.png \
+        /mnt/x/DRTools/Wallpapers/ontrack-wallpaper.jpg \
+        /mnt/x/DRTools/Branding/company-wallpaper.png \
+        /mnt/x/DRTools/Branding/company-wallpaper.jpg \
+        /mnt/x/DRTools/Branding/ontrack-wallpaper.png \
+        /mnt/x/DRTools/Branding/ontrack-wallpaper.jpg; do
+        if [ -f "\$candidate" ]; then
+            echo "\$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+configure_wallpaper_for_user() {
+    local user="\$1"
+    local home="\$2"
+    local uid="\$3"
+    local wallpaper_uri="file://\$4"
+
+    [ -d "\$home" ] || return 0
+
+    mkdir -p "\$home/.config/autostart" "\$home/.local/bin"
+
+    cat > "\$home/.local/bin/dr-apply-company-wallpaper" << EOF2
+#!/bin/bash
+if command -v gsettings >/dev/null 2>&1; then
+    gsettings set org.gnome.desktop.background picture-uri '${wallpaper_uri}' 2>/dev/null || true
+    gsettings set org.gnome.desktop.background picture-uri-dark '${wallpaper_uri}' 2>/dev/null || true
+    gsettings set org.gnome.desktop.background picture-options 'zoom' 2>/dev/null || true
+fi
+EOF2
+    chmod +x "\$home/.local/bin/dr-apply-company-wallpaper"
+
+    cat > "\$home/.config/autostart/dr-company-wallpaper.desktop" << EOF2
+[Desktop Entry]
+Type=Application
+Name=Apply Company Wallpaper
+Exec=\$home/.local/bin/dr-apply-company-wallpaper
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+EOF2
+
+    chown -R "\$uid:\$uid" "\$home/.config" "\$home/.local" 2>/dev/null || chown -R "\$user:\$user" "\$home/.config" "\$home/.local" 2>/dev/null || true
+}
+
+install_wallpaper() {
+    local source
+    local ext
+    local dest
+
+    if ! source="\$(find_wallpaper_source)"; then
+        log "No company wallpaper source found on /mnt/x; branding wallpaper not changed."
+        log "Set BRAND_WALLPAPER_SOURCE or place wallpaper at /mnt/x/DRTools/Branding/Wallpaper/1080p_ontrackwallpaper.jpg."
+        return 0
+    fi
+
+    ext="\${source##*.}"
+    dest="\${BRAND_WALLPAPER_DEST}.\${ext}"
+    install -D -m 0644 "\$source" "\$dest"
+    log "Installed company wallpaper from \$source to \$dest"
+
+    # System defaults for GNOME/Unity-style desktops. Existing users may need an
+    # active user-session gsettings write, handled by the per-user autostart below.
+    mkdir -p /etc/dconf/db/local.d
+    cat > /etc/dconf/db/local.d/20-dr-company-wallpaper << EOF2
+[org/gnome/desktop/background]
+picture-uri='file://\$dest'
+picture-uri-dark='file://\$dest'
+picture-options='zoom'
+EOF2
+    dconf update >/dev/null 2>&1 || true
+
+    while IFS=: read -r user _ uid gid _ home shell; do
+        [ -z "\$home" ] && continue
+        [ "\$home" = "/" ] && continue
+        [ "\$uid" -lt 1000 ] 2>/dev/null && continue
+        configure_wallpaper_for_user "\$user" "\$home" "\$uid" "\$dest"
+    done < <(getent passwd)
+
+    state_mark "COMPANY_WALLPAPER_CONFIGURED"
+}
+
+install_kit
+install_wallpaper
+exit 0
+EOF
+
+    chmod 755 /usr/local/sbin/dr-post-mount-provision
+    chown root:root /usr/local/sbin/dr-post-mount-provision
+
+    # Permit the selected domain user to run only the post-mount provisioning
+    # helper without a password. It must sort late for the same reason as the
+    # mount helper sudoers file.
+    local provision_user="${DOMAIN_SUDO_USER:-}"
+    rm -f /etc/sudoers.d/dr_post_mount_provision /etc/sudoers.d/99-dr_post_mount_provision
+    if [ -n "$provision_user" ] && [ "$provision_user" != "root" ]; then
+        local provision_sudoers_file="/etc/sudoers.d/zz-dr_post_mount_provision"
+        cat > "$provision_sudoers_file" << EOF
+# Managed by DR Domain Join
+$provision_user ALL=(root) NOPASSWD: /usr/local/sbin/dr-post-mount-provision
+EOF
+        chmod 440 "$provision_sudoers_file"
+        chown root:root "$provision_sudoers_file"
+        if visudo -cf "$provision_sudoers_file" >/dev/null 2>&1; then
+            print_info "Configured passwordless post-mount provisioning permission for $provision_user"
+            if getent passwd "$provision_user" >/dev/null 2>&1; then
+                if su - "$provision_user" -c 'sudo -n /usr/local/sbin/dr-post-mount-provision --sudo-self-test >/dev/null 2>&1'; then
+                    print_info "Validated post-mount provisioning sudo permission for $provision_user"
+                else
+                    print_warning "Could not validate passwordless post-mount provisioning permission for $provision_user"
+                fi
+            fi
+        else
+            print_warning "Post-mount provisioning sudoers validation failed; removing $provision_sudoers_file"
+            rm -f "$provision_sudoers_file"
+        fi
+    else
+        print_warning "No domain user available for passwordless post-mount provisioning rule"
+    fi
+}
 }
 
 # ── Configure DNS search domains ──────────────────────────────────────────────
