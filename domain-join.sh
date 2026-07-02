@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.6.3"
+SCRIPT_VERSION="1.6.5"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -603,6 +603,9 @@ office_hostname_prefix() {
         DE|DE1)
             echo "de-cr-kit"
             ;;
+        PL|PL1)
+            echo "pl-cr-kit"
+            ;;
         *)
             local office_lower
             office_lower="$(echo "${OFFICE_CODE:-kit}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
@@ -958,6 +961,59 @@ STATEEOF
     chmod 600 "\$STATE_FILE"
 }
 
+cleanup_local_join_state() {
+    local reset_stage="\${1:-WAITING_FOR_ADMIN}"
+    local reset_host="\${2:-\$(hostnamectl --static 2>/dev/null || hostname)}"
+
+    echo ""
+    print_warn "Returning local workstation to a clean pre-join state..."
+
+    realm leave "\$DOMAIN" >/dev/null 2>&1 || true
+    rm -f /etc/krb5.keytab
+    rm -rf /var/lib/sss/db/* /var/lib/sss/mc/* 2>/dev/null || true
+    systemctl stop sssd >/dev/null 2>&1 || true
+    systemctl disable sssd >/dev/null 2>&1 || true
+
+    save_join_state "\$reset_stage" "\$reset_host"
+
+    print_info "Local domain join state cleaned."
+    print_info "Installer state reset to \$reset_stage."
+    print_info "After AD-side cleanup or replication settling, rerun the admin helper:"
+    echo "  sudo /usr/local/sbin/dr-domain-admin-join"
+}
+
+explain_join_validation_failure() {
+    local failed_host="\${1:-\$(hostnamectl --static 2>/dev/null || hostname)}"
+
+    echo ""
+    echo "=========================================="
+    echo "  Machine Account Validation Failed"
+    echo "=========================================="
+    echo ""
+    echo "  The domain join command completed, but this workstation could not"
+    echo "  validate its machine account for:"
+    echo ""
+    echo "    \${failed_host}"
+    echo ""
+    echo "  The workstation is not considered provisioned."
+    echo ""
+    echo "  Common causes:"
+    echo "    - Active Directory replication delay between domain controllers"
+    echo "    - A stale or duplicate computer object"
+    echo "    - A reverted VM snapshot with old local join material"
+    echo "    - A computer object created during an earlier failed test run"
+    echo ""
+    echo "  Recommended recovery:"
+    echo "    1. Remove or verify the corresponding computer object in AD."
+    echo "    2. Allow AD replication to settle if multiple DCs are involved."
+    echo "    3. Return this workstation to a clean local pre-join state."
+    echo ""
+    echo "  This helper can perform the local cleanup automatically."
+    echo "  It will not delete anything from Active Directory."
+    echo "=========================================="
+    echo ""
+}
+
 office_hostname_prefix() {
     case "\$(echo "\${OFFICE_CODE:-}" | tr '[:lower:]' '[:upper:]')" in
         EP|EP1) echo "ep-cr-kit" ;;
@@ -966,6 +1022,7 @@ office_hostname_prefix() {
         ATL) echo "atl-cr-kit" ;;
         LON|UK|UK1) echo "lon-cr-kit" ;;
         DE|DE1) echo "de-cr-kit" ;;
+        PL|PL1) echo "pl-cr-kit" ;;
         *)
             local office_lower
             office_lower="\$(echo "\${OFFICE_CODE:-kit}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
@@ -1213,16 +1270,16 @@ if realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
         save_join_state "DOMAIN_JOIN_COMPLETE" "\$current_host"
         exit 0
     fi
-    echo ""
-    print_warn "Existing join is not valid. You may need to leave/rejoin."
-    read -r -p "Attempt to leave and rejoin? [y/N]: " rejoin
+    explain_join_validation_failure "\$current_host"
+    read -r -p "Clean the local join state now and prepare for a re-run? [Y/n]: " rejoin
+    rejoin="\${rejoin:-Y}"
     case "\$rejoin" in
         y|Y|yes|YES)
-            realm leave "\$DOMAIN" || true
-            rm -f /etc/krb5.keytab
-            rm -rf /var/lib/sss/db/* /var/lib/sss/mc/* 2>/dev/null || true
+            cleanup_local_join_state "WAITING_FOR_ADMIN" "\$current_host"
             ;;
         *)
+            print_error "Existing join is not valid. Aborting without local cleanup by admin choice."
+            save_join_state "DOMAIN_JOIN_FAILED" "\$current_host"
             exit 1
             ;;
     esac
@@ -1340,10 +1397,21 @@ if [ "\$validation_ok" -eq 1 ]; then
     print_info "Join is OK."
     save_join_state "DOMAIN_JOIN_COMPLETE" "\$current_host"
 else
-    print_error "Domain join command completed, but machine-account validation failed after retries."
-    print_error "Do not continue with workstation post-join steps until this is resolved."
+    explain_join_validation_failure "\$current_host"
     save_join_state "DOMAIN_JOIN_FAILED" "\$current_host"
-    exit 1
+    read -r -p "Clean the local join state now and prepare for a re-run? [Y/n]: " cleanup_answer
+    cleanup_answer="\${cleanup_answer:-Y}"
+    case "\$cleanup_answer" in
+        y|Y|yes|YES)
+            cleanup_local_join_state "WAITING_FOR_ADMIN" "\$current_host"
+            exit 1
+            ;;
+        *)
+            print_error "Leaving local join material in place by admin choice."
+            print_error "Do not continue with workstation post-join steps until this is resolved."
+            exit 1
+            ;;
+    esac
 fi
 
 echo ""
@@ -3303,7 +3371,7 @@ prompt_office_code() {
     echo ""
     echo "  Enter the office code for this machine."
     echo "  This is used to derive the tools server name."
-    echo "  Example: EP1 → dr-ep1-tools"
+    echo "  Example: EP1 → dr-ep1-tools, PL1 → dr-pl1-tools"
     echo ""
 
     while [ -z "$OFFICE_CODE" ]; do
@@ -3360,7 +3428,7 @@ parse_args() {
     if [ -z "$OFFICE_CODE" ]; then
         echo ""
         echo "  Enter the office code for this workstation."
-        echo "  Example: EP1"
+        echo "  Example: EP1 or PL1"
         echo ""
         while [ -z "$OFFICE_CODE" ]; do
             read -r -p "  Office code: " OFFICE_CODE
@@ -3377,7 +3445,14 @@ parse_args() {
         save_state "${STAGE:-OFFICE_CODE_SELECTED}"
     fi
 
-    TOOLS_SERVER="dr-$(echo "$OFFICE_CODE" | tr '[:upper:]' '[:lower:]')-tools"
+    case "$OFFICE_CODE" in
+        PL|PL1)
+            TOOLS_SERVER="dr-pl1-tools"
+            ;;
+        *)
+            TOOLS_SERVER="dr-$(echo "$OFFICE_CODE" | tr '[:upper:]' '[:lower:]')-tools"
+            ;;
+    esac
     print_info "Office: $OFFICE_CODE — tools server: $TOOLS_SERVER"
 }
 
