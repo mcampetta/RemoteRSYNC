@@ -8,10 +8,10 @@
 #   1. Make the script executable:
 #      chmod +x domain-join.sh
 #
-#   2. Run the script with sudo, passing your office code:
-#      sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)" EP1
+#   2. Run the installer:
+#      wget -qO- http://ontrack.link/joindomain | sudo bash
 #
-#   The office code is used to derive the tools file server hostname
+#   You will be prompted for the office code when needed. The office code is used to derive the tools file server hostname
 #   (e.g. EP1 → dr-ep1-tools, UK1 → dr-uk1-tools, DE1 → dr-de1-tools).
 #
 # Two-run process:
@@ -34,7 +34,7 @@
 #   the script will explicitly apply those DNS servers via NetworkManager.
 #
 # Test mode:
-#   sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)" EP1 --dns-test
+#   wget -qO- http://ontrack.link/joindomain | sudo bash -s -- --dns-test
 #   Applies DNS/search settings and runs realm discovery without joining.
 #
 # Supported Systems:
@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.6.11"
+SCRIPT_VERSION="1.6.12"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -118,7 +118,7 @@ load_config() {
 check_privileges() {
     if [ "$EUID" -ne 0 ]; then
         print_error "This script must be run as root or with sudo"
-        print_info 'Please run: sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)"'
+        print_info 'Please run: wget -qO- http://ontrack.link/joindomain | sudo bash'
         exit 1
     fi
 }
@@ -168,7 +168,7 @@ wait_for_apt_locks() {
     local showed_update_msg=0
 
     # Test/development override support:
-    #   sudo APT_LOCK_OVERRIDE_WAIT=10 bash -c "$(wget -qO- http://ontrack.link/joindomain)"
+    #   wget -qO- http://ontrack.link/joindomain | sudo APT_LOCK_OVERRIDE_WAIT=10 bash
     # Production defaults are tuned for fresh Ubuntu installs, but can still be overridden.
     case "$interval:$quiet_wait:$pid_detail_wait:$offer_clear_wait" in
         *[!0-9:]*|:*|*::*)
@@ -926,7 +926,7 @@ validate_existing_join() {
     echo "  Recommended action:"
     echo "    Wait 15-30 minutes, then rerun the provisioning command:"
     echo ""
-    echo "      wget -qO /tmp/joindomain http://ontrack.link/joindomain && sudo bash /tmp/joindomain"
+    echo "      wget -qO- http://ontrack.link/joindomain | sudo bash"
     echo ""
     echo "  Do not clean up or rejoin unless this continues to fail after"
     echo "  AD replication has had time to complete, or a domain admin confirms"
@@ -1018,7 +1018,7 @@ explain_join_validation_failure() {
     echo "    1. Wait 15-30 minutes."
     echo "    2. Have the technician rerun the main provisioning command:"
     echo ""
-    echo "       wget -qO /tmp/joindomain http://ontrack.link/joindomain && sudo bash /tmp/joindomain"
+    echo "       wget -qO- http://ontrack.link/joindomain | sudo bash"
     echo ""
     echo "  Do not clean up or rejoin unless this continues to fail after"
     echo "  replication has had time to complete, or you know the AD object"
@@ -1441,7 +1441,7 @@ echo "  Domain join validated"
 echo "=========================================="
 echo ""
 echo "Return to the local technician and have them rerun:"
-echo '  sudo bash -c "\$(wget -qO- http://ontrack.link/joindomain)"'
+echo '  wget -qO- http://ontrack.link/joindomain | sudo bash'
 echo ""
 EOF
 
@@ -1554,7 +1554,7 @@ print_domain_admin_join_instructions() {
     echo ""
     echo "  After the helper reports 'Join is OK', rerun this script locally:"
     echo ""
-    echo '    sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)"'
+    echo '    wget -qO- http://ontrack.link/joindomain | sudo bash'
     echo ""
     echo "=========================================="
     echo ""
@@ -2313,7 +2313,7 @@ join_domain() {
     echo ""
     echo "  Once the helper reports 'Join is OK', re-run this script to complete configuration:"
     echo ""
-    echo '    sudo bash -c "$(wget -qO- http://ontrack.link/joindomain)"'
+    echo '    wget -qO- http://ontrack.link/joindomain | sudo bash'
     echo ""
     exit 0
 }
@@ -3630,14 +3630,15 @@ parse_args() {
             --dns-test)
                 DNS_TEST_ONLY=true
                 ;;-h|--help)
-                echo 'Usage: sudo bash -c \"$(wget -qO- http://ontrack.link/joindomain)\"'
+                echo 'Usage: wget -qO- http://ontrack.link/joindomain | sudo bash'
+                echo 'Args:  wget -qO- http://ontrack.link/joindomain | sudo bash -s -- [OFFICE_CODE] [--dns-test]'
                 echo "  If no office code has been saved, you will be prompted for it."
                 echo "  --dns-test   Apply DNS/search settings and test realm discovery only."
                 exit 0
                 ;;
             -*)
                 print_error "Unknown option: $1"
-                echo 'Usage: sudo bash -c \"$(wget -qO- http://ontrack.link/joindomain)\"'
+                echo 'Usage: wget -qO- http://ontrack.link/joindomain | sudo bash'
                 exit 1
                 ;;
             *)
@@ -3645,7 +3646,7 @@ parse_args() {
                     OFFICE_CODE="$1"
                 else
                     print_error "Unexpected argument: $1"
-                    echo 'Usage: sudo bash -c \"$(wget -qO- http://ontrack.link/joindomain)\"'
+                    echo 'Usage: wget -qO- http://ontrack.link/joindomain | sudo bash'
                     exit 1
                 fi
                 ;;
