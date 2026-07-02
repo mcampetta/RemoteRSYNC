@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -2525,7 +2525,7 @@ set -u
 
 LOG="/var/log/dr-launch-kit.log"
 KIT_DIR="$kit_runtime_dir"
-KIT_SCRIPT="\$KIT_DIR/KIT.sh"
+KIT_SCRIPT="./KIT.sh"
 
 mkdir -p "\$(dirname "\$LOG")" 2>/dev/null || true
 touch "\$LOG" 2>/dev/null || true
@@ -2534,7 +2534,7 @@ chmod 644 "\$LOG" 2>/dev/null || true
 {
     echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Launch requested by: \${SUDO_USER:-unknown}"
     echo "KIT_DIR=\$KIT_DIR"
-    echo "KIT_SCRIPT=\$KIT_SCRIPT"
+    echo "KIT_SCRIPT=\$KIT_DIR/KIT.sh"
 } >> "\$LOG" 2>/dev/null || true
 
 if [ "\${1:-}" = "--sudo-self-test" ]; then
@@ -2547,8 +2547,8 @@ if [ ! -d "\$KIT_DIR" ]; then
     exit 1
 fi
 
-if [ ! -f "\$KIT_SCRIPT" ]; then
-    echo "KIT script not found: \$KIT_SCRIPT" | tee -a "\$LOG" >&2
+if [ ! -f "\$KIT_DIR/KIT.sh" ]; then
+    echo "KIT script not found: \$KIT_DIR/KIT.sh" | tee -a "\$LOG" >&2
     echo "Verify Tool Server is mounted at /mnt/x, then try again." >&2
     exit 1
 fi
@@ -2603,7 +2603,7 @@ set -u
 
 LOG="/var/log/dr-launch-kit.log"
 KIT_DIR="\$kit_dir"
-KIT_SCRIPT="\$KIT_DIR/KIT.sh"
+KIT_SCRIPT="./KIT.sh"
 
 mkdir -p "\$(dirname "\$LOG")" 2>/dev/null || true
 touch "\$LOG" 2>/dev/null || true
@@ -2612,7 +2612,7 @@ chmod 644 "\$LOG" 2>/dev/null || true
 {
     echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Launch requested by: \${SUDO_USER:-unknown}"
     echo "KIT_DIR=\$KIT_DIR"
-    echo "KIT_SCRIPT=\$KIT_SCRIPT"
+    echo "KIT_SCRIPT=\$KIT_DIR/KIT.sh"
 } >> "\$LOG" 2>/dev/null || true
 
 if [ "\${1:-}" = "--sudo-self-test" ]; then
@@ -2625,8 +2625,8 @@ if [ ! -d "\$KIT_DIR" ]; then
     exit 1
 fi
 
-if [ ! -f "\$KIT_SCRIPT" ]; then
-    echo "KIT script not found: \$KIT_SCRIPT" | tee -a "\$LOG" >&2
+if [ ! -f "\$KIT_DIR/KIT.sh" ]; then
+    echo "KIT script not found: \$KIT_DIR/KIT.sh" | tee -a "\$LOG" >&2
     echo "Verify Tool Server is mounted at /mnt/x, then try again." >&2
     exit 1
 fi
