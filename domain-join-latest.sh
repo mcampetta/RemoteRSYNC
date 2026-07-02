@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.6.16"
+SCRIPT_VERSION="1.7.0"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -2577,16 +2577,32 @@ install_root_kit_launcher_helper() {
     local kit_dir
     kit_dir="\$(dirname "\$KIT_INSTALLER_PATH")"
 
-    # Generate the root KIT launcher without embedding unexpanded KIT_DIR-style
-    # variables. Earlier builds wrote KIT_DIR into the generated helper path and
-    # could fail under set -u when the post-mount helper was re-entered after KIT
-    # was already marked complete.
-    {
-        echo '#!/bin/bash'
-        echo 'set -euo pipefail'
-        printf 'cd %q\n' "\$kit_dir"
-        echo 'exec bash "./KIT.sh"'
-    } > /usr/local/sbin/dr-launch-kit
+    cat > /usr/local/sbin/dr-launch-kit << EOF2
+#!/bin/bash
+set -euo pipefail
+
+KIT_RUNTIME_DIR="\$kit_dir"
+KIT_RUNTIME_SCRIPT="\$kit_dir/KIT.sh"
+LOG_FILE="/var/log/dr-launch-kit.log"
+
+if [ "\${1:-}" = "--sudo-self-test" ]; then
+    exit 0
+fi
+
+mkdir -p "\$(dirname "\$LOG_FILE")" 2>/dev/null || true
+touch "\$LOG_FILE" 2>/dev/null || true
+chmod 644 "\$LOG_FILE" 2>/dev/null || true
+echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Launch requested by \${SUDO_USER:-unknown}; KIT=\$KIT_RUNTIME_SCRIPT" >> "\$LOG_FILE" 2>/dev/null || true
+
+if [ ! -f "\$KIT_RUNTIME_SCRIPT" ]; then
+    echo "KIT runtime not found: \$KIT_RUNTIME_SCRIPT" >&2
+    echo "Verify Tool Server is mounted at /mnt/x, then try again." >&2
+    exit 1
+fi
+
+cd "\$KIT_RUNTIME_DIR"
+exec bash "./KIT.sh"
+EOF2
     chmod 755 /usr/local/sbin/dr-launch-kit
     chown root:root /usr/local/sbin/dr-launch-kit
 }
@@ -2880,33 +2896,14 @@ EOF
 #!/bin/bash
 set -euo pipefail
 
+WORKSPACE_VERSION="1.0"
 KIT_INSTALLER_PATH="${KIT_INSTALLER_PATH}"
-LOG_FILE="\${HOME:-/tmp}/.dr-domain-join-desktop.log"
+LOG_FILE="\${HOME:-/tmp}/.dr-user-session-init.log"
+ONTRACK_LOG_DIR="\${HOME:-/tmp}/.local/share/ontrack/logs"
 
 log_user() {
-    mkdir -p "\$(dirname "\$LOG_FILE")" 2>/dev/null || true
+    mkdir -p "\$(dirname "\$LOG_FILE")" "\$ONTRACK_LOG_DIR" 2>/dev/null || true
     echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$*" >> "\$LOG_FILE" 2>/dev/null || true
-}
-
-apply_company_wallpaper_now() {
-    local wallpaper=""
-    local candidate
-
-    for candidate in         /usr/share/backgrounds/dr-company-wallpaper.jpg         /usr/share/backgrounds/dr-company-wallpaper.jpeg         /usr/share/backgrounds/dr-company-wallpaper.png; do
-        if [ -f "\$candidate" ]; then
-            wallpaper="\$candidate"
-            break
-        fi
-    done
-
-    [ -n "\$wallpaper" ] || return 0
-
-    if command -v gsettings >/dev/null 2>&1; then
-        gsettings set org.gnome.desktop.background picture-uri "file://\$wallpaper" 2>/dev/null || true
-        gsettings set org.gnome.desktop.background picture-uri-dark "file://\$wallpaper" 2>/dev/null || true
-        gsettings set org.gnome.desktop.background picture-options 'zoom' 2>/dev/null || true
-        log_user "Applied company wallpaper for active user session: \$wallpaper"
-    fi
 }
 
 trust_desktop_file() {
@@ -2918,55 +2915,128 @@ trust_desktop_file() {
     fi
 }
 
+write_folder_launcher() {
+    local file="\$1" name="\$2" target="\$3" comment="\$4" icon="\${5:-folder}"
+    cat > "\$file" << EOF2
+[Desktop Entry]
+Version=1.0
+Name=\$name
+Comment=\$comment
+Exec=xdg-open "\$target"
+Icon=\$icon
+Terminal=false
+Type=Application
+Categories=Utility;
+StartupNotify=true
+EOF2
+    trust_desktop_file "\$file"
+}
+
+write_command_launcher() {
+    local file="\$1" name="\$2" command="\$3" comment="\$4" icon="\${5:-utilities-terminal}" terminal="\${6:-true}"
+    cat > "\$file" << EOF2
+[Desktop Entry]
+Version=1.0
+Name=\$name
+Comment=\$comment
+Exec=\$command
+Icon=\$icon
+Terminal=\$terminal
+Type=Application
+Categories=Utility;System;
+StartupNotify=true
+EOF2
+    trust_desktop_file "\$file"
+}
+
+apply_company_wallpaper_now() {
+    local wallpaper="" candidate expected actual
+    for candidate in /usr/share/backgrounds/dr-company-wallpaper.jpg /usr/share/backgrounds/dr-company-wallpaper.jpeg /usr/share/backgrounds/dr-company-wallpaper.png; do
+        [ -f "\$candidate" ] && wallpaper="\$candidate" && break
+    done
+    [ -n "\$wallpaper" ] || return 0
+    expected="file://\$wallpaper"
+    if command -v gsettings >/dev/null 2>&1; then
+        gsettings set org.gnome.desktop.background picture-uri "\$expected" 2>/dev/null || true
+        gsettings set org.gnome.desktop.background picture-uri-dark "\$expected" 2>/dev/null || true
+        gsettings set org.gnome.desktop.background picture-options 'zoom' 2>/dev/null || true
+        actual="\$(gsettings get org.gnome.desktop.background picture-uri 2>/dev/null | tr -d "'")"
+        [ "\$actual" = "\$expected" ] && log_user "Wallpaper verified: \$wallpaper" || log_user "Wallpaper apply attempted; readback: \$actual"
+    fi
+}
+
+repair_bookmarks() {
+    local bookmark_file line notes_uri
+    notes_uri="file://\$(printf '%s' "\$user_home/Recovery Notes" | sed 's/ /%20/g')"
+    for bookmark_file in "\$user_home/.config/gtk-3.0/bookmarks" "\$user_home/.config/gtk-4.0/bookmarks"; do
+        mkdir -p "\$(dirname "\$bookmark_file")"; touch "\$bookmark_file"
+        for line in \
+            "file:///mnt/x Tool Server" \
+            "file:///mnt/x/DRTools Logical Recovery Tools" \
+            "file:///mnt/x/CRTools Physical Recovery Tools" \
+            "file:///mnt/x/Firmware Firmware" \
+            "file:///mnt/x/Audit Audit Resources" \
+            "\$notes_uri Recovery Notes"; do
+            grep -Fxq "\$line" "\$bookmark_file" 2>/dev/null || echo "\$line" >> "\$bookmark_file"
+        done
+    done
+}
+
+repair_aliases() {
+    local bashrc="\$user_home/.bashrc"
+    touch "\$bashrc"
+    grep -q '# BEGIN Ontrack Recovery Workstation aliases' "\$bashrc" 2>/dev/null && return 0
+    cat >> "\$bashrc" << 'EOF2'
+
+# BEGIN Ontrack Recovery Workstation aliases
+alias toolserver='cd /mnt/x'
+alias drtools='cd /mnt/x/DRTools'
+alias crtools='cd /mnt/x/CRTools'
+alias logicaltools='cd /mnt/x/DRTools'
+alias physicaltools='cd /mnt/x/CRTools'
+alias firmware='cd /mnt/x/Firmware'
+alias audit='cd /mnt/x/Audit'
+alias recoverynotes='cd "$HOME/Recovery Notes"'
+alias drlogs='cd "$HOME/.local/share/ontrack/logs"'
+alias kit='sudo -n /usr/local/sbin/dr-launch-kit'
+# END Ontrack Recovery Workstation aliases
+EOF2
+}
+
+repair_dock_favorites() {
+    command -v gsettings >/dev/null 2>&1 || return 0
+    gsettings set org.gnome.shell favorite-apps "['org.gnome.Nautilus.desktop', 'org.gnome.Terminal.desktop', 'firefox.desktop', 'dr-kit.desktop', 'org.gnome.Settings.desktop']" >/dev/null 2>&1 || true
+}
+
+show_workspace_ready_once() {
+    local marker="\$user_home/.local/share/ontrack/workspace-welcome-v\$WORKSPACE_VERSION"
+    [ -f "\$marker" ] && return 0
+    mkdir -p "\$(dirname "\$marker")"
+    command -v notify-send >/dev/null 2>&1 && notify-send "Ontrack Recovery Workstation Ready" "Tool Server connected. Workspace verified." >/dev/null 2>&1 || true
+    touch "\$marker" 2>/dev/null || true
+}
+
 user_name="\$(id -un)"
 user_home="\${HOME:-}"
 if [ -z "\$user_home" ] || [ ! -d "\$user_home" ]; then
     user_home="\$(getent passwd "\$user_name" | awk -F: '{print \$6}')"
 fi
-
-if [ -z "\$user_home" ] || [ ! -d "\$user_home" ]; then
-    exit 0
-fi
-
-# Avoid provisioning root's desktop if this helper is accidentally run with sudo.
-if [ "\$(id -u)" -eq 0 ]; then
-    exit 0
-fi
+[ -n "\$user_home" ] && [ -d "\$user_home" ] || exit 0
+[ "\$(id -u)" -eq 0 ] && exit 0
 
 desktop_dir="\$user_home/Desktop"
 applications_dir="\$user_home/.local/share/applications"
 bin_dir="\$user_home/.local/bin"
-mkdir -p "\$desktop_dir" "\$applications_dir" "\$bin_dir"
+resources_dir="\$desktop_dir/Ontrack Resources"
+notes_dir="\$user_home/Recovery Notes"
+mkdir -p "\$desktop_dir" "\$applications_dir" "\$bin_dir" "\$resources_dir" "\$notes_dir" "\$ONTRACK_LOG_DIR"
 
-# Repair/create Mount DR Tools launcher for the current user.
-mount_desktop="\$desktop_dir/Mount DR Tools.desktop"
-if [ -f /usr/share/applications/mount-kit-tools.desktop ]; then
-    cp -f /usr/share/applications/mount-kit-tools.desktop "\$mount_desktop" 2>/dev/null || true
-else
-    cat > "\$mount_desktop" << EOF2
-[Desktop Entry]
-Name=Mount DR Tools
-Comment=Mount the DR Tools share at /mnt/x
-Exec=/usr/local/bin/mount-kit-tools-desktop
-Icon=drive-network
-Terminal=false
-Type=Application
-Categories=Utility;System;
-EOF2
-fi
-trust_desktop_file "\$mount_desktop"
-log_user "Provisioned trusted Mount DR Tools launcher at \$mount_desktop"
+# Keep the top-level desktop intentionally sparse. Manual mount lives inside Ontrack Resources.
+rm -f "\$desktop_dir/Mount DR Tools.desktop" 2>/dev/null || true
 
-# Repair/create KIT launcher for the current user. KIT lives on /mnt/x, so this
-# succeeds once the share has mounted; otherwise the Mount launcher is still
-# trusted and the KIT shortcut will be repaired on a later login/mount.
-kit_dir="\$(dirname "\$KIT_INSTALLER_PATH")"
-kit_launcher="\$kit_dir/KIT.sh"
-if [ -f "\$kit_launcher" ]; then
-    wrapper="\$bin_dir/dr-launch-kit"
-    cat > "\$wrapper" << EOF2
+wrapper="\$bin_dir/dr-launch-kit"
+cat > "\$wrapper" << 'EOF2'
 #!/bin/bash
-set -e
 sudo -n /usr/local/sbin/dr-launch-kit
 rc=$?
 if [ "$rc" -ne 0 ]; then
@@ -2978,11 +3048,11 @@ if [ "$rc" -ne 0 ]; then
 fi
 exit "$rc"
 EOF2
-    chmod 755 "\$wrapper"
+chmod 755 "\$wrapper"
 
-    kit_app="\$applications_dir/dr-kit.desktop"
-    kit_desktop="\$desktop_dir/KIT.desktop"
-    cat > "\$kit_app" << EOF2
+kit_app="\$applications_dir/dr-kit.desktop"
+kit_desktop="\$desktop_dir/KIT.desktop"
+cat > "\$kit_app" << EOF2
 [Desktop Entry]
 Version=1.0
 Name=KIT
@@ -2994,16 +3064,43 @@ Type=Application
 Categories=Utility;System;
 StartupNotify=true
 EOF2
-    chmod 755 "\$kit_app"
-    cp -f "\$kit_app" "\$kit_desktop"
-    trust_desktop_file "\$kit_desktop"
-    log_user "Provisioned trusted KIT launcher at \$kit_desktop -> \$kit_launcher"
-else
-    log_user "KIT launcher not available yet at \$kit_launcher; skipping KIT desktop repair."
-fi
+chmod 755 "\$kit_app"; cp -f "\$kit_app" "\$kit_desktop"; trust_desktop_file "\$kit_desktop"; trust_desktop_file "\$kit_app"
 
+write_folder_launcher "\$resources_dir/Tool Server.desktop" "Tool Server" "/mnt/x" "Open the mounted Ontrack tool server" "drive-network"
+write_folder_launcher "\$resources_dir/Logical Recovery Tools.desktop" "Logical Recovery Tools" "/mnt/x/DRTools" "Open lab tools for imaging, filesystem parsing, logical recovery, and reconstruction" "folder"
+write_folder_launcher "\$resources_dir/Physical Recovery Tools.desktop" "Physical Recovery Tools" "/mnt/x/CRTools" "Open clean-room tools for physical recovery and device preparation" "folder"
+write_folder_launcher "\$resources_dir/Firmware.desktop" "Firmware" "/mnt/x/Firmware" "Open firmware repository" "folder"
+write_folder_launcher "\$resources_dir/Audit Resources.desktop" "Audit Resources" "/mnt/x/Audit" "Open audit resources" "folder"
+write_folder_launcher "\$resources_dir/Recovery Notes.desktop" "Recovery Notes" "\$notes_dir" "Open local recovery notes" "text-x-generic"
+write_folder_launcher "\$resources_dir/Engineering Logs.desktop" "Engineering Logs" "\$ONTRACK_LOG_DIR" "Open local workstation logs" "folder"
+write_command_launcher "\$resources_dir/Mount Tool Server.desktop" "Mount Tool Server" "/usr/local/bin/mount-kit-tools-desktop" "Mount or repair the Tool Server connection" "drive-network" "false"
+write_command_launcher "\$resources_dir/Repair Workspace.desktop" "Repair Workspace" "/usr/local/bin/dr-user-desktop-provision --repair" "Repair Ontrack desktop resources" "applications-system" "true"
+write_command_launcher "\$resources_dir/Workstation Diagnostics.desktop" "Workstation Diagnostics" "gnome-terminal -- bash -lc 'echo Ontrack Recovery Workstation Diagnostics; echo; hostnamectl; echo; realm list 2>/dev/null || true; echo; findmnt /mnt/x || true; echo; read -r -p \\\"Press Enter to close...\\\" _'" "Show workstation health information" "utilities-system-monitor" "false"
+
+cat > "\$resources_dir/README - Start Here.txt" << EOF2
+Ontrack Recovery Workstation
+============================
+
+KIT launches the primary imaging/recovery application.
+
+Tool Server opens the shared Ontrack tool server. Internally it is mounted at /mnt/x, but you can think of it like a Windows network drive.
+
+Logical Recovery Tools opens DRTools: lab tools for imaging, filesystem parsing, logical recovery, metadata analysis, and data reconstruction workflows.
+
+Physical Recovery Tools opens CRTools: clean-room tools for storage-device preparation, system/service-area work, firmware-related work, and device operations needed before imaging.
+
+Firmware opens the shared firmware repository.
+Audit Resources opens shared audit resources.
+Recovery Notes is your local notes folder.
+Repair Workspace recreates launchers, bookmarks, wallpaper, and shortcuts if anything is accidentally changed.
+EOF2
+
+repair_bookmarks
+repair_aliases
+repair_dock_favorites
 apply_company_wallpaper_now
-
+show_workspace_ready_once
+log_user "Ontrack workspace v\$WORKSPACE_VERSION repaired successfully."
 exit 0
 EOF
     chmod 755 /usr/local/bin/dr-user-desktop-provision
@@ -3181,27 +3278,32 @@ EOF
 RUNNER="/usr/local/bin/mount-kit-tools-desktop-runner"
 
 if command -v x-terminal-emulator >/dev/null 2>&1; then
-    exec x-terminal-emulator -e "$RUNNER"
+    exec x-terminal-emulator -e "$RUNNER" "$@"
 fi
 
 if command -v gnome-terminal >/dev/null 2>&1; then
-    exec gnome-terminal -- "$RUNNER"
+    exec gnome-terminal -- "$RUNNER" "$@"
 fi
 
 if command -v mate-terminal >/dev/null 2>&1; then
-    exec mate-terminal -e "$RUNNER"
+    exec mate-terminal -e "$RUNNER" "$@"
 fi
 
 if command -v xfce4-terminal >/dev/null 2>&1; then
-    exec xfce4-terminal -e "$RUNNER"
+    exec xfce4-terminal -e "$RUNNER" "$@"
 fi
 
-exec "$RUNNER"
+exec "$RUNNER" "$@"
 EOF
     chmod +x /usr/local/bin/mount-kit-tools-desktop
 
     cat > /usr/local/bin/mount-kit-tools-desktop-runner << 'EOF'
 #!/bin/bash
+
+QUIET_SUCCESS=0
+case "${1:-}" in
+    --autostart|--autostart-quiet|--quiet-success) QUIET_SUCCESS=1 ;;
+esac
 
 echo "Mount DR Tools"
 echo "=============="
@@ -3260,6 +3362,10 @@ else
     echo ""
     echo "Try from terminal:"
     echo "  mount-kit-tools"
+fi
+
+if [ "$status" -eq 0 ] && [ "$QUIET_SUCCESS" -eq 1 ]; then
+    exit 0
 fi
 
 echo ""
@@ -3368,7 +3474,7 @@ EOF
 [Desktop Entry]
 Name=Mount DR Tools
 Comment=Mount the DR Tools share at /mnt/x
-Exec=/usr/local/bin/mount-kit-tools-desktop
+Exec=/usr/local/bin/mount-kit-tools-desktop --autostart-quiet
 Icon=drive-network
 Terminal=false
 Type=Application
