@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.6.6"
+SCRIPT_VERSION="1.6.10"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -63,7 +63,7 @@ DNS_SEARCH="dr.kodr.local,corp.altegrity.com,corp.eddom.org,corp.kroll.com,ontra
 DNS_TEST_ONLY=false
 KIT_PROCESS_PATTERN="${KIT_PROCESS_PATTERN:-KIT}"
 KIT_INSTALLER_PATH="${KIT_INSTALLER_PATH:-/mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/KIT-installer-modified.sh}"
-BRAND_WALLPAPER_SOURCE="${BRAND_WALLPAPER_SOURCE:-}"
+BRAND_WALLPAPER_SOURCE="${BRAND_WALLPAPER_SOURCE:-/mnt/x/CRtools/Frozen/Branding/Wallpaper/1080p_ontrackwallpaper.jpg}"
 BRAND_WALLPAPER_DEST="/usr/share/backgrounds/dr-company-wallpaper"
 OFFICE_CODE=""
 TOOLS_SERVER=""
@@ -911,14 +911,29 @@ validate_existing_join() {
         return 0
     fi
 
-    print_error "Machine appears joined, but AD machine-account validation failed."
-    print_error "This commonly occurs after VM snapshot rollback, hostname truncation, or deleted AD computer objects."
-    print_error "Do not continue with post-join configuration until this is fixed."
-    print_error "Recommended cleanup:"
-    print_error "  sudo realm leave $DOMAIN"
-    print_error "  sudo rm -f /etc/krb5.keytab"
-    print_error "  sudo rm -rf /var/lib/sss/db/* /var/lib/sss/mc/*"
-    print_error "Then ensure the hostname is AD-safe and rejoin the domain."
+    echo ""
+    print_warning "Machine appears joined, but the machine account is not valid yet."
+    echo ""
+    echo "=========================================="
+    echo "  Domain Join Pending AD Replication"
+    echo "=========================================="
+    echo ""
+    echo "  The workstation is joined to $DOMAIN, but machine-account"
+    echo "  validation did not succeed yet. This can happen shortly after"
+    echo "  a domain join while Active Directory replicates the new computer"
+    echo "  account between domain controllers."
+    echo ""
+    echo "  Recommended action:"
+    echo "    Wait 15-30 minutes, then rerun the provisioning command:"
+    echo ""
+    echo "      wget -qO /tmp/joindomain http://ontrack.link/joindomain && sudo bash /tmp/joindomain"
+    echo ""
+    echo "  Do not clean up or rejoin unless this continues to fail after"
+    echo "  AD replication has had time to complete, or a domain admin confirms"
+    echo "  the AD computer object is stale or incorrect."
+    echo "=========================================="
+    echo ""
+    save_state "DOMAIN_JOIN_PENDING_REPLICATION"
     ensure_local_pam_survives_sssd_failure
     return 1
 }
@@ -995,21 +1010,23 @@ explain_join_validation_failure() {
     echo ""
     echo "    \${failed_host}"
     echo ""
-    echo "  The workstation is not considered provisioned."
+    echo "  This is often temporary immediately after a successful join."
+    echo "  Active Directory may need time to replicate the new computer account"
+    echo "  between domain controllers before adcli testjoin succeeds."
     echo ""
-    echo "  Common causes:"
-    echo "    - Active Directory replication delay between domain controllers"
-    echo "    - A stale or duplicate computer object"
-    echo "    - A reverted VM snapshot with old local join material"
-    echo "    - A computer object created during an earlier failed test run"
+    echo "  Recommended first action:"
+    echo "    1. Wait 15-30 minutes."
+    echo "    2. Have the technician rerun the main provisioning command:"
     echo ""
-    echo "  Recommended recovery:"
-    echo "    1. Remove or verify the corresponding computer object in AD."
-    echo "    2. Allow AD replication to settle if multiple DCs are involved."
-    echo "    3. Return this workstation to a clean local pre-join state."
+    echo "       wget -qO /tmp/joindomain http://ontrack.link/joindomain && sudo bash /tmp/joindomain"
     echo ""
-    echo "  This helper can perform the local cleanup automatically."
-    echo "  It will not delete anything from Active Directory."
+    echo "  Do not clean up or rejoin unless this continues to fail after"
+    echo "  replication has had time to complete, or you know the AD object"
+    echo "  is stale, duplicated, or incorrect."
+    echo ""
+    echo "  Advanced recovery option:"
+    echo "    This helper can clean local realm/keytab/SSSD state so the"
+    echo "    workstation can be rejoined later. It will not delete AD objects."
     echo "=========================================="
     echo ""
 }
@@ -1271,15 +1288,15 @@ if realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
         exit 0
     fi
     explain_join_validation_failure "\$current_host"
-    read -r -p "Clean the local join state now and prepare for a re-run? [Y/n]: " rejoin
-    rejoin="\${rejoin:-Y}"
+    save_join_state "DOMAIN_JOIN_PENDING_REPLICATION" "\$current_host"
+    read -r -p "Advanced recovery: clean local join state now? [y/N]: " rejoin
+    rejoin="\${rejoin:-N}"
     case "\$rejoin" in
         y|Y|yes|YES)
             cleanup_local_join_state "WAITING_FOR_ADMIN" "\$current_host"
             ;;
         *)
-            print_error "Existing join is not valid. Aborting without local cleanup by admin choice."
-            save_join_state "DOMAIN_JOIN_FAILED" "\$current_host"
+            print_warn "Leaving local join material in place. Wait 15-30 minutes, then rerun the main provisioning script."
             exit 1
             ;;
     esac
@@ -1398,17 +1415,17 @@ if [ "\$validation_ok" -eq 1 ]; then
     save_join_state "DOMAIN_JOIN_COMPLETE" "\$current_host"
 else
     explain_join_validation_failure "\$current_host"
-    save_join_state "DOMAIN_JOIN_FAILED" "\$current_host"
-    read -r -p "Clean the local join state now and prepare for a re-run? [Y/n]: " cleanup_answer
-    cleanup_answer="\${cleanup_answer:-Y}"
+    save_join_state "DOMAIN_JOIN_PENDING_REPLICATION" "\$current_host"
+    read -r -p "Advanced recovery: clean local join state now? [y/N]: " cleanup_answer
+    cleanup_answer="\${cleanup_answer:-N}"
     case "\$cleanup_answer" in
         y|Y|yes|YES)
             cleanup_local_join_state "WAITING_FOR_ADMIN" "\$current_host"
             exit 1
             ;;
         *)
-            print_error "Leaving local join material in place by admin choice."
-            print_error "Do not continue with workstation post-join steps until this is resolved."
+            print_warn "Leaving local join material in place so AD replication can settle."
+            print_warn "Wait 15-30 minutes, then rerun the main provisioning script."
             exit 1
             ;;
     esac
@@ -2596,6 +2613,94 @@ install_kit() {
     fi
 }
 
+install_kit_desktop_shortcut_for_user() {
+    local user="\$1"
+    local home="\$2"
+    local uid="\$3"
+    local kit_dir
+    local kit_launcher
+    local wrapper
+    local desktop_file
+    local desktop_copy
+
+    [ -d "\$home" ] || return 0
+    kit_dir="\$(dirname "\$KIT_INSTALLER_PATH")"
+    kit_launcher="\$kit_dir/KIT.sh"
+
+    if [ ! -f "\$kit_launcher" ]; then
+        log "KIT launcher not found for \$user at \$kit_launcher; shortcut not installed."
+        return 0
+    fi
+
+    mkdir -p "\$home/Desktop" "\$home/.local/share/applications" "\$home/.local/bin"
+
+    # The vendor KIT installer may create a desktop file that points back at
+    # KIT-installer-modified.sh. Replace/repair it with a deterministic launcher
+    # that always starts the real runtime entrypoint: KIT.sh.
+    wrapper="\$home/.local/bin/dr-launch-kit"
+    cat > "\$wrapper" << EOF2
+#!/bin/bash
+set -e
+KIT_DIR="\$kit_dir"
+cd "\$KIT_DIR" || exit 1
+exec sudo bash "./KIT.sh"
+EOF2
+    chmod 755 "\$wrapper"
+
+    desktop_file="\$home/.local/share/applications/dr-kit.desktop"
+    desktop_copy="\$home/Desktop/KIT.desktop"
+
+    cat > "\$desktop_file" << EOF2
+[Desktop Entry]
+Version=1.0
+Name=KIT
+Comment=Launch KIT imaging tools
+Exec=\$wrapper
+Icon=drive-harddisk
+Terminal=true
+Type=Application
+Categories=Utility;System;
+StartupNotify=true
+EOF2
+
+    chmod 755 "\$desktop_file"
+    cp -f "\$desktop_file" "\$desktop_copy"
+    chmod 755 "\$desktop_copy"
+
+    chown -R "\$uid:\$uid" "\$home/Desktop" "\$home/.local" 2>/dev/null || chown -R "\$user:\$user" "\$home/Desktop" "\$home/.local" 2>/dev/null || true
+
+    # GNOME/Nautilus marks downloaded or newly-created desktop files as
+    # untrusted until the user enables launching. Best effort: pre-trust the
+    # desktop entry when gio/gvfs metadata is available in the login session.
+    # This may be skipped on non-GNOME desktops without breaking the launcher.
+    if command -v gio >/dev/null 2>&1; then
+        sudo -u "\$user" gio set "\$desktop_copy" metadata::trusted true >/dev/null 2>&1 || true
+        sudo -u "\$user" gio info "\$desktop_copy" >/dev/null 2>&1 || true
+    fi
+
+    if grep -q 'KIT-installer-modified.sh' "\$desktop_copy" 2>/dev/null; then
+        log "WARNING: repaired KIT shortcut for \$user still references installer unexpectedly."
+    else
+        log "Installed trusted KIT desktop shortcut for \$user at \$desktop_copy -> \$kit_launcher"
+    fi
+}
+
+install_kit_desktop_shortcuts() {
+    if [ ! -f "\$(dirname "\$KIT_INSTALLER_PATH")/KIT.sh" ]; then
+        log "KIT launcher not found at \$(dirname "\$KIT_INSTALLER_PATH")/KIT.sh; desktop shortcut not installed."
+        return 0
+    fi
+
+    while IFS=: read -r user _ uid gid _ home shell; do
+        [ -z "\$home" ] && continue
+        [ "\$home" = "/" ] && continue
+        [ "\$uid" -lt 1000 ] 2>/dev/null && continue
+        install_kit_desktop_shortcut_for_user "\$user" "\$home" "\$uid"
+    done < <(getent passwd)
+
+    state_mark "KIT_DESKTOP_SHORTCUTS_CONFIGURED"
+}
+
 find_wallpaper_source() {
     if [ -n "\$BRAND_WALLPAPER_SOURCE" ] && [ -f "\$BRAND_WALLPAPER_SOURCE" ]; then
         echo "\$BRAND_WALLPAPER_SOURCE"
@@ -2603,6 +2708,7 @@ find_wallpaper_source() {
     fi
 
     for candidate in \
+        /mnt/x/CRtools/Frozen/Branding/Wallpaper/1080p_ontrackwallpaper.jpg \
         /mnt/x/DRTools/Branding/Wallpaper/1080p_ontrackwallpaper.jpg \
         /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/company-wallpaper.png \
         /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/company-wallpaper.jpg \
@@ -2664,7 +2770,7 @@ install_wallpaper() {
 
     if ! source="\$(find_wallpaper_source)"; then
         log "No company wallpaper source found on /mnt/x; branding wallpaper not changed."
-        log "Set BRAND_WALLPAPER_SOURCE or place wallpaper at /mnt/x/DRTools/Branding/Wallpaper/1080p_ontrackwallpaper.jpg."
+        log "Set BRAND_WALLPAPER_SOURCE or place wallpaper at /mnt/x/CRtools/Frozen/Branding/Wallpaper/1080p_ontrackwallpaper.jpg."
         return 0
     fi
 
@@ -2695,12 +2801,121 @@ EOF2
 }
 
 install_kit
+install_kit_desktop_shortcuts
 install_wallpaper
 exit 0
 EOF
 
     chmod 755 /usr/local/sbin/dr-post-mount-provision
     chown root:root /usr/local/sbin/dr-post-mount-provision
+
+    # User-session desktop provisioning. GNOME's Allow Launching trust bit is
+    # GVFS metadata stored in the logged-in user's session, so root cannot
+    # reliably stamp it for another user. This helper is intentionally
+    # non-privileged and is run by the desktop mount/autostart path as the
+    # logged-in user. It creates/repairs launchers and marks them trusted.
+    cat > /usr/local/bin/dr-user-desktop-provision << EOF
+#!/bin/bash
+set -euo pipefail
+
+KIT_INSTALLER_PATH="${KIT_INSTALLER_PATH}"
+LOG_FILE="\${HOME:-/tmp}/.dr-domain-join-desktop.log"
+
+log_user() {
+    mkdir -p "\$(dirname "\$LOG_FILE")" 2>/dev/null || true
+    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$*" >> "\$LOG_FILE" 2>/dev/null || true
+}
+
+trust_desktop_file() {
+    local file="\$1"
+    [ -f "\$file" ] || return 0
+    chmod 755 "\$file" 2>/dev/null || true
+    if command -v gio >/dev/null 2>&1; then
+        gio set "\$file" metadata::trusted true >/dev/null 2>&1 || true
+    fi
+}
+
+user_name="\$(id -un)"
+user_home="\${HOME:-}"
+if [ -z "\$user_home" ] || [ ! -d "\$user_home" ]; then
+    user_home="\$(getent passwd "\$user_name" | awk -F: '{print \$6}')"
+fi
+
+if [ -z "\$user_home" ] || [ ! -d "\$user_home" ]; then
+    exit 0
+fi
+
+# Avoid provisioning root's desktop if this helper is accidentally run with sudo.
+if [ "\$(id -u)" -eq 0 ]; then
+    exit 0
+fi
+
+desktop_dir="\$user_home/Desktop"
+applications_dir="\$user_home/.local/share/applications"
+bin_dir="\$user_home/.local/bin"
+mkdir -p "\$desktop_dir" "\$applications_dir" "\$bin_dir"
+
+# Repair/create Mount DR Tools launcher for the current user.
+mount_desktop="\$desktop_dir/Mount DR Tools.desktop"
+if [ -f /usr/share/applications/mount-kit-tools.desktop ]; then
+    cp -f /usr/share/applications/mount-kit-tools.desktop "\$mount_desktop" 2>/dev/null || true
+else
+    cat > "\$mount_desktop" << EOF2
+[Desktop Entry]
+Name=Mount DR Tools
+Comment=Mount the DR Tools share at /mnt/x
+Exec=/usr/local/bin/mount-kit-tools-desktop
+Icon=drive-network
+Terminal=false
+Type=Application
+Categories=Utility;System;
+EOF2
+fi
+trust_desktop_file "\$mount_desktop"
+log_user "Provisioned trusted Mount DR Tools launcher at \$mount_desktop"
+
+# Repair/create KIT launcher for the current user. KIT lives on /mnt/x, so this
+# succeeds once the share has mounted; otherwise the Mount launcher is still
+# trusted and the KIT shortcut will be repaired on a later login/mount.
+kit_dir="\$(dirname "\$KIT_INSTALLER_PATH")"
+kit_launcher="\$kit_dir/KIT.sh"
+if [ -f "\$kit_launcher" ]; then
+    wrapper="\$bin_dir/dr-launch-kit"
+    cat > "\$wrapper" << EOF2
+#!/bin/bash
+set -e
+KIT_DIR="\$kit_dir"
+cd "\$KIT_DIR" || exit 1
+exec sudo bash "./KIT.sh"
+EOF2
+    chmod 755 "\$wrapper"
+
+    kit_app="\$applications_dir/dr-kit.desktop"
+    kit_desktop="\$desktop_dir/KIT.desktop"
+    cat > "\$kit_app" << EOF2
+[Desktop Entry]
+Version=1.0
+Name=KIT
+Comment=Launch KIT imaging tools
+Exec=\$wrapper
+Icon=drive-harddisk
+Terminal=true
+Type=Application
+Categories=Utility;System;
+StartupNotify=true
+EOF2
+    chmod 755 "\$kit_app"
+    cp -f "\$kit_app" "\$kit_desktop"
+    trust_desktop_file "\$kit_desktop"
+    log_user "Provisioned trusted KIT launcher at \$kit_desktop -> \$kit_launcher"
+else
+    log_user "KIT launcher not available yet at \$kit_launcher; skipping KIT desktop repair."
+fi
+
+exit 0
+EOF
+    chmod 755 /usr/local/bin/dr-user-desktop-provision
+    chown root:root /usr/local/bin/dr-user-desktop-provision
 
     # Permit the selected domain user to run only the post-mount provisioning
     # helper without a password. It must sort late for the same reason as the
@@ -2879,13 +3094,11 @@ echo ""
 
 if mountpoint -q /mnt/x; then
     echo "/mnt/x is already mounted."
-    echo ""
-    read -r -p "Press Enter to close..."
-    exit 0
+    status=0
+else
+    /usr/local/bin/mount-kit-tools
+    status=$?
 fi
-
-/usr/local/bin/mount-kit-tools
-status=$?
 
 echo ""
 if [ "$status" -eq 0 ]; then
@@ -2893,10 +3106,20 @@ if [ "$status" -eq 0 ]; then
     echo ""
     ls -la /mnt/x 2>/dev/null || true
     echo ""
+    if [ -x /usr/local/bin/dr-user-desktop-provision ]; then
+        echo "Repairing and trusting desktop launchers for this user..."
+        /usr/local/bin/dr-user-desktop-provision || true
+        echo "Desktop launcher repair completed."
+        echo ""
+    fi
     if [ -x /usr/local/sbin/dr-post-mount-provision ]; then
         echo "Running post-mount provisioning: KIT installer and company branding..."
         if sudo -n /usr/local/sbin/dr-post-mount-provision; then
             echo "Post-mount provisioning completed."
+            if [ -x /usr/local/bin/dr-user-desktop-provision ]; then
+                echo "Refreshing desktop launchers after post-mount provisioning..."
+                /usr/local/bin/dr-user-desktop-provision || true
+            fi
         else
             pm_status=$?
             echo "Post-mount provisioning failed with exit code $pm_status."
