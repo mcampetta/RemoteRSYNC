@@ -1,4 +1,27 @@
-
+#!/bin/bash
+#
+# Domain Join Script
+# Joins a Debian or Ubuntu machine to the dr.kodr.local Active Directory domain
+# and configures it for network share access using short (NetBIOS) server names.
+#
+# Usage:
+#   1. Make the script executable:
+#      chmod +x domain-join.sh
+#
+#   2. Run the installer:
+#      wget -qO- http://ontrack.link/joindomain | sudo bash
+#
+#   You will be prompted for the office code when needed. The office code is used to derive the tools file server hostname
+#   (e.g. EP1 → dr-ep1-tools, UK1 → dr-uk1-tools, DE1 → dr-de1-tools).
+#
+# Two-run process:
+#   Run 1: You will be prompted for a domain user to receive sudo access.
+#          The script installs packages, configures DNS and time sync, then
+#          exits with instructions for a domain admin to complete the join via SSH.
+#
+#   Run 2: After the domain admin has joined the machine, re-run this script.
+#          It will detect the existing join and complete all post-join
+#          configuration unattended. Safe to re-run on an already-joined machine.
 #
 # DNS behavior:
 #   This script expects DHCP/VPN to provide the correct office-local AD DNS
@@ -19,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.7.1"
+SCRIPT_VERSION="1.7.2"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -2686,11 +2709,14 @@ install_kit_desktop_shortcut_for_user() {
     # KIT-installer-modified.sh. Replace/repair it with a deterministic launcher
     # that always starts the real runtime entrypoint: KIT.sh.
     wrapper="\$home/.local/bin/dr-launch-kit"
-    cat > "\$wrapper" << EOF2
+    cat > "\$wrapper" << 'EOF2'
 #!/bin/bash
-set -e
-sudo -n /usr/local/sbin/dr-launch-kit
+set +e
+sudo -n /usr/local/sbin/dr-launch-kit "\$@"
 rc=\$?
+if [ -z "\${rc:-}" ]; then
+    rc=1
+fi
 if [ "\$rc" -ne 0 ]; then
     echo
     echo "KIT launch failed with exit code \$rc."
@@ -2947,10 +2973,16 @@ repair_bookmarks() {
     notes_uri="file://\$(printf '%s' "\$user_home/Recovery Notes" | sed 's/ /%20/g')"
     for bookmark_file in "\$user_home/.config/gtk-3.0/bookmarks" "\$user_home/.config/gtk-4.0/bookmarks"; do
         mkdir -p "\$(dirname "\$bookmark_file")"; touch "\$bookmark_file"
+        # Remove earlier workspace labels so Nautilus sidebar stays aligned
+        # with established engineering vocabulary.
+        grep -v -F "file:///mnt/x/DRTools Logical Recovery Tools" "\$bookmark_file" > "\${bookmark_file}.tmp" 2>/dev/null || true
+        mv "\${bookmark_file}.tmp" "\$bookmark_file" 2>/dev/null || true
+        grep -v -F "file:///mnt/x/CRTools Physical Recovery Tools" "\$bookmark_file" > "\${bookmark_file}.tmp" 2>/dev/null || true
+        mv "\${bookmark_file}.tmp" "\$bookmark_file" 2>/dev/null || true
         for line in \
             "file:///mnt/x Tool Server" \
-            "file:///mnt/x/DRTools Logical Recovery Tools" \
-            "file:///mnt/x/CRTools Physical Recovery Tools" \
+            "file:///mnt/x/DRTools DRTools" \
+            "file:///mnt/x/CRTools CRTools" \
             "file:///mnt/x/Firmware Firmware" \
             "file:///mnt/x/Audit Audit Resources" \
             "\$notes_uri Recovery Notes"; do
@@ -2969,8 +3001,6 @@ repair_aliases() {
 alias toolserver='cd /mnt/x'
 alias drtools='cd /mnt/x/DRTools'
 alias crtools='cd /mnt/x/CRTools'
-alias logicaltools='cd /mnt/x/DRTools'
-alias physicaltools='cd /mnt/x/CRTools'
 alias firmware='cd /mnt/x/Firmware'
 alias audit='cd /mnt/x/Audit'
 alias recoverynotes='cd "$HOME/Recovery Notes"'
@@ -3014,16 +3044,20 @@ rm -f "\$desktop_dir/Mount DR Tools.desktop" 2>/dev/null || true
 wrapper="\$bin_dir/dr-launch-kit"
 cat > "\$wrapper" << 'EOF2'
 #!/bin/bash
-sudo -n /usr/local/sbin/dr-launch-kit
-rc=$?
-if [ "$rc" -ne 0 ]; then
+set +e
+sudo -n /usr/local/sbin/dr-launch-kit "\$@"
+rc=\$?
+if [ -z "\${rc:-}" ]; then
+    rc=1
+fi
+if [ "\$rc" -ne 0 ]; then
     echo
-    echo "KIT launch failed with exit code $rc."
+    echo "KIT launch failed with exit code \$rc."
     echo "See /var/log/dr-launch-kit.log for details."
     echo
     read -r -p "Press Enter to close..." _
 fi
-exit "$rc"
+exit "\$rc"
 EOF2
 chmod 755 "\$wrapper"
 
@@ -3048,7 +3082,7 @@ chmod 755 "\$kit_app"; cp -f "\$kit_app" "\$kit_desktop"; trust_desktop_file "\$
 # behaves like Windows Explorer. Command launchers remain on the Desktop or are
 # exposed as terminal aliases/README guidance instead of as .desktop files in
 # this folder.
-for stale in     "\$resources_dir/Tool Server.desktop"     "\$resources_dir/Logical Recovery Tools.desktop"     "\$resources_dir/Physical Recovery Tools.desktop"     "\$resources_dir/Firmware.desktop"     "\$resources_dir/Audit Resources.desktop"     "\$resources_dir/Recovery Notes.desktop"     "\$resources_dir/Engineering Logs.desktop"     "\$resources_dir/Mount Tool Server.desktop"     "\$resources_dir/Repair Workspace.desktop"     "\$resources_dir/Workstation Diagnostics.desktop"; do
+for stale in     "\$resources_dir/Tool Server.desktop"     "\$resources_dir/Logical Recovery Tools.desktop"     "\$resources_dir/Physical Recovery Tools.desktop"     "\$resources_dir/DRTools.desktop"     "\$resources_dir/CRTools.desktop"     "\$resources_dir/Firmware.desktop"     "\$resources_dir/Audit Resources.desktop"     "\$resources_dir/Recovery Notes.desktop"     "\$resources_dir/Engineering Logs.desktop"     "\$resources_dir/Mount Tool Server.desktop"     "\$resources_dir/Repair Workspace.desktop"     "\$resources_dir/Workstation Diagnostics.desktop"; do
     rm -f "\$stale" 2>/dev/null || true
 done
 
@@ -3060,8 +3094,10 @@ link_resource() {
 }
 
 link_resource "Tool Server" "/mnt/x"
-link_resource "Logical Recovery Tools" "/mnt/x/DRTools"
-link_resource "Physical Recovery Tools" "/mnt/x/CRTools"
+rm -rf "$resources_dir/Logical Recovery Tools" 2>/dev/null || true
+link_resource "DRTools" "/mnt/x/DRTools"
+rm -rf "$resources_dir/Physical Recovery Tools" 2>/dev/null || true
+link_resource "CRTools" "/mnt/x/CRTools"
 link_resource "Firmware" "/mnt/x/Firmware"
 link_resource "Audit Resources" "/mnt/x/Audit"
 link_resource "Recovery Notes" "\$notes_dir"
@@ -3074,9 +3110,9 @@ KIT launches the primary imaging/recovery application.
 
 Tool Server opens the shared Ontrack tool server. Internally it is mounted at /mnt/x, but you can think of it like a Windows network drive.
 
-Logical Recovery Tools opens DRTools: lab tools for imaging, filesystem parsing, logical recovery, metadata analysis, and data reconstruction workflows.
+DRTools contains lab tools for imaging, filesystem parsing, logical recovery, metadata analysis, and data reconstruction workflows.
 
-Physical Recovery Tools opens CRTools: clean-room tools for storage-device preparation, system/service-area work, firmware-related work, and device operations needed before imaging.
+CRTools contains clean-room tools for storage-device preparation, system/service-area work, firmware-related work, and device operations needed before imaging.
 
 Firmware opens the shared firmware repository.
 Audit Resources opens shared audit resources.
