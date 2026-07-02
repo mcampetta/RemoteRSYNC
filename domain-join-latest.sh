@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.6.12"
+SCRIPT_VERSION="1.6.13"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -2641,8 +2641,7 @@ install_kit_desktop_shortcut_for_user() {
     cat > "\$wrapper" << EOF2
 #!/bin/bash
 set -e
-KIT_DIR="\$kit_dir"
-cd "\$KIT_DIR" || exit 1
+cd "\$kit_dir" || exit 1
 exec sudo bash "./KIT.sh"
 EOF2
     chmod 755 "\$wrapper"
@@ -2884,8 +2883,7 @@ if [ -f "\$kit_launcher" ]; then
     cat > "\$wrapper" << EOF2
 #!/bin/bash
 set -e
-KIT_DIR="\$kit_dir"
-cd "\$KIT_DIR" || exit 1
+cd "\$kit_dir" || exit 1
 exec sudo bash "./KIT.sh"
 EOF2
     chmod 755 "\$wrapper"
