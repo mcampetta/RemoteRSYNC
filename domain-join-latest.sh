@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.0"
+SCRIPT_VERSION="1.0.1"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -3085,6 +3085,14 @@ mkdir -p "\$desktop_dir" "\$applications_dir" "\$bin_dir" "\$resources_dir" "\$n
 
 # Keep the top-level desktop intentionally sparse. Manual mount lives inside Ontrack Resources.
 rm -f "\$desktop_dir/Mount DR Tools.desktop" 2>/dev/null || true
+rm -f "\$desktop_dir/Home.desktop" "\$desktop_dir/home.desktop" "\$desktop_dir/Computer.desktop" "\$desktop_dir/Trash.desktop" 2>/dev/null || true
+
+# Hide GNOME desktop special icons where the extension/schema supports it.
+if command -v gsettings >/dev/null 2>&1; then
+    gsettings set org.gnome.shell.extensions.ding show-home false >/dev/null 2>&1 || true
+    gsettings set org.gnome.shell.extensions.ding show-trash false >/dev/null 2>&1 || true
+    gsettings set org.gnome.desktop.background show-desktop-icons false >/dev/null 2>&1 || true
+fi
 
 wrapper="\$bin_dir/dr-launch-kit"
 cat > "\$wrapper" << 'EOF2'
@@ -3132,7 +3140,7 @@ chmod 755 "\$kit_app"; cp -f "\$kit_app" "\$kit_desktop"; trust_desktop_file "\$
 # behaves like Windows Explorer. Command launchers remain on the Desktop or are
 # exposed as terminal aliases/README guidance instead of as .desktop files in
 # this folder.
-for stale in     "\$resources_dir/Tool Server.desktop"     "\$resources_dir/Logical Recovery Tools.desktop"     "\$resources_dir/Physical Recovery Tools.desktop"     "\$resources_dir/DRTools.desktop"     "\$resources_dir/CRTools.desktop"     "\$resources_dir/Firmware.desktop"     "\$resources_dir/Audit Resources.desktop"     "\$resources_dir/Recovery Notes.desktop"     "\$resources_dir/Engineering Logs.desktop"     "\$resources_dir/Mount Tool Server.desktop"     "\$resources_dir/Repair Workspace.desktop"     "\$resources_dir/Workstation Diagnostics.desktop"; do
+for stale in     "\$resources_dir/Tool Server.desktop"     "\$resources_dir/Logical Recovery Tools.desktop"     "\$resources_dir/Physical Recovery Tools.desktop"     "\$resources_dir/DRTools.desktop"     "\$resources_dir/CRTools.desktop"     "\$resources_dir/Firmware.desktop"     "\$resources_dir/Audit Resources.desktop"     "\$resources_dir/Recovery Notes.desktop"     "\$resources_dir/Engineering Logs.desktop"     "\$resources_dir/Engineering Logs"     "\$resources_dir/Mount Tool Server.desktop"     "\$resources_dir/Repair Workspace.desktop"     "\$resources_dir/Workstation Diagnostics.desktop"; do
     rm -f "\$stale" 2>/dev/null || true
 done
 
@@ -3151,7 +3159,6 @@ link_resource "CRTools" "/mnt/x/CRTools"
 link_resource "Firmware" "/mnt/x/Firmware"
 link_resource "Audit Resources" "/mnt/x/Audit"
 link_resource "Recovery Notes" "\$notes_dir"
-link_resource "Engineering Logs" "\$ONTRACK_LOG_DIR"
 cat > "\$resources_dir/README - Start Here.txt" << EOF2
 Ontrack Recovery Workstation
 ============================
@@ -3167,6 +3174,9 @@ CRTools contains clean-room tools for storage-device preparation, system/service
 Firmware opens the shared firmware repository.
 Audit Resources opens shared audit resources.
 Recovery Notes is your local notes folder.
+
+Logs are kept quietly under ~/.local/share/ontrack/logs and are intended for diagnostics, not daily workflow.
+
 Repair Workspace recreates launchers, bookmarks, wallpaper, and shortcuts if anything is accidentally changed.
 Run it from Terminal with:
   dr-user-desktop-provision --repair
@@ -3382,6 +3392,46 @@ exec "$RUNNER" "$@"
 EOF
     chmod +x /usr/local/bin/mount-kit-tools-desktop
 
+    cat > /usr/local/bin/mount-kit-tools-autostart << 'EOF'
+#!/bin/bash
+# Quiet login-time Tool Server/workspace verifier. Successful runs produce no UI.
+# If anything fails, show the captured diagnostics in a terminal and leave it open.
+set -u
+
+RUNNER="/usr/local/bin/mount-kit-tools-desktop-runner"
+LOG_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+LOG="$LOG_DIR/dr-mount-kit-tools-autostart.log"
+
+"$RUNNER" --autostart-quiet >"$LOG" 2>&1
+status=$?
+
+if [ "$status" -eq 0 ]; then
+    exit 0
+fi
+
+show_failure() {
+    echo "Ontrack Recovery Workstation startup encountered a problem."
+    echo ""
+    cat "$LOG" 2>/dev/null || true
+    echo ""
+    echo "Exit code: $status"
+    echo ""
+    read -r -p "Press Enter to close..." _
+}
+
+if command -v x-terminal-emulator >/dev/null 2>&1; then
+    exec x-terminal-emulator -e bash -lc "cat '$LOG'; echo; echo 'Exit code: $status'; echo; read -r -p 'Press Enter to close...' _"
+fi
+
+if command -v gnome-terminal >/dev/null 2>&1; then
+    exec gnome-terminal -- bash -lc "cat '$LOG'; echo; echo 'Exit code: $status'; echo; read -r -p 'Press Enter to close...' _"
+fi
+
+show_failure
+exit "$status"
+EOF
+    chmod +x /usr/local/bin/mount-kit-tools-autostart
+
     cat > /usr/local/bin/mount-kit-tools-desktop-runner << 'EOF'
 #!/bin/bash
 
@@ -3559,7 +3609,7 @@ EOF
 [Desktop Entry]
 Name=Mount DR Tools
 Comment=Mount the DR Tools share at /mnt/x
-Exec=/usr/local/bin/mount-kit-tools-desktop --autostart-quiet
+Exec=/usr/local/bin/mount-kit-tools-autostart
 Icon=drive-network
 Terminal=false
 Type=Application
