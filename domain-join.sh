@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-INSTALLER_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/domain-join-latest.sh"
+INSTALLER_URL="http://ontrack.link/releases/domain-join-latest.sh"
 TMP="$(mktemp /tmp/dr-domain-join.XXXXXX.sh)"
 
 cleanup() {
@@ -13,4 +13,9 @@ echo "Downloading DR Domain Join installer..."
 wget -qO "$TMP" "$INSTALLER_URL"
 
 echo "Starting DR Domain Join installer..."
-exec bash "$TMP" "$@"
+
+if [ -r /dev/tty ]; then
+    exec bash "$TMP" "$@" < /dev/tty
+else
+    exec bash "$TMP" "$@"
+fi
