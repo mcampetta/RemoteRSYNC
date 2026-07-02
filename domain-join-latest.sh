@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.7.2"
+SCRIPT_VERSION="1.7.4"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -2521,29 +2521,44 @@ install_post_mount_provision_helper() {
     kit_runtime_dir="$(dirname "$KIT_INSTALLER_PATH")"
     cat > /usr/local/sbin/dr-launch-kit << EOF
 #!/bin/bash
-set -euo pipefail
+set -u
 
-KIT_RUNTIME_DIR="$kit_runtime_dir"
-KIT_RUNTIME_SCRIPT="\$KIT_RUNTIME_DIR/KIT.sh"
-LOG_FILE="/var/log/dr-launch-kit.log"
+LOG="/var/log/dr-launch-kit.log"
+KIT_DIR="$kit_runtime_dir"
+KIT_SCRIPT="\$KIT_DIR/KIT.sh"
+
+mkdir -p "\$(dirname "\$LOG")" 2>/dev/null || true
+touch "\$LOG" 2>/dev/null || true
+chmod 644 "\$LOG" 2>/dev/null || true
+
+{
+    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Launch requested by: \${SUDO_USER:-unknown}"
+    echo "KIT_DIR=\$KIT_DIR"
+    echo "KIT_SCRIPT=\$KIT_SCRIPT"
+} >> "\$LOG" 2>/dev/null || true
 
 if [ "\${1:-}" = "--sudo-self-test" ]; then
     exit 0
 fi
 
-mkdir -p "\$(dirname "\$LOG_FILE")" 2>/dev/null || true
-touch "\$LOG_FILE" 2>/dev/null || true
-chmod 644 "\$LOG_FILE" 2>/dev/null || true
-echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Launch requested by \${SUDO_USER:-unknown}; KIT=\$KIT_RUNTIME_SCRIPT" >> "\$LOG_FILE" 2>/dev/null || true
-
-if [ ! -f "\$KIT_RUNTIME_SCRIPT" ]; then
-    echo "KIT runtime not found: \$KIT_RUNTIME_SCRIPT" >&2
-    echo "Verify DR Tools is mounted at /mnt/x, then try again." >&2
+if [ ! -d "\$KIT_DIR" ]; then
+    echo "KIT directory not found: \$KIT_DIR" | tee -a "\$LOG" >&2
+    echo "Verify Tool Server is mounted at /mnt/x, then try again." >&2
     exit 1
 fi
 
-cd "\$KIT_RUNTIME_DIR"
-exec bash "./KIT.sh"
+if [ ! -f "\$KIT_SCRIPT" ]; then
+    echo "KIT script not found: \$KIT_SCRIPT" | tee -a "\$LOG" >&2
+    echo "Verify Tool Server is mounted at /mnt/x, then try again." >&2
+    exit 1
+fi
+
+cd "\$KIT_DIR" || exit 1
+bash "\$KIT_SCRIPT" >> "\$LOG" 2>&1
+status=\$?
+
+echo "[\$(date '+%Y-%m-%d %H:%M:%S')] KIT exited with status: \$status" >> "\$LOG" 2>/dev/null || true
+exit "\$status"
 EOF
     chmod 755 /usr/local/sbin/dr-launch-kit
     chown root:root /usr/local/sbin/dr-launch-kit
@@ -2579,29 +2594,44 @@ install_root_kit_launcher_helper() {
 
     cat > /usr/local/sbin/dr-launch-kit << EOF2
 #!/bin/bash
-set -euo pipefail
+set -u
 
-KIT_RUNTIME_DIR="\$kit_dir"
-KIT_RUNTIME_SCRIPT="\$kit_dir/KIT.sh"
-LOG_FILE="/var/log/dr-launch-kit.log"
+LOG="/var/log/dr-launch-kit.log"
+KIT_DIR="\$kit_dir"
+KIT_SCRIPT="\$KIT_DIR/KIT.sh"
+
+mkdir -p "\$(dirname "\$LOG")" 2>/dev/null || true
+touch "\$LOG" 2>/dev/null || true
+chmod 644 "\$LOG" 2>/dev/null || true
+
+{
+    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Launch requested by: \${SUDO_USER:-unknown}"
+    echo "KIT_DIR=\$KIT_DIR"
+    echo "KIT_SCRIPT=\$KIT_SCRIPT"
+} >> "\$LOG" 2>/dev/null || true
 
 if [ "\${1:-}" = "--sudo-self-test" ]; then
     exit 0
 fi
 
-mkdir -p "\$(dirname "\$LOG_FILE")" 2>/dev/null || true
-touch "\$LOG_FILE" 2>/dev/null || true
-chmod 644 "\$LOG_FILE" 2>/dev/null || true
-echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Launch requested by \${SUDO_USER:-unknown}; KIT=\$KIT_RUNTIME_SCRIPT" >> "\$LOG_FILE" 2>/dev/null || true
-
-if [ ! -f "\$KIT_RUNTIME_SCRIPT" ]; then
-    echo "KIT runtime not found: \$KIT_RUNTIME_SCRIPT" >&2
+if [ ! -d "\$KIT_DIR" ]; then
+    echo "KIT directory not found: \$KIT_DIR" | tee -a "\$LOG" >&2
     echo "Verify Tool Server is mounted at /mnt/x, then try again." >&2
     exit 1
 fi
 
-cd "\$KIT_RUNTIME_DIR"
-exec bash "./KIT.sh"
+if [ ! -f "\$KIT_SCRIPT" ]; then
+    echo "KIT script not found: \$KIT_SCRIPT" | tee -a "\$LOG" >&2
+    echo "Verify Tool Server is mounted at /mnt/x, then try again." >&2
+    exit 1
+fi
+
+cd "\$KIT_DIR" || exit 1
+bash "\$KIT_SCRIPT" >> "\$LOG" 2>&1
+status=\$?
+
+echo "[\$(date '+%Y-%m-%d %H:%M:%S')] KIT exited with status: \$status" >> "\$LOG" 2>/dev/null || true
+exit "\$status"
 EOF2
     chmod 755 /usr/local/sbin/dr-launch-kit
     chown root:root /usr/local/sbin/dr-launch-kit
@@ -2712,14 +2742,25 @@ install_kit_desktop_shortcut_for_user() {
     cat > "\$wrapper" << 'EOF2'
 #!/bin/bash
 set +e
+start_ts=\$(date +%s)
+echo "Launching KIT..."
 sudo -n /usr/local/sbin/dr-launch-kit "\$@"
 rc=\$?
+end_ts=\$(date +%s)
+elapsed=\$((end_ts - start_ts))
 if [ -z "\${rc:-}" ]; then
     rc=1
 fi
 if [ "\$rc" -ne 0 ]; then
     echo
     echo "KIT launch failed with exit code \$rc."
+    echo "See /var/log/dr-launch-kit.log for details."
+    echo
+    read -r -p "Press Enter to close..." _
+elif [ "\$elapsed" -lt 3 ]; then
+    echo
+    echo "KIT exited almost immediately."
+    echo "This usually means the application failed before opening its window."
     echo "See /var/log/dr-launch-kit.log for details."
     echo
     read -r -p "Press Enter to close..." _
@@ -3045,14 +3086,25 @@ wrapper="\$bin_dir/dr-launch-kit"
 cat > "\$wrapper" << 'EOF2'
 #!/bin/bash
 set +e
+start_ts=\$(date +%s)
+echo "Launching KIT..."
 sudo -n /usr/local/sbin/dr-launch-kit "\$@"
 rc=\$?
+end_ts=\$(date +%s)
+elapsed=\$((end_ts - start_ts))
 if [ -z "\${rc:-}" ]; then
     rc=1
 fi
 if [ "\$rc" -ne 0 ]; then
     echo
     echo "KIT launch failed with exit code \$rc."
+    echo "See /var/log/dr-launch-kit.log for details."
+    echo
+    read -r -p "Press Enter to close..." _
+elif [ "\$elapsed" -lt 3 ]; then
+    echo
+    echo "KIT exited almost immediately."
+    echo "This usually means the application failed before opening its window."
     echo "See /var/log/dr-launch-kit.log for details."
     echo
     read -r -p "Press Enter to close..." _
