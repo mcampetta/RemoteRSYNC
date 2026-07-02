@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.6.14"
+SCRIPT_VERSION="1.6.16"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -2513,6 +2513,41 @@ ensure_directory_path() {
 install_post_mount_provision_helper() {
     print_info "Installing post-mount provisioning helper for KIT installer and workstation branding..."
 
+    # Install/repair the canonical root KIT launch helper now, not only after
+    # post-mount provisioning runs. The desktop shortcut and sudoers rule both
+    # target this one helper. It is intentionally narrow: it only cd's into the
+    # KIT runtime directory and launches KIT.sh.
+    local kit_runtime_dir
+    kit_runtime_dir="$(dirname "$KIT_INSTALLER_PATH")"
+    cat > /usr/local/sbin/dr-launch-kit << EOF
+#!/bin/bash
+set -euo pipefail
+
+KIT_RUNTIME_DIR="$kit_runtime_dir"
+KIT_RUNTIME_SCRIPT="\$KIT_RUNTIME_DIR/KIT.sh"
+LOG_FILE="/var/log/dr-launch-kit.log"
+
+if [ "\${1:-}" = "--sudo-self-test" ]; then
+    exit 0
+fi
+
+mkdir -p "\$(dirname "\$LOG_FILE")" 2>/dev/null || true
+touch "\$LOG_FILE" 2>/dev/null || true
+chmod 644 "\$LOG_FILE" 2>/dev/null || true
+echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Launch requested by \${SUDO_USER:-unknown}; KIT=\$KIT_RUNTIME_SCRIPT" >> "\$LOG_FILE" 2>/dev/null || true
+
+if [ ! -f "\$KIT_RUNTIME_SCRIPT" ]; then
+    echo "KIT runtime not found: \$KIT_RUNTIME_SCRIPT" >&2
+    echo "Verify DR Tools is mounted at /mnt/x, then try again." >&2
+    exit 1
+fi
+
+cd "\$KIT_RUNTIME_DIR"
+exec bash "./KIT.sh"
+EOF
+    chmod 755 /usr/local/sbin/dr-launch-kit
+    chown root:root /usr/local/sbin/dr-launch-kit
+
     cat > /usr/local/sbin/dr-post-mount-provision << EOF
 #!/bin/bash
 set -euo pipefail
@@ -2542,13 +2577,16 @@ install_root_kit_launcher_helper() {
     local kit_dir
     kit_dir="\$(dirname "\$KIT_INSTALLER_PATH")"
 
-    cat > /usr/local/sbin/dr-launch-kit << EOF2
-#!/bin/bash
-set -euo pipefail
-KIT_DIR="\$kit_dir"
-cd "\$KIT_DIR"
-exec bash "./KIT.sh"
-EOF2
+    # Generate the root KIT launcher without embedding unexpanded KIT_DIR-style
+    # variables. Earlier builds wrote KIT_DIR into the generated helper path and
+    # could fail under set -u when the post-mount helper was re-entered after KIT
+    # was already marked complete.
+    {
+        echo '#!/bin/bash'
+        echo 'set -euo pipefail'
+        printf 'cd %q\n' "\$kit_dir"
+        echo 'exec bash "./KIT.sh"'
+    } > /usr/local/sbin/dr-launch-kit
     chmod 755 /usr/local/sbin/dr-launch-kit
     chown root:root /usr/local/sbin/dr-launch-kit
 }
@@ -2658,7 +2696,16 @@ install_kit_desktop_shortcut_for_user() {
     cat > "\$wrapper" << EOF2
 #!/bin/bash
 set -e
-exec sudo -n /usr/local/sbin/dr-launch-kit
+sudo -n /usr/local/sbin/dr-launch-kit
+rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo
+    echo "KIT launch failed with exit code $rc."
+    echo "See /var/log/dr-launch-kit.log for details."
+    echo
+    read -r -p "Press Enter to close..." _
+fi
+exit "$rc"
 EOF2
     chmod 755 "\$wrapper"
 
@@ -2920,7 +2967,16 @@ if [ -f "\$kit_launcher" ]; then
     cat > "\$wrapper" << EOF2
 #!/bin/bash
 set -e
-exec sudo -n /usr/local/sbin/dr-launch-kit
+sudo -n /usr/local/sbin/dr-launch-kit
+rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo
+    echo "KIT launch failed with exit code $rc."
+    echo "See /var/log/dr-launch-kit.log for details."
+    echo
+    read -r -p "Press Enter to close..." _
+fi
+exit "$rc"
 EOF2
     chmod 755 "\$wrapper"
 
