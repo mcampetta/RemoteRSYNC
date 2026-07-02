@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.6.2"
+SCRIPT_VERSION="1.6.3"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -2469,9 +2469,19 @@ if ! mountpoint -q /mnt/x; then
 fi
 
 install_kit() {
+    local kit_dir
+    local kit_script
+    local rc
+
     if state_has "KIT_INSTALL_COMPLETE"; then
         log "KIT installer already marked complete; skipping."
         return 0
+    fi
+
+    if [ -z "\${OFFICE_CODE:-}" ]; then
+        log "No office code is available for KIT installer automation."
+        log "Cannot run KIT installer because it requires an office code such as EP1."
+        exit 1
     fi
 
     if [ ! -f "\$KIT_INSTALLER_PATH" ]; then
@@ -2480,8 +2490,18 @@ install_kit() {
         return 0
     fi
 
-    log "Starting KIT installer: \$KIT_INSTALLER_PATH"
-    if bash "\$KIT_INSTALLER_PATH" >> "\$LOG_FILE" 2>&1; then
+    kit_dir="\$(dirname "\$KIT_INSTALLER_PATH")"
+    kit_script="\$(basename "\$KIT_INSTALLER_PATH")"
+
+    log "Starting KIT installer."
+    log "Office code: \$OFFICE_CODE"
+    log "Installer: \$KIT_INSTALLER_PATH"
+    log "Working directory: \$kit_dir"
+
+    if (
+        cd "\$kit_dir"
+        printf '%s\n' "\$OFFICE_CODE" | bash "./\$kit_script"
+    ) >> "\$LOG_FILE" 2>&1; then
         state_mark "KIT_INSTALL_COMPLETE"
         log "KIT installer completed successfully."
     else
