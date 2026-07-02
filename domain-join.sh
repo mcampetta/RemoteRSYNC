@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.6.5"
+SCRIPT_VERSION="1.6.6"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -2504,6 +2504,8 @@ KIT_INSTALLER_PATH="${KIT_INSTALLER_PATH}"
 BRAND_WALLPAPER_SOURCE="${BRAND_WALLPAPER_SOURCE}"
 BRAND_WALLPAPER_DEST="${BRAND_WALLPAPER_DEST}"
 STATE_DIR="${STATE_DIR}"
+STATE_FILE="${STATE_FILE}"
+OFFICE_CODE="${OFFICE_CODE:-}"
 LOG_FILE="/var/log/dr-post-mount-provision.log"
 
 log() {
@@ -2530,6 +2532,21 @@ fi
 mkdir -p "\$STATE_DIR"
 touch "\$LOG_FILE"
 chmod 644 "\$LOG_FILE" 2>/dev/null || true
+
+# The desktop/autostart path reaches this helper through sudo -n, which does
+# not preserve the technician-phase shell variables. Rehydrate the saved
+# installer state here so KIT automation still knows the selected office code.
+if [ -z "\${OFFICE_CODE:-}" ] && [ -f "\$STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "\$STATE_FILE" || true
+    OFFICE_CODE="\${OFFICE_CODE:-}"
+fi
+
+if [ -n "\${OFFICE_CODE:-}" ]; then
+    log "Using office code for post-mount provisioning: \$OFFICE_CODE"
+else
+    log "No saved office code found in \$STATE_FILE."
+fi
 
 if ! mountpoint -q /mnt/x; then
     log "DR Tools share is not mounted at /mnt/x; skipping post-mount provisioning."
