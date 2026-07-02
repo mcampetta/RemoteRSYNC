@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.4"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -2518,53 +2518,56 @@ install_post_mount_provision_helper() {
     # target this one helper. It is intentionally narrow: it only cd's into the
     # KIT runtime directory and launches KIT.sh.
     local kit_runtime_dir
+    local escaped_kit_runtime_dir
     kit_runtime_dir="$(dirname "$KIT_INSTALLER_PATH")"
-    cat > /usr/local/sbin/dr-launch-kit << EOF
+
+    # Generate this helper with a quoted heredoc so runtime variables such as
+    # $LOG, $KIT_DIR, ${1:-}, and $? are preserved until dr-launch-kit runs.
+    cat > /usr/local/sbin/dr-launch-kit << 'EOF'
 #!/bin/bash
 set -u
 
 LOG="/var/log/dr-launch-kit.log"
-KIT_DIR="$kit_runtime_dir"
+KIT_DIR="__KIT_RUNTIME_DIR__"
 KIT_SCRIPT="./KIT.sh"
 
-mkdir -p "\$(dirname "\$LOG")" 2>/dev/null || true
-touch "\$LOG" 2>/dev/null || true
-chmod 644 "\$LOG" 2>/dev/null || true
-
-{
-    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Launch requested by: \${SUDO_USER:-unknown}"
-    echo "KIT_DIR=\$KIT_DIR"
-    echo "KIT_SCRIPT=\$KIT_DIR/KIT.sh"
-} >> "\$LOG" 2>/dev/null || true
-
-if [ "\${1:-}" = "--sudo-self-test" ]; then
+if [ "${1:-}" = "--sudo-self-test" ]; then
     exit 0
 fi
 
-if [ ! -d "\$KIT_DIR" ]; then
-    echo "KIT directory not found: \$KIT_DIR" | tee -a "\$LOG" >&2
+{
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Launch requested by: ${SUDO_USER:-unknown}"
+    echo "KIT_DIR=$KIT_DIR"
+    echo "KIT_SCRIPT=$KIT_DIR/$KIT_SCRIPT"
+} >> "$LOG" 2>/dev/null || true
+
+if [ ! -d "$KIT_DIR" ]; then
+    echo "KIT directory not found: $KIT_DIR" | tee -a "$LOG" >&2
     echo "Verify Tool Server is mounted at /mnt/x, then try again." >&2
     exit 1
 fi
 
-if [ ! -f "\$KIT_DIR/KIT.sh" ]; then
-    echo "KIT script not found: \$KIT_DIR/KIT.sh" | tee -a "\$LOG" >&2
+if [ ! -f "$KIT_DIR/$KIT_SCRIPT" ]; then
+    echo "KIT script not found: $KIT_DIR/$KIT_SCRIPT" | tee -a "$LOG" >&2
     echo "Verify Tool Server is mounted at /mnt/x, then try again." >&2
     exit 1
 fi
 
-cd "\$KIT_DIR" || exit 1
+cd "$KIT_DIR" || exit 1
 
 # Intentionally do NOT redirect stdout/stderr. KIT behaves correctly when
 # launched like the manual known-good command:
 #   cd /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64
 #   sudo bash ./KIT.sh
-bash "\$KIT_SCRIPT"
-status=\$?
+bash "$KIT_SCRIPT"
+status=$?
 
-echo "[\$(date '+%Y-%m-%d %H:%M:%S')] KIT exited with status: \$status" >> "\$LOG" 2>/dev/null || true
-exit "\$status"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] KIT exited with status: $status" >> "$LOG" 2>/dev/null || true
+exit "$status"
 EOF
+    escaped_kit_runtime_dir="$(printf '%s
+' "$kit_runtime_dir" | sed 's/[#&]/\&/g')"
+    sed -i "s#__KIT_RUNTIME_DIR__#$escaped_kit_runtime_dir#g" /usr/local/sbin/dr-launch-kit
     chmod 755 /usr/local/sbin/dr-launch-kit
     chown root:root /usr/local/sbin/dr-launch-kit
 
@@ -2597,12 +2600,14 @@ install_root_kit_launcher_helper() {
     local kit_dir
     kit_dir="\$(dirname "\$KIT_INSTALLER_PATH")"
 
-    cat > /usr/local/sbin/dr-launch-kit << EOF2
+    # Quote the nested heredoc so variables like $LOG and $1 are not
+    # expanded by dr-post-mount-provision while it is generating the helper.
+    cat > /usr/local/sbin/dr-launch-kit << 'EOF2'
 #!/bin/bash
 set -u
 
 LOG="/var/log/dr-launch-kit.log"
-KIT_DIR="\$kit_dir"
+KIT_DIR="__KIT_RUNTIME_DIR__"
 KIT_SCRIPT="./KIT.sh"
 
 mkdir -p "\$(dirname "\$LOG")" 2>/dev/null || true
@@ -2643,6 +2648,9 @@ status=\$?
 echo "[\$(date '+%Y-%m-%d %H:%M:%S')] KIT exited with status: \$status" >> "\$LOG" 2>/dev/null || true
 exit "\$status"
 EOF2
+    escaped_kit_dir="\$(printf '%s\n' "\$kit_dir" | sed 's/[#&]/\\&/g')"
+    sed -i "s#__KIT_RUNTIME_DIR__#\$escaped_kit_dir#g" /usr/local/sbin/dr-launch-kit
+
     chmod 755 /usr/local/sbin/dr-launch-kit
     chown root:root /usr/local/sbin/dr-launch-kit
 }
