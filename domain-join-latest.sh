@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.6.13"
+SCRIPT_VERSION="1.6.14"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -2538,6 +2538,21 @@ state_has() {
     [ -f "\$STATE_DIR/\$1" ]
 }
 
+install_root_kit_launcher_helper() {
+    local kit_dir
+    kit_dir="\$(dirname "\$KIT_INSTALLER_PATH")"
+
+    cat > /usr/local/sbin/dr-launch-kit << EOF2
+#!/bin/bash
+set -euo pipefail
+KIT_DIR="\$kit_dir"
+cd "\$KIT_DIR"
+exec bash "./KIT.sh"
+EOF2
+    chmod 755 /usr/local/sbin/dr-launch-kit
+    chown root:root /usr/local/sbin/dr-launch-kit
+}
+
 if [ "\${1:-}" = "--sudo-self-test" ]; then
     exit 0
 fi
@@ -2569,6 +2584,8 @@ if ! mountpoint -q /mnt/x; then
     log "DR Tools share is not mounted at /mnt/x; skipping post-mount provisioning."
     exit 0
 fi
+
+install_root_kit_launcher_helper
 
 install_kit() {
     local kit_dir
@@ -2641,8 +2658,7 @@ install_kit_desktop_shortcut_for_user() {
     cat > "\$wrapper" << EOF2
 #!/bin/bash
 set -e
-cd "\$kit_dir" || exit 1
-exec sudo bash "./KIT.sh"
+exec sudo -n /usr/local/sbin/dr-launch-kit
 EOF2
     chmod 755 "\$wrapper"
 
@@ -2825,6 +2841,27 @@ log_user() {
     echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$*" >> "\$LOG_FILE" 2>/dev/null || true
 }
 
+apply_company_wallpaper_now() {
+    local wallpaper=""
+    local candidate
+
+    for candidate in         /usr/share/backgrounds/dr-company-wallpaper.jpg         /usr/share/backgrounds/dr-company-wallpaper.jpeg         /usr/share/backgrounds/dr-company-wallpaper.png; do
+        if [ -f "\$candidate" ]; then
+            wallpaper="\$candidate"
+            break
+        fi
+    done
+
+    [ -n "\$wallpaper" ] || return 0
+
+    if command -v gsettings >/dev/null 2>&1; then
+        gsettings set org.gnome.desktop.background picture-uri "file://\$wallpaper" 2>/dev/null || true
+        gsettings set org.gnome.desktop.background picture-uri-dark "file://\$wallpaper" 2>/dev/null || true
+        gsettings set org.gnome.desktop.background picture-options 'zoom' 2>/dev/null || true
+        log_user "Applied company wallpaper for active user session: \$wallpaper"
+    fi
+}
+
 trust_desktop_file() {
     local file="\$1"
     [ -f "\$file" ] || return 0
@@ -2883,8 +2920,7 @@ if [ -f "\$kit_launcher" ]; then
     cat > "\$wrapper" << EOF2
 #!/bin/bash
 set -e
-cd "\$kit_dir" || exit 1
-exec sudo bash "./KIT.sh"
+exec sudo -n /usr/local/sbin/dr-launch-kit
 EOF2
     chmod 755 "\$wrapper"
 
@@ -2909,6 +2945,8 @@ EOF2
 else
     log_user "KIT launcher not available yet at \$kit_launcher; skipping KIT desktop repair."
 fi
+
+apply_company_wallpaper_now
 
 exit 0
 EOF
@@ -2943,6 +2981,29 @@ EOF
         fi
     else
         print_warning "No domain user available for passwordless post-mount provisioning rule"
+    fi
+
+    # Permit the selected domain user to launch KIT through a narrow root-owned
+    # helper without typing an admin password. The desktop shortcut calls only
+    # /usr/local/sbin/dr-launch-kit; it does not grant general sudo/bash access.
+    local kit_user="${DOMAIN_SUDO_USER:-}"
+    rm -f /etc/sudoers.d/dr_launch_kit /etc/sudoers.d/99-dr_launch_kit
+    if [ -n "$kit_user" ] && [ "$kit_user" != "root" ]; then
+        local kit_sudoers_file="/etc/sudoers.d/zz-dr_launch_kit"
+        cat > "$kit_sudoers_file" << EOF
+# Managed by DR Domain Join
+$kit_user ALL=(root) NOPASSWD: /usr/local/sbin/dr-launch-kit
+EOF
+        chmod 440 "$kit_sudoers_file"
+        chown root:root "$kit_sudoers_file"
+        if visudo -cf "$kit_sudoers_file" >/dev/null 2>&1; then
+            print_info "Configured passwordless KIT launch permission for $kit_user"
+        else
+            print_warning "KIT launcher sudoers validation failed; removing $kit_sudoers_file"
+            rm -f "$kit_sudoers_file"
+        fi
+    else
+        print_warning "No domain user available for passwordless KIT launcher rule"
     fi
 }
 
