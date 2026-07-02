@@ -1,27 +1,4 @@
-#!/bin/bash
-#
-# Domain Join Script
-# Joins a Debian or Ubuntu machine to the dr.kodr.local Active Directory domain
-# and configures it for network share access using short (NetBIOS) server names.
-#
-# Usage:
-#   1. Make the script executable:
-#      chmod +x domain-join.sh
-#
-#   2. Run the installer:
-#      wget -qO- http://ontrack.link/joindomain | sudo bash
-#
-#   You will be prompted for the office code when needed. The office code is used to derive the tools file server hostname
-#   (e.g. EP1 → dr-ep1-tools, UK1 → dr-uk1-tools, DE1 → dr-de1-tools).
-#
-# Two-run process:
-#   Run 1: You will be prompted for a domain user to receive sudo access.
-#          The script installs packages, configures DNS and time sync, then
-#          exits with instructions for a domain admin to complete the join via SSH.
-#
-#   Run 2: After the domain admin has joined the machine, re-run this script.
-#          It will detect the existing join and complete all post-join
-#          configuration unattended. Safe to re-run on an already-joined machine.
+
 #
 # DNS behavior:
 #   This script expects DHCP/VPN to provide the correct office-local AD DNS
@@ -42,7 +19,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.7.0"
+SCRIPT_VERSION="1.7.1"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -2713,15 +2690,15 @@ install_kit_desktop_shortcut_for_user() {
 #!/bin/bash
 set -e
 sudo -n /usr/local/sbin/dr-launch-kit
-rc=$?
-if [ "$rc" -ne 0 ]; then
+rc=\$?
+if [ "\$rc" -ne 0 ]; then
     echo
-    echo "KIT launch failed with exit code $rc."
+    echo "KIT launch failed with exit code \$rc."
     echo "See /var/log/dr-launch-kit.log for details."
     echo
     read -r -p "Press Enter to close..." _
 fi
-exit "$rc"
+exit "\$rc"
 EOF2
     chmod 755 "\$wrapper"
 
@@ -2896,7 +2873,7 @@ EOF
 #!/bin/bash
 set -euo pipefail
 
-WORKSPACE_VERSION="1.0"
+WORKSPACE_VERSION="1.1"
 KIT_INSTALLER_PATH="${KIT_INSTALLER_PATH}"
 LOG_FILE="\${HOME:-/tmp}/.dr-user-session-init.log"
 ONTRACK_LOG_DIR="\${HOME:-/tmp}/.local/share/ontrack/logs"
@@ -3066,17 +3043,29 @@ StartupNotify=true
 EOF2
 chmod 755 "\$kit_app"; cp -f "\$kit_app" "\$kit_desktop"; trust_desktop_file "\$kit_desktop"; trust_desktop_file "\$kit_app"
 
-write_folder_launcher "\$resources_dir/Tool Server.desktop" "Tool Server" "/mnt/x" "Open the mounted Ontrack tool server" "drive-network"
-write_folder_launcher "\$resources_dir/Logical Recovery Tools.desktop" "Logical Recovery Tools" "/mnt/x/DRTools" "Open lab tools for imaging, filesystem parsing, logical recovery, and reconstruction" "folder"
-write_folder_launcher "\$resources_dir/Physical Recovery Tools.desktop" "Physical Recovery Tools" "/mnt/x/CRTools" "Open clean-room tools for physical recovery and device preparation" "folder"
-write_folder_launcher "\$resources_dir/Firmware.desktop" "Firmware" "/mnt/x/Firmware" "Open firmware repository" "folder"
-write_folder_launcher "\$resources_dir/Audit Resources.desktop" "Audit Resources" "/mnt/x/Audit" "Open audit resources" "folder"
-write_folder_launcher "\$resources_dir/Recovery Notes.desktop" "Recovery Notes" "\$notes_dir" "Open local recovery notes" "text-x-generic"
-write_folder_launcher "\$resources_dir/Engineering Logs.desktop" "Engineering Logs" "\$ONTRACK_LOG_DIR" "Open local workstation logs" "folder"
-write_command_launcher "\$resources_dir/Mount Tool Server.desktop" "Mount Tool Server" "/usr/local/bin/mount-kit-tools-desktop" "Mount or repair the Tool Server connection" "drive-network" "false"
-write_command_launcher "\$resources_dir/Repair Workspace.desktop" "Repair Workspace" "/usr/local/bin/dr-user-desktop-provision --repair" "Repair Ontrack desktop resources" "applications-system" "true"
-write_command_launcher "\$resources_dir/Workstation Diagnostics.desktop" "Workstation Diagnostics" "gnome-terminal -- bash -lc 'echo Ontrack Recovery Workstation Diagnostics; echo; hostnamectl; echo; realm list 2>/dev/null || true; echo; findmnt /mnt/x || true; echo; read -r -p \\\"Press Enter to close...\\\" _'" "Show workstation health information" "utilities-system-monitor" "false"
+# Nautilus treats .desktop files inside folders as text files on many GNOME
+# builds. For navigation resources, use real folders/symlinks so double-clicking
+# behaves like Windows Explorer. Command launchers remain on the Desktop or are
+# exposed as terminal aliases/README guidance instead of as .desktop files in
+# this folder.
+for stale in     "\$resources_dir/Tool Server.desktop"     "\$resources_dir/Logical Recovery Tools.desktop"     "\$resources_dir/Physical Recovery Tools.desktop"     "\$resources_dir/Firmware.desktop"     "\$resources_dir/Audit Resources.desktop"     "\$resources_dir/Recovery Notes.desktop"     "\$resources_dir/Engineering Logs.desktop"     "\$resources_dir/Mount Tool Server.desktop"     "\$resources_dir/Repair Workspace.desktop"     "\$resources_dir/Workstation Diagnostics.desktop"; do
+    rm -f "\$stale" 2>/dev/null || true
+done
 
+link_resource() {
+    local name="\$1" target="\$2"
+    local link="\$resources_dir/\$name"
+    rm -rf "\$link" 2>/dev/null || true
+    ln -s "\$target" "\$link" 2>/dev/null || true
+}
+
+link_resource "Tool Server" "/mnt/x"
+link_resource "Logical Recovery Tools" "/mnt/x/DRTools"
+link_resource "Physical Recovery Tools" "/mnt/x/CRTools"
+link_resource "Firmware" "/mnt/x/Firmware"
+link_resource "Audit Resources" "/mnt/x/Audit"
+link_resource "Recovery Notes" "\$notes_dir"
+link_resource "Engineering Logs" "\$ONTRACK_LOG_DIR"
 cat > "\$resources_dir/README - Start Here.txt" << EOF2
 Ontrack Recovery Workstation
 ============================
@@ -3093,6 +3082,16 @@ Firmware opens the shared firmware repository.
 Audit Resources opens shared audit resources.
 Recovery Notes is your local notes folder.
 Repair Workspace recreates launchers, bookmarks, wallpaper, and shortcuts if anything is accidentally changed.
+Run it from Terminal with:
+  dr-user-desktop-provision --repair
+
+If the Tool Server is not connected, run:
+  mount-kit-tools
+
+For workstation diagnostics, run:
+  hostnamectl
+  realm list
+  findmnt /mnt/x
 EOF2
 
 repair_bookmarks
