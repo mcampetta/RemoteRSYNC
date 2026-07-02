@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.7.4"
+SCRIPT_VERSION="1.0"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -2554,7 +2554,12 @@ if [ ! -f "\$KIT_SCRIPT" ]; then
 fi
 
 cd "\$KIT_DIR" || exit 1
-bash "\$KIT_SCRIPT" >> "\$LOG" 2>&1
+
+# Intentionally do NOT redirect stdout/stderr. KIT behaves correctly when
+# launched like the manual known-good command:
+#   cd /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64
+#   sudo bash ./KIT.sh
+bash "\$KIT_SCRIPT"
 status=\$?
 
 echo "[\$(date '+%Y-%m-%d %H:%M:%S')] KIT exited with status: \$status" >> "\$LOG" 2>/dev/null || true
@@ -2627,7 +2632,12 @@ if [ ! -f "\$KIT_SCRIPT" ]; then
 fi
 
 cd "\$KIT_DIR" || exit 1
-bash "\$KIT_SCRIPT" >> "\$LOG" 2>&1
+
+# Intentionally do NOT redirect stdout/stderr. KIT behaves correctly when
+# launched like the manual known-good command:
+#   cd /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64
+#   sudo bash ./KIT.sh
+bash "\$KIT_SCRIPT"
 status=\$?
 
 echo "[\$(date '+%Y-%m-%d %H:%M:%S')] KIT exited with status: \$status" >> "\$LOG" 2>/dev/null || true
@@ -2742,29 +2752,23 @@ install_kit_desktop_shortcut_for_user() {
     cat > "\$wrapper" << 'EOF2'
 #!/bin/bash
 set +e
-start_ts=\$(date +%s)
+
 echo "Launching KIT..."
 sudo -n /usr/local/sbin/dr-launch-kit "\$@"
 rc=\$?
-end_ts=\$(date +%s)
-elapsed=\$((end_ts - start_ts))
+
 if [ -z "\${rc:-}" ]; then
     rc=1
 fi
+
 if [ "\$rc" -ne 0 ]; then
     echo
     echo "KIT launch failed with exit code \$rc."
     echo "See /var/log/dr-launch-kit.log for details."
     echo
     read -r -p "Press Enter to close..." _
-elif [ "\$elapsed" -lt 3 ]; then
-    echo
-    echo "KIT exited almost immediately."
-    echo "This usually means the application failed before opening its window."
-    echo "See /var/log/dr-launch-kit.log for details."
-    echo
-    read -r -p "Press Enter to close..." _
 fi
+
 exit "\$rc"
 EOF2
     chmod 755 "\$wrapper"
@@ -3086,29 +3090,23 @@ wrapper="\$bin_dir/dr-launch-kit"
 cat > "\$wrapper" << 'EOF2'
 #!/bin/bash
 set +e
-start_ts=\$(date +%s)
+
 echo "Launching KIT..."
 sudo -n /usr/local/sbin/dr-launch-kit "\$@"
 rc=\$?
-end_ts=\$(date +%s)
-elapsed=\$((end_ts - start_ts))
+
 if [ -z "\${rc:-}" ]; then
     rc=1
 fi
+
 if [ "\$rc" -ne 0 ]; then
     echo
     echo "KIT launch failed with exit code \$rc."
     echo "See /var/log/dr-launch-kit.log for details."
     echo
     read -r -p "Press Enter to close..." _
-elif [ "\$elapsed" -lt 3 ]; then
-    echo
-    echo "KIT exited almost immediately."
-    echo "This usually means the application failed before opening its window."
-    echo "See /var/log/dr-launch-kit.log for details."
-    echo
-    read -r -p "Press Enter to close..." _
 fi
+
 exit "\$rc"
 EOF2
 chmod 755 "\$wrapper"
