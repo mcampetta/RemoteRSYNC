@@ -42,7 +42,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.0.4"
+SCRIPT_VERSION="1.1.0"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -68,6 +68,8 @@ BRAND_WALLPAPER_DEST="/usr/share/backgrounds/dr-company-wallpaper"
 OFFICE_CODE=""
 TOOLS_SERVER=""
 CONFIG_FILE="/etc/domain-join.conf"
+DR_WORKSTATION_USERS_GROUP="dr-workstation-users"
+DR_WORKSTATION_ADMINS_GROUP="dr-workstation-admins"
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 
@@ -2483,6 +2485,208 @@ ensure_directory_path() {
     mkdir -p "$path"
 }
 
+
+# ── Ontrack workstation user management ──────────────────────────────────────
+# Provides a supported way to add/remove/list domain users after the workstation
+# has already been provisioned. This avoids hand-editing /etc/sudoers.d and
+# gives future releases one managed place to evolve workstation authorization.
+
+install_dr_workstation_manager() {
+    print_info "Installing Ontrack workstation user management command..."
+
+    groupadd -f "$DR_WORKSTATION_USERS_GROUP"
+    groupadd -f "$DR_WORKSTATION_ADMINS_GROUP"
+
+    local sudoers_file="/etc/sudoers.d/zz-dr_workstation_users"
+    cat > "$sudoers_file" << EOF
+# Managed by Ontrack Recovery Workstation Provisioner
+# Members of $DR_WORKSTATION_ADMINS_GROUP are workstation administrators.
+%$DR_WORKSTATION_ADMINS_GROUP ALL=(ALL:ALL) ALL
+
+# Members of $DR_WORKSTATION_USERS_GROUP may run only the managed workstation helpers without a password.
+%$DR_WORKSTATION_USERS_GROUP ALL=(root) NOPASSWD: /usr/local/bin/mount-kit-tools
+%$DR_WORKSTATION_USERS_GROUP ALL=(root) NOPASSWD: /usr/local/sbin/dr-post-mount-provision
+%$DR_WORKSTATION_USERS_GROUP ALL=(root) NOPASSWD: /usr/local/sbin/dr-launch-kit
+EOF
+    chmod 440 "$sudoers_file"
+    chown root:root "$sudoers_file"
+
+    if ! visudo -cf "$sudoers_file" >/dev/null 2>&1; then
+        print_warning "Workstation user-management sudoers validation failed; removing $sudoers_file"
+        rm -f "$sudoers_file"
+        return 1
+    fi
+
+    cat > /usr/local/sbin/dr-workstation << 'EOF'
+#!/bin/bash
+set -euo pipefail
+
+DOMAIN="dr.kodr.local"
+USERS_GROUP="dr-workstation-users"
+ADMINS_GROUP="dr-workstation-admins"
+
+usage() {
+    cat <<USAGE
+Ontrack Recovery Workstation user management
+
+Usage:
+  sudo dr-workstation add-user <domain-user>
+  sudo dr-workstation remove-user <domain-user>
+  sudo dr-workstation list-users
+  sudo dr-workstation status
+
+Examples:
+  sudo dr-workstation add-user jsmith
+  sudo dr-workstation add-user jsmith@dr.kodr.local
+  sudo dr-workstation remove-user jsmith
+
+add-user grants:
+  - normal workstation sudo rights
+  - passwordless access to managed workstation helpers:
+      /usr/local/bin/mount-kit-tools
+      /usr/local/sbin/dr-post-mount-provision
+      /usr/local/sbin/dr-launch-kit
+
+Users should log out and back in after being added or removed.
+USAGE
+}
+
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "This command must be run with sudo." >&2
+        exit 1
+    fi
+}
+
+normalize_user() {
+    local user="${1:-}"
+    user="${user#*\\}"
+    user="${user%%@*}"
+    user="${user// /}"
+    if [ -z "$user" ]; then
+        echo "Missing username." >&2
+        exit 1
+    fi
+    echo "$user"
+}
+
+safe_name_for_user() {
+    local user="$1"
+    echo "${user//./_}"
+}
+
+legacy_sudoers_file_for_user() {
+    local user="$1"
+    local safe
+    safe="$(safe_name_for_user "$user")"
+    echo "/etc/sudoers.d/${safe}_domain_sudo"
+}
+
+ensure_groups() {
+    groupadd -f "$USERS_GROUP"
+    groupadd -f "$ADMINS_GROUP"
+}
+
+remove_legacy_user_sudoers() {
+    local user="$1"
+    local legacy
+    legacy="$(legacy_sudoers_file_for_user "$user")"
+    if [ -f "$legacy" ]; then
+        rm -f "$legacy"
+        echo "Removed legacy per-user sudoers file: $legacy"
+    fi
+}
+
+add_user() {
+    require_root
+    local user
+    user="$(normalize_user "${1:-}")"
+    ensure_groups
+
+    if ! getent passwd "$user" >/dev/null 2>&1; then
+        echo "Warning: '$user' is not currently resolvable through NSS/SSSD." >&2
+        echo "The workstation may need working domain connectivity before this user can be added." >&2
+        exit 1
+    fi
+
+    gpasswd -a "$user" "$USERS_GROUP" >/dev/null
+    gpasswd -a "$user" "$ADMINS_GROUP" >/dev/null
+    remove_legacy_user_sudoers "$user"
+
+    echo "Added workstation user: $user"
+    echo "Granted groups: $USERS_GROUP, $ADMINS_GROUP"
+    echo "The user should log out and back in before testing sudo/KIT access."
+}
+
+remove_user() {
+    require_root
+    local user
+    user="$(normalize_user "${1:-}")"
+    ensure_groups
+
+    gpasswd -d "$user" "$USERS_GROUP" >/dev/null 2>&1 || true
+    gpasswd -d "$user" "$ADMINS_GROUP" >/dev/null 2>&1 || true
+    remove_legacy_user_sudoers "$user"
+
+    echo "Removed workstation user: $user"
+    echo "The user should log out and back in for group membership changes to fully clear."
+}
+
+list_group_members() {
+    local group="$1"
+    getent group "$group" | awk -F: '{print $4}' | tr ',' '\n' | sed '/^$/d' | sort
+}
+
+list_users() {
+    echo "Workstation users ($USERS_GROUP):"
+    list_group_members "$USERS_GROUP" | sed 's/^/  /' || true
+    echo ""
+    echo "Workstation administrators ($ADMINS_GROUP):"
+    list_group_members "$ADMINS_GROUP" | sed 's/^/  /' || true
+}
+
+status() {
+    echo "Ontrack Recovery Workstation"
+    echo "Domain: $DOMAIN"
+    echo "User group: $USERS_GROUP"
+    echo "Admin group: $ADMINS_GROUP"
+    echo ""
+    list_users
+    echo ""
+    echo "Managed sudoers:"
+    ls -l /etc/sudoers.d/zz-dr_workstation_users 2>/dev/null || echo "  missing"
+}
+
+case "${1:-}" in
+    add-user)
+        add_user "${2:-}"
+        ;;
+    remove-user)
+        remove_user "${2:-}"
+        ;;
+    list-users)
+        list_users
+        ;;
+    status)
+        status
+        ;;
+    -h|--help|help|"")
+        usage
+        ;;
+    *)
+        echo "Unknown command: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+esac
+EOF
+    chmod 755 /usr/local/sbin/dr-workstation
+    chown root:root /usr/local/sbin/dr-workstation
+
+    print_info "Installed: /usr/local/sbin/dr-workstation"
+    print_info "Manage users with: sudo dr-workstation add-user <username>"
+}
+
 # ── Configure autofs for DRIP image share access ─────────────────────────────
 # DRIP image fragment files are stored on Windows file servers. The DRIP REST
 # API returns file paths with /smb/<server>/<share>/... as the mount prefix
@@ -3764,33 +3968,20 @@ configure_dns_search_domains() {
 
 configure_sudoers() {
     if [ -z "$DOMAIN_SUDO_USER" ]; then
-        print_info "No sudo user specified — skipping sudoers configuration"
+        print_info "No workstation user specified — skipping workstation user authorization"
         return 0
     fi
 
-    # SSSD is configured for short-name logins (use_fully_qualified_names = False),
-    # and realm list reports login-formats: %U. Sudo must therefore match the
-    # resolved local identity (e.g. martin.campetta), not user@domain.
-    local sudo_identity="$DOMAIN_SUDO_USER"
-    # Replace dots with underscores in the filename — sudo ignores files with dots in the name
-    local safe_name="${DOMAIN_SUDO_USER//./_}"
-    local sudoers_file="/etc/sudoers.d/${safe_name}_domain_sudo"
-    local desired_entry="${sudo_identity} ALL=(ALL:ALL) ALL"
-
-    if [ -f "$sudoers_file" ] && grep -qxF "$desired_entry" "$sudoers_file"; then
-        print_info "Sudoers entry already correct for $sudo_identity — skipping"
-        return 0
+    if [ ! -x /usr/local/sbin/dr-workstation ]; then
+        install_dr_workstation_manager || return 1
     fi
 
-    echo "$desired_entry" > "$sudoers_file"
-    chmod 440 "$sudoers_file"
-    chown root:root "$sudoers_file"
-
-    if visudo -c -f "$sudoers_file" > /dev/null 2>&1; then
-        print_info "Sudoers entry configured for $sudo_identity"
+    print_info "Authorizing workstation user with dr-workstation: $DOMAIN_SUDO_USER"
+    if /usr/local/sbin/dr-workstation add-user "$DOMAIN_SUDO_USER"; then
+        print_info "Workstation access configured for $DOMAIN_SUDO_USER"
     else
-        print_warning "Sudoers file failed syntax check — removing $sudoers_file"
-        rm -f "$sudoers_file"
+        print_warning "Could not add $DOMAIN_SUDO_USER through dr-workstation"
+        print_warning "After domain login works, run: sudo dr-workstation add-user $DOMAIN_SUDO_USER"
     fi
 }
 
@@ -4162,6 +4353,7 @@ fi
     configure_sssd_settings
     enable_sssd
     configure_gdm_login_prompt
+    install_dr_workstation_manager
     configure_autofs_cifs
     configure_sudoers
     configure_samba
