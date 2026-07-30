@@ -21,7 +21,8 @@
 #
 #   Run 2: After the domain admin has joined the machine, re-run this script.
 #          It will detect the existing join and complete all post-join
-#          configuration unattended. Safe to re-run on an already-joined machine.
+#          configuration unattended. After successful completion, future full
+#          reruns stop safely and direct users to dr-workstation commands.
 #
 # DNS behavior:
 #   This script expects DHCP/VPN to provide the correct office-local AD DNS
@@ -42,7 +43,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -61,6 +62,7 @@ WORKGROUP="DR"
 WINS_SERVER="10.40.249.101"
 DNS_SEARCH="dr.kodr.local,corp.altegrity.com,corp.eddom.org,corp.kroll.com,ontrack.com,ccp.edp.local"
 DNS_TEST_ONLY=false
+FULL_RECONFIGURE=false
 KIT_PROCESS_PATTERN="${KIT_PROCESS_PATTERN:-KIT}"
 KIT_INSTALLER_PATH="${KIT_INSTALLER_PATH:-/mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/KIT-installer-modified.sh}"
 BRAND_WALLPAPER_SOURCE="${BRAND_WALLPAPER_SOURCE:-/mnt/x/CRtools/Frozen/Branding/Wallpaper/1080p_ontrackwallpaper.jpg}"
@@ -123,6 +125,115 @@ check_privileges() {
         print_info 'Please run: wget -qO- http://ontrack.link/joindomain | sudo bash'
         exit 1
     fi
+}
+
+# ── Completed-workstation rerun guard ────────────────────────────────────────
+
+requested_full_reconfigure() {
+    local arg
+    for arg in "$@"; do
+        [ "$arg" = "--full-reconfigure" ] && return 0
+    done
+    return 1
+}
+
+get_invoking_user() {
+    local user="${SUDO_USER:-}"
+
+    if [ -z "$user" ] || [ "$user" = "root" ]; then
+        user="$(logname 2>/dev/null || true)"
+    fi
+    if [ -z "$user" ] || [ "$user" = "root" ]; then
+        user="$(who am i 2>/dev/null | awk '{print $1}' || true)"
+    fi
+
+    printf '%s\n' "${user:-root}"
+}
+
+is_managed_workstation_admin() {
+    local user="$1"
+    [ -n "$user" ] && [ "$user" != "root" ] || return 1
+
+    if getent group "$DR_WORKSTATION_ADMINS_GROUP" 2>/dev/null \
+        | awk -F: -v user="$user" 'BEGIN{found=1} {n=split($4,a,","); for(i=1;i<=n;i++) if(a[i]==user) found=0} END{exit found}'; then
+        return 0
+    fi
+
+    id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -Fxq "$DR_WORKSTATION_ADMINS_GROUP"
+}
+
+state_is_postjoin_complete() {
+    [ -f "$STATE_FILE" ] && grep -q '^STAGE="POSTJOIN_COMPLETE"$' "$STATE_FILE" 2>/dev/null
+}
+
+show_completed_workstation_message() {
+    local current_user
+    current_user="$(get_invoking_user)"
+
+    echo "=========================================="
+    echo "  Ontrack Recovery Workstation"
+    echo "=========================================="
+    echo ""
+    echo "  This workstation has already been fully provisioned."
+    echo ""
+    echo "  The domain provisioning workflow will not run again automatically."
+    echo "  A full rerun can modify hostname, network, DNS, time synchronization,"
+    echo "  Kerberos, SSSD, and Active Directory membership settings."
+    echo ""
+
+    if [ "$current_user" = "root" ] || is_managed_workstation_admin "$current_user"; then
+        echo "  Use the workstation management commands instead:"
+        echo ""
+        echo "    sudo dr-workstation status"
+        echo "    sudo dr-workstation verify"
+        echo "    sudo dr-workstation list-users"
+        echo "    sudo dr-workstation add-user <username>"
+        echo "    sudo dr-workstation remove-user <username>"
+    else
+        echo "  Current user: $current_user"
+        echo "  Workstation administrator access: No"
+        echo ""
+        echo "  To grant this account workstation administrator access, run:"
+        echo ""
+        echo "    su - drone"
+        echo ""
+        echo "  Enter the local drone account password, then run:"
+        echo ""
+        echo "    sudo dr-workstation add-user $current_user"
+        echo ""
+        echo "  When complete, run:"
+        echo ""
+        echo "    exit"
+        echo ""
+        echo "  Then log out of the desktop and log back in."
+    fi
+
+    echo ""
+    echo "  No domain provisioning or network changes were made."
+    echo "=========================================="
+}
+
+completed_workstation_rerun_guard() {
+    state_is_postjoin_complete || return 0
+
+    if requested_full_reconfigure "$@"; then
+        FULL_RECONFIGURE=true
+        print_warning "Full reconfiguration explicitly requested."
+        print_warning "Hostname, network, DNS, time, Kerberos, SSSD, and domain settings may be modified."
+        return 0
+    fi
+
+    # A completed-workstation rerun is allowed to refresh only the isolated
+    # management command and its sudo policy. It must not enter provisioning or
+    # touch hostname, NetworkManager, DNS, Chrony, Kerberos, SSSD, or the realm.
+    if install_dr_workstation_manager; then
+        print_info "Workstation management commands and permissions are up to date."
+    else
+        print_warning "Could not refresh workstation management components."
+    fi
+
+    show_completed_workstation_message
+    exit 0
 }
 
 # ── OS detection ──────────────────────────────────────────────────────────────
@@ -2503,7 +2614,12 @@ install_dr_workstation_manager() {
 # Members of $DR_WORKSTATION_ADMINS_GROUP are workstation administrators.
 %$DR_WORKSTATION_ADMINS_GROUP ALL=(ALL:ALL) ALL
 
-# Members of $DR_WORKSTATION_USERS_GROUP may run only the managed workstation helpers without a password.
+# Every authenticated DR domain user may mount the standard Tool Server.
+# SSSD is configured with use_fully_qualified_names=False, so the AD group is
+# exposed as the short group name "domain users". The escaped space is required.
+%domain\ users ALL=(root) NOPASSWD: /usr/local/bin/mount-kit-tools
+
+# Locally managed workstation users may also run the remaining managed helpers.
 %$DR_WORKSTATION_USERS_GROUP ALL=(root) NOPASSWD: /usr/local/bin/mount-kit-tools
 %$DR_WORKSTATION_USERS_GROUP ALL=(root) NOPASSWD: /usr/local/sbin/dr-post-mount-provision
 %$DR_WORKSTATION_USERS_GROUP ALL=(root) NOPASSWD: /usr/local/sbin/dr-launch-kit
@@ -2534,6 +2650,7 @@ Usage:
   sudo dr-workstation remove-user <domain-user>
   sudo dr-workstation list-users
   sudo dr-workstation status
+  sudo dr-workstation verify
 
 Examples:
   sudo dr-workstation add-user jsmith
@@ -2657,6 +2774,50 @@ status() {
     ls -l /etc/sudoers.d/zz-dr_workstation_users 2>/dev/null || echo "  missing"
 }
 
+verify() {
+    local failed=0
+
+    echo "Ontrack Recovery Workstation verification"
+    echo ""
+
+    if realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+        echo "[OK] Realm membership is configured"
+    else
+        echo "[FAIL] Realm membership is not configured"
+        failed=1
+    fi
+
+    if command -v sssctl >/dev/null 2>&1 && sssctl domain-status "$DOMAIN" 2>/dev/null | grep -q '^Online status: Online'; then
+        echo "[OK] SSSD domain is online"
+    else
+        echo "[FAIL] SSSD domain is offline or unavailable"
+        failed=1
+    fi
+
+    if host -t SRV "_kerberos._tcp.$DOMAIN" >/dev/null 2>&1; then
+        echo "[OK] Kerberos DNS discovery works"
+    else
+        echo "[FAIL] Kerberos DNS discovery failed"
+        failed=1
+    fi
+
+    if adcli testjoin -D "$DOMAIN" >/dev/null 2>&1; then
+        echo "[OK] Machine account trust is valid"
+    else
+        echo "[FAIL] Machine account trust could not be validated"
+        failed=1
+    fi
+
+    if visudo -cf /etc/sudoers.d/zz-dr_workstation_users >/dev/null 2>&1; then
+        echo "[OK] Workstation sudo policy is valid"
+    else
+        echo "[FAIL] Workstation sudo policy is missing or invalid"
+        failed=1
+    fi
+
+    return "$failed"
+}
+
 case "${1:-}" in
     add-user)
         add_user "${2:-}"
@@ -2669,6 +2830,10 @@ case "${1:-}" in
         ;;
     status)
         status
+        ;;
+    verify)
+        require_root
+        verify
         ;;
     -h|--help|help|"")
         usage
@@ -3537,8 +3702,15 @@ fi
 # helper.
 if [ "\$(id -u)" -ne 0 ]; then
     if ! sudo -n /usr/local/bin/mount-kit-tools --sudo-self-test >/dev/null 2>&1; then
-        echo "This user does not have passwordless permission to run /usr/local/bin/mount-kit-tools." >&2
-        echo "Rerun the domain-join script post-join and enter this domain username when prompted." >&2
+        CURRENT_USER="\$(id -un)"
+        echo "This domain account does not have permission to mount the Tool Server." >&2
+        echo "" >&2
+        echo "Run the following commands:" >&2
+        echo "  su - drone" >&2
+        echo "  sudo dr-workstation add-user \$CURRENT_USER" >&2
+        echo "  exit" >&2
+        echo "" >&2
+        echo "Then log out of the desktop and log back in." >&2
         exit 1
     fi
     exec sudo -n /usr/local/bin/mount-kit-tools
@@ -3709,6 +3881,15 @@ else
     echo ""
     echo "Try from terminal:"
     echo "  mount-kit-tools"
+    echo ""
+    if ! sudo -n /usr/local/bin/mount-kit-tools --sudo-self-test >/dev/null 2>&1; then
+        current_user="$(id -un)"
+        echo "If this account is not yet authorized, run:"
+        echo "  su - drone"
+        echo "  sudo dr-workstation add-user $current_user"
+        echo "  exit"
+        echo "Then log out and back in."
+    fi
 fi
 
 if [ "$status" -eq 0 ] && [ "$QUIET_SUCCESS" -eq 1 ]; then
@@ -4184,11 +4365,16 @@ parse_args() {
         case "$1" in
             --dns-test)
                 DNS_TEST_ONLY=true
-                ;;-h|--help)
+                ;;
+            --full-reconfigure)
+                FULL_RECONFIGURE=true
+                ;;
+            -h|--help)
                 echo 'Usage: wget -qO- http://ontrack.link/joindomain | sudo bash'
                 echo 'Args:  wget -qO- http://ontrack.link/joindomain | sudo bash -s -- [OFFICE_CODE] [--dns-test]'
                 echo "  If no office code has been saved, you will be prompted for it."
-                echo "  --dns-test   Apply DNS/search settings and test realm discovery only."
+                echo "  --dns-test          Apply DNS/search settings and test realm discovery only."
+                echo "  --full-reconfigure  Engineering override for a completed workstation."
                 exit 0
                 ;;
             -*)
@@ -4263,6 +4449,7 @@ main() {
 
     check_privileges
     load_state || true
+    completed_workstation_rerun_guard "$@"
     parse_args "$@"
     print_resume_state
     ensure_local_pam_survives_sssd_failure
