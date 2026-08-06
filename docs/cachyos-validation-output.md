@@ -97,7 +97,7 @@ BLOCKED Dry-run plan is not executable until preflight blockers are resolved
 ```text
 bash -n domain-join-latest.sh tests/test_domain_join.sh scripts/dr-domain-join-backup.sh scripts/dr-domain-join-rollback.sh: PASS
 git diff --check: PASS
-fixture regression suite: 189 tests passed
+fixture regression suite: 192 tests passed
 systemd-analyze verify generated mount/automount units: PASS
 testparm generated Arch smb.conf: PASS (no live file written)
 visudo generated sudoers: PASS

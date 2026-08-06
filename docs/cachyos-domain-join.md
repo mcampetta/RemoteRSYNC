@@ -472,7 +472,7 @@ out. Domain membership rollback remains the human-approved Samba leave path.
 
 ## Status and known limitations
 
-Static and read-only validation is passing: the fixture suite reports 189
+Static and read-only validation is passing: the fixture suite reports 192
 tests, including configured-root DRIP units, cache-path/TOCTOU validation,
 command-scoped sudoers, transactional Arch rebind coverage, Samba renewal
 repair policy, completion gating, Debian autofs, and Ubuntu KIT compatibility.
