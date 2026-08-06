@@ -752,6 +752,8 @@ test_modes() {
 
 test_missing_capability() {
     local output
+    output="$(DR_JOIN_STATE_DIR="$TMP_DIR/time-provider" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_time_provider(){ case \"\$1\" in active) echo systemd-timesyncd ;; enabled) echo systemd-timesyncd ;; esac; }; platform_capability_status time-sync")"
+    assert_contains "$output" "PASS|time-sync|existing supported provider" "existing Arch time provider satisfies time-sync"
     output="$(DR_JOIN_STATE_DIR="$TMP_DIR/missing" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_capability_status realmd")"
     assert_contains "$output" "WARNING|realmd|unavailable but no longer required" "Arch realmd is not required"
     output="$(DR_JOIN_STATE_DIR="$TMP_DIR/missing2" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_capability_status autofs")"

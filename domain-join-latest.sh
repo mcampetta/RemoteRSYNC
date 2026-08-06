@@ -656,6 +656,10 @@ platform_install_packages() {
     local capability
     platform_prepare_package_manager || return 1
     for capability in "$@"; do
+        if [ "$capability" = "time-sync" ] && platform_time_provider_satisfies; then
+            print_info "time-sync: existing supported provider $(platform_time_provider active) is already available"
+            continue
+        fi
         platform_install_package "$capability" || return 1
     done
 }
@@ -734,6 +738,10 @@ backup_config_file() {
 platform_capability_status() {
     local capability="$1"
     local package
+    if [ "$capability" = "time-sync" ] && platform_time_provider_satisfies; then
+        printf 'PASS|%s|existing supported provider is active or enabled' "$capability"
+        return 0
+    fi
     package="$(platform_package_name "$capability")"
     if [ -z "$package" ]; then
         if platform_capability_required "$capability"; then
@@ -834,6 +842,13 @@ platform_time_provider() {
     fi
 
     echo "none"
+}
+
+platform_time_provider_satisfies() {
+    local active enabled
+    active="$(platform_time_provider active)"
+    enabled="$(platform_time_provider enabled)"
+    [ "$active" != "none" ] || [ "$enabled" != "none" ]
 }
 
 platform_time_is_synchronized() {
