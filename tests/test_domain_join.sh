@@ -17,7 +17,7 @@ assert_eq() {
 }
 assert_contains() {
     local haystack="$1" needle="$2" name="$3"
-    printf '%s\n' "$haystack" | grep -Fq "$needle" || fail "$name: missing '$needle'"
+    [[ "$haystack" == *"$needle"* ]] || fail "$name: missing '$needle'"
     pass "$name"
 }
 write_os_release() {
@@ -77,6 +77,11 @@ test_renderers() {
     output="$(DR_JOIN_STATE_DIR="$TMP_DIR/sudo" bash -c "source '$SCRIPT'; render_workstation_sudoers")"
     assert_contains "$output" "%domain\\ users ALL=(root) NOPASSWD" "domain-users sudoers quoting"
     assert_contains "$output" "%dr-workstation-admins ALL=(ALL:ALL) ALL" "managed admin sudoers policy"
+    assert_contains "$output" 'Defaults!/usr/local/sbin/dr-launch-kit env_keep += "KRB5CCNAME"' "KIT command-scoped KRB5CCNAME preservation"
+    if printf '%s\n' "$output" | grep -Fq 'SETENV'; then
+        fail "KIT sudoers must not grant broad SETENV"
+    fi
+    pass "KIT sudoers avoids broad environment preservation"
     printf '%s\n' "$output" > "$TMP_DIR/sudoers.fragment"
     if visudo -cf "$TMP_DIR/sudoers.fragment" >/dev/null 2>&1; then
         pass "generated sudoers validates with visudo"
@@ -89,6 +94,13 @@ test_renderers() {
         fail "unsafe sudoers username is rejected"
     fi
     pass "unsafe sudoers username is rejected"
+
+    output="$(DR_JOIN_STATE_DIR="$TMP_DIR/kit-sudo" bash -c "source '$SCRIPT'; render_kit_launcher_sudoers 'alice.smith@dr.kodr.local'")"
+    assert_contains "$output" 'Defaults!/usr/local/sbin/dr-launch-kit env_keep += "KRB5CCNAME"' "individual KIT sudoers preserves only cache selector"
+    assert_contains "$output" "alice.smith ALL=(root) NOPASSWD: /usr/local/sbin/dr-launch-kit" "individual KIT launcher rule"
+    printf '%s\n' "$output" > "$TMP_DIR/kit-sudoers.fragment"
+    visudo -cf "$TMP_DIR/kit-sudoers.fragment" >/dev/null 2>&1 || fail "command-scoped KIT sudoers validates with visudo"
+    pass "command-scoped KIT sudoers validates with visudo"
 
     output="$(DR_JOIN_STATE_DIR="$TMP_DIR/arch-render" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; TOOLS_SERVER=dr-ep1-tools; render_arch_smb_conf")"
     assert_contains "$output" "kerberos method = secrets only" "Samba 4.21 keytab method"
@@ -120,12 +132,21 @@ test_renderers() {
     bash -n "$helper" || fail "generated Arch mount helper syntax"
     helper_output="$(sed -n '1,180p' "$helper")"
     assert_contains "$helper_output" 'AUTOMOUNT_UNIT="mnt-x.automount"' "Arch mount helper defines automount unit"
-    assert_contains "$helper_output" 'KRB5CCNAME="FILE:/tmp/krb5cc_$CRUID" klist -s' "Arch mount helper checks selected user's Kerberos cache"
+    assert_contains "$helper_output" 'KRB5CCNAME="FILE:/tmp/krb5cc_$CURRENT_CONFIGURED_CRUID" klist -s' "Arch mount helper checks selected user's Kerberos cache"
     assert_contains "$helper_output" 'sudo -n /usr/local/bin/mount-kit-tools --cruid' "Arch mount helper passes UID through sudo"
     if printf '%s\n' "$helper_output" | grep -Fq 'sec=krb5,multiuser'; then
         fail "Arch mount helper must not claim multiuser ownership"
     fi
+    assert_contains "$helper_output" "CURRENT_CONFIGURED_CRUID" "Arch helper reads the current unit credential owner"
+    assert_contains "$helper_output" "sudo /usr/local/sbin/dr-tools-rebind \$CRUID" "Arch helper provides explicit multi-user rebind path"
     pass "Arch mount helper is root/Kerberos ownership aware"
+
+    rebind_helper="$TMP_DIR/dr-tools-rebind"
+    DR_JOIN_STATE_DIR="$TMP_DIR/arch-rebind" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; render_arch_tools_rebind_helper > '$rebind_helper'"
+    bash -n "$rebind_helper" || fail "generated Arch rebind helper syntax"
+    assert_contains "$(sed -n '1,180p' "$rebind_helper")" 'systemctl stop "$AUTOMOUNT_UNIT" "$MOUNT_UNIT"' "Arch rebind stops automount before changing cruid"
+    assert_contains "$(sed -n '1,180p' "$rebind_helper")" 'cp -a -- "$UNIT_PATH" "$BACKUP"' "Arch rebind creates a rollback copy"
+    pass "Arch Tool Server rebind helper is explicit and reversible"
 
     renewal_dir="$TMP_DIR/renew-units"
     mkdir -p "$renewal_dir/usr/local/sbin"
@@ -134,6 +155,65 @@ test_renderers() {
     sed -i "s#/usr/local/sbin/dr-domain-machine-password-renew#$renewal_dir/usr/local/sbin/dr-domain-machine-password-renew#" "$renewal_dir/dr-domain-machine-password-renew.service"
     systemd-analyze verify "$renewal_dir/dr-domain-machine-password-renew.service" "$renewal_dir/dr-domain-machine-password-renew.timer" >/dev/null 2>&1 || fail "generated machine-renewal units validate"
     pass "generated machine-renewal units validate"
+}
+
+test_kit_cache_validation() {
+    local validator fake_bin cache link uid
+    validator="$TMP_DIR/kit-cache-validator.sh"
+    fake_bin="$TMP_DIR/fake-klist"
+    cache="$TMP_DIR/krb5cc_1000_fixture"
+    link="$TMP_DIR/krb5cc_symlink"
+    uid="$(id -u)"
+
+    DR_JOIN_STATE_DIR="$TMP_DIR/cache-render" bash -c "source '$SCRIPT'; render_kit_cache_validator > '$validator'"
+    bash -n "$validator" || fail "generated KIT cache validator syntax"
+    mkdir -p "$fake_bin"
+    cat > "$fake_bin/klist" << 'EOF'
+#!/bin/bash
+if [ "${1:-}" = "-s" ]; then
+    exit 0
+fi
+printf 'Default principal: invoking-user@DR.KODR.LOCAL\n'
+EOF
+    chmod 755 "$fake_bin/klist"
+    : > "$cache"
+    chmod 600 "$cache"
+
+    PATH="$fake_bin:$PATH" SUDO_UID="$uid" KRB5CCNAME="FILE:$cache" bash -c "source '$validator'; validate_kit_invoking_cache"
+    pass "KIT validator accepts an owned 0600 FILE cache with a DR realm principal"
+
+    chmod 700 "$cache"
+    if PATH="$fake_bin:$PATH" SUDO_UID="$uid" KRB5CCNAME="FILE:$cache" bash -c "source '$validator'; validate_kit_invoking_cache" >/dev/null 2>&1; then
+        fail "KIT validator must reject executable cache permissions"
+    fi
+    chmod 600 "$cache"
+    pass "KIT validator rejects cache permissions broader than 0600"
+
+    ln -s "$cache" "$link"
+    if PATH="$fake_bin:$PATH" SUDO_UID="$uid" KRB5CCNAME="FILE:$link" bash -c "source '$validator'; validate_kit_invoking_cache" >/dev/null 2>&1; then
+        fail "KIT validator must reject symlinked caches"
+    fi
+    pass "KIT validator rejects symlinked caches"
+
+    if PATH="$fake_bin:$PATH" SUDO_UID="$uid" KRB5CCNAME="FILE:/tmp/krb5cc_0" bash -c "source '$validator'; validate_kit_invoking_cache" >/dev/null 2>&1; then
+        fail "KIT validator must reject the KIT-owned root cache"
+    fi
+    pass "KIT validator rejects /tmp/krb5cc_0 before KIT launch"
+
+    if PATH="$fake_bin:$PATH" SUDO_UID="$uid" KRB5CCNAME="DIR:$cache" bash -c "source '$validator'; validate_kit_invoking_cache" >/dev/null 2>&1; then
+        fail "KIT validator must reject non-FILE cache types"
+    fi
+    pass "KIT validator rejects non-FILE cache types"
+
+    if PATH="$fake_bin:$PATH" SUDO_UID=0 KRB5CCNAME="FILE:$cache" bash -c "source '$validator'; validate_kit_invoking_cache" >/dev/null 2>&1; then
+        fail "KIT validator must reject root SUDO_UID"
+    fi
+    pass "KIT validator rejects root SUDO_UID"
+
+    if grep -Eq '(cp|install|mv|tee|cat)[^\n]*[/]tmp/krb5cc_0|[/]tmp/krb5cc_0[^\n]*(cp|install|mv|tee|cat)' "$SCRIPT"; then
+        fail "provisioning launcher must not create or overwrite /tmp/krb5cc_0"
+    fi
+    pass "provisioning launcher leaves /tmp/krb5cc_0 ownership to KIT.sh"
 }
 
 test_drip_compatibility() {
@@ -157,7 +237,7 @@ test_drip_compatibility() {
 }
 
 test_machine_account_renewal() {
-    local policy helper service timer
+    local policy helper service timer script_text
     policy="$(DR_JOIN_STATE_DIR="$TMP_DIR/renew-policy" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_machine_account_renewal_policy")"
     assert_contains "$policy" "authority: dr-domain-machine-password-renew.service/timer" "Arch renewal authority is explicit"
     assert_contains "$policy" "ad_maximum_machine_account_password_age=0" "SSSD default renewal is disabled on Arch"
@@ -166,7 +246,8 @@ test_machine_account_renewal() {
     assert_contains "$helper" "net ads changetrustpw -P" "renewal uses Samba machine credentials"
     assert_contains "$helper" "net ads keytab create" "renewal rebuilds the system keytab"
     assert_contains "$helper" "net ads testjoin" "renewal validates machine membership"
-    assert_contains "$(sed -n '6160,6215p' "$SCRIPT")" "sssctl config-check" "Arch post-join validation uses sssctl"
+    script_text="$(<"$SCRIPT")"
+    assert_contains "$script_text" "sssctl config-check" "Arch post-join validation uses sssctl"
     if printf '%s\n' "$helper" | grep -Eq 'realm join|adcli'; then
         fail "Arch renewal helper must not depend on realm or adcli"
     fi
@@ -181,12 +262,15 @@ test_machine_account_renewal() {
 test_kit_root_access_and_helpers() {
     local plan post_section launcher
     plan="$(DR_JOIN_STATE_DIR="$TMP_DIR/kit-plan" bash -c "source '$SCRIPT'; render_kit_root_access_test_plan martin")"
-    assert_contains "$plan" "Domain user ticket/list" "KIT staged domain-user test"
-    assert_contains "$plan" "Root-through-sudo list/execute" "KIT staged root list/execute test"
+    assert_contains "$plan" "Before launch, as the domain user" "KIT staged domain-user test"
+    assert_contains "$plan" "Root KIT process" "KIT staged root list/execute test"
     assert_contains "$plan" "bash -n /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/KIT.sh" "KIT staged root execution check"
     assert_contains "$plan" "dr-post-mount-provision --access-self-test" "KIT staged post-mount read test"
     assert_contains "$plan" "dr-launch-kit --access-self-test" "KIT staged launcher/runtime read test"
     assert_contains "$plan" "sec=krb5,cruid=<logged-in-domain-user-uid>,vers=3.0" "KIT staged ownership model"
+    assert_contains "$plan" "KIT.sh creates /tmp/krb5cc_0" "KIT root-cache creation is staged"
+    assert_contains "$plan" "cifs/<server>@DR.KODR.LOCAL" "DRIP CIFS ticket lifecycle is staged"
+    assert_contains "$plan" "Deactivate the DRIP share" "DRIP deactivation is staged"
 
     post_section="$(sed -n '/cat > \/usr\/local\/sbin\/dr-post-mount-provision << EOF/,/chmod 755 \/usr\/local\/sbin\/dr-post-mount-provision/p' "$SCRIPT")"
     if printf '%s\n' "$post_section" | grep -Fq 'AUTOMOUNT_UNIT'; then
@@ -194,16 +278,23 @@ test_kit_root_access_and_helpers() {
     fi
     pass "generated post-mount helper has no undefined AUTOMOUNT_UNIT branch"
 
-    launcher="$(sed -n '4488,4540p' "$SCRIPT")"
-    assert_contains "$launcher" 'find "\$KIT_DIR" -type f -print0' "KIT launcher checks runtime files as root"
+    launcher="$(<"$SCRIPT")"
+    assert_contains "$launcher" 'find "$KIT_DIR" -type f -print0' "KIT launcher checks runtime files as root"
 }
 
 test_debian_kit_and_autofs_regression() {
-    local output
+    local output contract
     output="$(DR_JOIN_STATE_DIR="$TMP_DIR/debian-autofs-regression" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=debian; render_autofs_master_maps; render_autofs_cifs_map")"
     assert_contains "$output" "/smb    /etc/auto.net.cifs" "Debian SMB autofs map preserved"
     assert_contains "$output" "/net    /etc/auto.net.cifs" "Debian NET autofs map preserved"
     assert_contains "$output" 'sec=krb5,cruid=${UID},vers=3.0' "Debian KIT/DRIP Kerberos ownership preserved"
+    contract="$(DR_JOIN_STATE_DIR="$TMP_DIR/debian-kit-contract" bash -c "source '$SCRIPT'; render_debian_kit_compatibility_contract")"
+    assert_contains "$contract" 'KRB5CCNAME=FILE:/tmp/krb5cc_<domain-uid>_<random>' "Ubuntu FILE cache contract preserved"
+    assert_contains "$contract" 'DRIP /smb and /mnt/p: sec=krb5,cruid=0' "Ubuntu DRIP root cache ownership preserved"
+    assert_contains "$contract" 'KIT /mnt/x: sec=krb5,cruid=<domain-user-uid>,vers=3.0' "Ubuntu KIT mount ownership preserved"
+    assert_contains "$contract" 'KIT.sh: copy the user cache to /tmp/krb5cc_0' "Ubuntu KIT.sh root-cache contract preserved"
+    assert_contains "$contract" 'remove on EXIT' "Ubuntu KIT.sh cache cleanup contract preserved"
+    pass "Ubuntu KIT credential-cache and mount contract remains explicit"
 }
 
 test_state_and_guard() {
@@ -282,6 +373,7 @@ test_renderers
 test_drip_compatibility
 test_machine_account_renewal
 test_kit_root_access_and_helpers
+test_kit_cache_validation
 test_debian_kit_and_autofs_regression
 test_state_and_guard
 test_modes

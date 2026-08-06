@@ -48,6 +48,7 @@ restore_files=(
     etc/systemd/system/dr-domain-machine-password-renew.service
     etc/systemd/system/dr-domain-machine-password-renew.timer
     usr/local/sbin/dr-domain-machine-password-renew
+    usr/local/sbin/dr-tools-rebind
     var/lib/dr-domain-join/state
 )
 
@@ -101,7 +102,8 @@ done
 for relative in \
     etc/systemd/system/dr-domain-machine-password-renew.service \
     etc/systemd/system/dr-domain-machine-password-renew.timer \
-    usr/local/sbin/dr-domain-machine-password-renew; do
+    usr/local/sbin/dr-domain-machine-password-renew \
+    usr/local/sbin/dr-tools-rebind; do
     if [ ! -e "$backup_dir/files/$relative" ] && [ -e "/$relative" ]; then
         rm -f -- "/$relative"
     fi

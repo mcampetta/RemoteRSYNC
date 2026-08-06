@@ -729,6 +729,9 @@ platform_report() {
     else
         echo "  DRIP support:        UNSUPPORTED on Arch (fixed /mnt/x does not provide /smb or /net)"
     fi
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        echo "  /mnt/x ownership:    selected domain-user UID; explicit dr-tools-rebind required when users change"
+    fi
     echo "  DRIP required:       $DRIP_REQUIRED"
     echo ""
     echo "Capability/package mapping"
@@ -1005,6 +1008,7 @@ platform_dry_run() {
         fi
         echo "  WOULD CHANGE /etc/systemd/system/mnt-x.mount and /etc/systemd/system/mnt-x.automount"
         echo "  WOULD USE CIFS ownership: sec=krb5,cruid=<logged-in-domain-user-uid>,vers=3.0"
+        echo "  WOULD INSTALL /usr/local/sbin/dr-tools-rebind for explicit selected-user remounts; shared multi-user /mnt/x is not claimed"
         echo "  WOULD CHANGE /etc/systemd/system/dr-domain-machine-password-renew.{service,timer} and /usr/local/sbin/dr-domain-machine-password-renew"
         echo "  WOULD CHANGE /usr/local/bin/*, /usr/local/sbin/*, desktop integration files"
         echo "  WOULD ENABLE/RESTART services: $(platform_service_name time-sync), sssd, $(platform_service_name ssh-server), mnt-x.automount, dr-domain-machine-password-renew.timer"
@@ -4072,6 +4076,11 @@ render_workstation_sudoers() {
 # Members of $DR_WORKSTATION_ADMINS_GROUP are workstation administrators.
 %$admins_group ALL=(ALL:ALL) ALL
 
+# KIT.sh owns the root cache copy/cleanup. Preserve only the invoking user's
+# FILE credential-cache selector for the narrow KIT launcher command. SUDO_UID
+# and SUDO_USER are supplied by sudo itself; no broad environment override is used.
+Defaults!/usr/local/sbin/dr-launch-kit env_keep += "KRB5CCNAME"
+
 # Every authenticated DR domain user may mount the standard Tool Server.
 # SSSD is configured with use_fully_qualified_names=False, so the AD group is
 # exposed as the short group name "domain users". The escaped space is required.
@@ -4081,6 +4090,17 @@ render_workstation_sudoers() {
 %$users_group ALL=(root) NOPASSWD: /usr/local/bin/mount-kit-tools
 %$users_group ALL=(root) NOPASSWD: /usr/local/sbin/dr-post-mount-provision
 %$users_group ALL=(root) NOPASSWD: /usr/local/sbin/dr-launch-kit
+EOF
+}
+
+render_kit_launcher_sudoers() {
+    local user
+    user="$(normalize_domain_user_for_sudoers "${1:-}")" || return 1
+    user="$(sudoers_escape_identifier "$user")"
+    cat << EOF
+# Managed by DR Domain Join
+Defaults!/usr/local/sbin/dr-launch-kit env_keep += "KRB5CCNAME"
+$user ALL=(root) NOPASSWD: /usr/local/sbin/dr-launch-kit
 EOF
 }
 
@@ -4392,6 +4412,82 @@ EOF
 # kernel keyring (belt-and-suspenders; the kernel keyring is used automatically
 # on modern systems regardless).
 
+# Rendered into the root KIT launcher. This deliberately validates the cache
+# selected by sudo without opening, copying, or creating a root cache. KIT.sh
+# remains the sole owner of /tmp/krb5cc_0 creation and EXIT-trap cleanup.
+render_kit_cache_validator() {
+    cat << 'EOF'
+validate_kit_invoking_cache() {
+    local cache_spec="${KRB5CCNAME:-}"
+    local cache_path=""
+    local owner=""
+    local mode=""
+    local mode_value=0
+    local principal=""
+    local principal_realm=""
+
+    case "${SUDO_UID:-}" in
+        ''|0|*[!0-9]*)
+            echo "KIT launch requires a non-root SUDO_UID from the domain-user sudo invocation." >&2
+            return 1
+            ;;
+    esac
+
+    case "$cache_spec" in
+        FILE:*) cache_path="${cache_spec#FILE:}" ;;
+        *)
+            echo "KIT launch requires KRB5CCNAME to use the FILE: cache type." >&2
+            return 1
+            ;;
+    esac
+
+    if [ -z "$cache_path" ] || [ "$cache_path" = "/tmp/krb5cc_0" ]; then
+        echo "KIT launch rejected an empty or root-owned Kerberos cache path." >&2
+        return 1
+    fi
+    if [ ! -f "$cache_path" ] || [ -L "$cache_path" ]; then
+        echo "KIT launch requires a regular, non-symlink Kerberos cache file." >&2
+        return 1
+    fi
+
+    owner="$(stat -c '%u' -- "$cache_path" 2>/dev/null || true)"
+    if [ "$owner" != "$SUDO_UID" ]; then
+        echo "KIT launch rejected a Kerberos cache not owned by SUDO_UID." >&2
+        return 1
+    fi
+
+    mode="$(stat -c '%a' -- "$cache_path" 2>/dev/null || true)"
+    case "$mode" in
+        ''|*[!0-7]*)
+            echo "KIT launch could not inspect Kerberos cache permissions." >&2
+            return 1
+            ;;
+    esac
+    mode_value=$((8#$mode))
+    if (( mode_value & 07177 )); then
+        echo "KIT launch requires a Kerberos cache with mode 0600 or stricter." >&2
+        return 1
+    fi
+
+    command -v klist >/dev/null 2>&1 || {
+        echo "KIT launch requires klist to validate the invoking user's ticket." >&2
+        return 1
+    }
+    klist -s -c "$cache_path" 2>/dev/null || {
+        echo "KIT launch requires a usable Kerberos credential cache." >&2
+        return 1
+    }
+
+    principal="$(klist -c "$cache_path" 2>/dev/null | awk -F': ' '/Default principal:/ {print $2; exit}')"
+    principal_realm="${principal##*@}"
+    if [ -z "$principal" ] || [ "${principal_realm^^}" != "DR.KODR.LOCAL" ]; then
+        echo "KIT launch requires a ticket principal in DR.KODR.LOCAL." >&2
+        return 1
+    fi
+}
+EOF
+}
+
 
 # ── Post-mount provisioning helper ───────────────────────────────────────────
 install_post_mount_provision_helper() {
@@ -4403,11 +4499,15 @@ install_post_mount_provision_helper() {
     # KIT runtime directory and launches KIT.sh.
     local kit_runtime_dir
     local escaped_kit_runtime_dir
+    local kit_cache_validator
     kit_runtime_dir="$(dirname "$KIT_INSTALLER_PATH")"
+    kit_cache_validator="$(render_kit_cache_validator)"
 
-    # Generate this helper with a quoted heredoc so runtime variables such as
-    # $LOG, $KIT_DIR, ${1:-}, and $? are preserved until dr-launch-kit runs.
-    cat > /usr/local/sbin/dr-launch-kit << 'EOF'
+    # Generate this helper with quoted heredoc segments so runtime variables
+    # such as $LOG, $KIT_DIR, ${1:-}, and $? are preserved until launch time,
+    # while the shared cache validator is inserted as generated shell code.
+    {
+    cat << 'EOF'
 #!/bin/bash
 set -u
 
@@ -4415,7 +4515,24 @@ LOG="/var/log/dr-launch-kit.log"
 KIT_DIR="__KIT_RUNTIME_DIR__"
 KIT_SCRIPT="./KIT.sh"
 
+EOF
+    printf '%s\n' "$kit_cache_validator"
+    cat << 'EOF'
+
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+touch "$LOG" 2>/dev/null || true
+chmod 644 "$LOG" 2>/dev/null || true
+
 if [ "${1:-}" = "--sudo-self-test" ]; then
+    exit 0
+fi
+
+if [ "${1:-}" = "--access-self-test" ]; then
+    [ "$(id -u)" -eq 0 ] || { echo "--access-self-test must run as root" >&2; exit 1; }
+    [ -r "$KIT_DIR/KIT.sh" ] || { echo "KIT.sh is not readable: $KIT_DIR/KIT.sh" >&2; exit 1; }
+    while IFS= read -r -d '' runtime_file; do
+        [ -r "$runtime_file" ] || { echo "KIT runtime file is not readable: $runtime_file" >&2; exit 1; }
+    done < <(find "$KIT_DIR" -type f -print0)
     exit 0
 fi
 
@@ -4437,6 +4554,8 @@ if [ ! -f "$KIT_DIR/$KIT_SCRIPT" ]; then
     exit 1
 fi
 
+validate_kit_invoking_cache
+
 cd "$KIT_DIR" || exit 1
 
 # Intentionally do NOT redirect stdout/stderr. KIT behaves correctly when
@@ -4449,6 +4568,7 @@ status=$?
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] KIT exited with status: $status" >> "$LOG" 2>/dev/null || true
 exit "$status"
 EOF
+    } > /usr/local/sbin/dr-launch-kit
     escaped_kit_runtime_dir="$(printf '%s
 ' "$kit_runtime_dir" | sed 's/[#&]/\&/g')"
     sed -i "s#__KIT_RUNTIME_DIR__#$escaped_kit_runtime_dir#g" /usr/local/sbin/dr-launch-kit
@@ -4493,6 +4613,7 @@ set -u
 LOG="/var/log/dr-launch-kit.log"
 KIT_DIR="__KIT_RUNTIME_DIR__"
 KIT_SCRIPT="./KIT.sh"
+$kit_cache_validator
 
 mkdir -p "\$(dirname "\$LOG")" 2>/dev/null || true
 touch "\$LOG" 2>/dev/null || true
@@ -4528,6 +4649,8 @@ if [ ! -f "\$KIT_DIR/KIT.sh" ]; then
     echo "Verify Tool Server is mounted at /mnt/x, then try again." >&2
     exit 1
 fi
+
+validate_kit_invoking_cache
 
 cd "\$KIT_DIR" || exit 1
 
@@ -5146,10 +5269,7 @@ EOF
     rm -f /etc/sudoers.d/dr_launch_kit /etc/sudoers.d/99-dr_launch_kit
     if [ -n "$kit_user" ] && [ "$kit_user" != "root" ]; then
         local kit_sudoers_file="/etc/sudoers.d/zz-dr_launch_kit"
-        cat > "$kit_sudoers_file" << EOF
-# Managed by DR Domain Join
-$kit_user ALL=(root) NOPASSWD: /usr/local/sbin/dr-launch-kit
-EOF
+        render_kit_launcher_sudoers "$kit_user" > "$kit_sudoers_file"
         chmod 440 "$kit_sudoers_file"
         chown root:root "$kit_sudoers_file"
         if visudo -cf "$kit_sudoers_file" >/dev/null 2>&1; then
@@ -5249,6 +5369,51 @@ WantedBy=multi-user.target
 EOF
 }
 
+render_arch_tools_rebind_helper() {
+    local mount_unit automount_unit
+    mount_unit="$(tools_mount_unit_name)" || return 1
+    automount_unit="$(tools_automount_unit_name)" || return 1
+    cat << EOF
+#!/bin/bash
+set -euo pipefail
+
+MOUNT_UNIT="$mount_unit"
+AUTOMOUNT_UNIT="$automount_unit"
+UNIT_PATH="/etc/systemd/system/\$MOUNT_UNIT"
+
+if [ "\$(id -u)" -ne 0 ]; then
+    echo "Tool Server credential-owner changes require a local administrator." >&2
+    echo "Run: sudo /usr/local/sbin/dr-tools-rebind \${1:-<domain-user-uid>}" >&2
+    exit 1
+fi
+
+NEW_CRUID="\${1:-}"
+case "\$NEW_CRUID" in
+    ''|0|*[!0-9]*) echo "Usage: dr-tools-rebind <non-root-domain-user-uid>" >&2; exit 2 ;;
+esac
+getent passwd "\$NEW_CRUID" >/dev/null 2>&1 || {
+    echo "UID \$NEW_CRUID is not a local/SSSD-resolvable account." >&2
+    exit 1
+}
+[ -f "\$UNIT_PATH" ] || { echo "Tool Server mount unit not found: \$UNIT_PATH" >&2; exit 1; }
+
+BACKUP="\$UNIT_PATH.rebind.bak.\$(date +%Y%m%d%H%M%S)"
+cp -a -- "\$UNIT_PATH" "\$BACKUP"
+systemctl stop "\$AUTOMOUNT_UNIT" "\$MOUNT_UNIT"
+sed -E -i "s/(cruid=)[0-9]+/\\1\$NEW_CRUID/" "\$UNIT_PATH"
+systemctl daemon-reload
+if ! systemctl enable "\$AUTOMOUNT_UNIT" >/dev/null || ! systemctl start "\$AUTOMOUNT_UNIT"; then
+    cp -a -- "\$BACKUP" "\$UNIT_PATH"
+    systemctl daemon-reload
+    systemctl enable "\$AUTOMOUNT_UNIT" >/dev/null 2>&1 || true
+    echo "Rebind failed; restored \$BACKUP" >&2
+    exit 1
+fi
+echo "Tool Server automount rebound to Kerberos credential owner UID \$NEW_CRUID."
+echo "Previous unit saved at \$BACKUP."
+EOF
+}
+
 platform_verify_tools_mount() {
     local mount_unit automount_unit
     mount_unit="$(tools_mount_unit_name)" || return 1
@@ -5291,9 +5456,10 @@ platform_remove_tools_mount() {
         automount_unit="$(tools_automount_unit_name)" || return 1
         systemctl disable --now "$automount_unit" >/dev/null 2>&1 || true
         systemctl stop "$mount_unit" >/dev/null 2>&1 || true
-        rm -f "/etc/systemd/system/$mount_unit" "/etc/systemd/system/$automount_unit"
+        rm -f "/etc/systemd/system/$mount_unit" "/etc/systemd/system/$automount_unit" \
+            /usr/local/sbin/dr-tools-rebind
         systemctl daemon-reload
-        print_info "Removed Arch Tool Server systemd mount and automount units"
+        print_info "Removed Arch Tool Server systemd mount, automount, and rebind helper"
         return 0
     fi
     systemctl disable --now autofs
@@ -5319,9 +5485,13 @@ platform_install_tools_mount() {
     mkdir -p /mnt/x
     backup_config_file "/etc/systemd/system/$mount_unit"
     backup_config_file "/etc/systemd/system/$automount_unit"
+    backup_config_file "/usr/local/sbin/dr-tools-rebind"
     render_arch_tools_mount_unit "/mnt/x" "$TOOLS_SERVER" "$cruid" > "/etc/systemd/system/$mount_unit"
     render_arch_tools_automount_unit "/mnt/x" > "/etc/systemd/system/$automount_unit"
+    render_arch_tools_rebind_helper > /usr/local/sbin/dr-tools-rebind
     chmod 644 "/etc/systemd/system/$mount_unit" "/etc/systemd/system/$automount_unit"
+    chmod 755 /usr/local/sbin/dr-tools-rebind
+    chown root:root /usr/local/sbin/dr-tools-rebind
     systemd-analyze verify "/etc/systemd/system/$mount_unit" "/etc/systemd/system/$automount_unit"
     systemctl daemon-reload
     systemctl enable "$automount_unit" >/dev/null
@@ -5330,7 +5500,8 @@ platform_install_tools_mount() {
 
 render_arch_tools_mount_helper() {
     local configured_cruid="${1:-${DR_TOOLS_MOUNT_CRUID:-}}"
-    local automount_unit
+    local mount_unit automount_unit
+    mount_unit="$(tools_mount_unit_name)" || return 1
     automount_unit="$(tools_automount_unit_name)" || return 1
     case "$configured_cruid" in
         ''|*[!0-9]*)
@@ -5343,6 +5514,7 @@ render_arch_tools_mount_helper() {
 set -euo pipefail
 
 MOUNT_POINT="/mnt/x"
+MOUNT_UNIT="$mount_unit"
 AUTOMOUNT_UNIT="$automount_unit"
 CONFIGURED_CRUID="$configured_cruid"
 
@@ -5363,8 +5535,11 @@ fi
 case "\$CRUID" in
     ''|*[!0-9]*) echo "Invalid Kerberos credential-cache UID" >&2; exit 1 ;;
 esac
-if [ "\$CRUID" != "\$CONFIGURED_CRUID" ]; then
-    echo "This mount unit is bound to domain-user UID \$CONFIGURED_CRUID; refusing a different credential owner" >&2
+CURRENT_CONFIGURED_CRUID="\$(sed -n 's/.*cruid=\([0-9][0-9]*\).*/\1/p' "/etc/systemd/system/\$MOUNT_UNIT" | head -n 1)"
+CURRENT_CONFIGURED_CRUID="\${CURRENT_CONFIGURED_CRUID:-\$CONFIGURED_CRUID}"
+if [ "\$CRUID" != "\$CURRENT_CONFIGURED_CRUID" ]; then
+    echo "This mount unit is bound to domain-user UID \$CURRENT_CONFIGURED_CRUID; refusing a different credential owner" >&2
+    echo "A local administrator must explicitly rebind it: sudo /usr/local/sbin/dr-tools-rebind \$CRUID" >&2
     exit 1
 fi
 
@@ -5386,7 +5561,7 @@ if [ "\$(id -u)" -ne 0 ]; then
 fi
 
 mkdir -p "\$MOUNT_POINT"
-if ! KRB5CCNAME="FILE:/tmp/krb5cc_\$CRUID" klist -s 2>/dev/null && ! klist -s 2>/dev/null; then
+if ! KRB5CCNAME="FILE:/tmp/krb5cc_\$CURRENT_CONFIGURED_CRUID" klist -s 2>/dev/null && ! klist -s 2>/dev/null; then
     echo "No valid Kerberos ticket found for configured domain-user UID \$CRUID" >&2
     exit 1
 fi
@@ -5406,12 +5581,29 @@ EOF
 render_kit_root_access_test_plan() {
     local domain_user="${1:-DOMAIN_USER}"
     cat << EOF
-KIT Kerberos ownership test plan (staged; not executed by preflight):
-  1. Domain user ticket/list: klist -s; ls -la /mnt/x
-  2. Root-through-sudo list/execute: sudo -n /usr/local/bin/mount-kit-tools --cruid "\$(id -u $domain_user)"; sudo -n sh -c 'ls -la /mnt/x; bash -n /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/KIT.sh'; then run only an approved harmless executable fixture from /mnt/x
-  3. Root post-mount read: sudo -n /usr/local/sbin/dr-post-mount-provision --access-self-test
-  4. Root KIT/runtime read: sudo -n /usr/local/sbin/dr-launch-kit --access-self-test
+KIT Kerberos ownership and root-cache lifecycle test plan (staged; not executed by preflight):
+  1. Before launch, as the domain user: printenv KRB5CCNAME; klist -s -c "\$KRB5CCNAME"; ls -la /mnt/x
+  2. Across sudo: sudo -n env | grep '^KRB5CCNAME=FILE:'; confirm the exact FILE cache path is preserved, with SUDO_USER and nonzero SUDO_UID
+  3. Root KIT process: sudo -n /usr/local/sbin/dr-launch-kit --access-self-test; capture only UID/SUDO_UID/KRB5CCNAME metadata in a harmless fixture and confirm UID 0 plus the invoking-user cache
+  4. KIT.sh lifecycle: launch the approved KIT test mode; confirm KIT.sh creates /tmp/krb5cc_0 as root:root mode 0600, with the invoking user's TGT principal
+  5. DRIP ticket lifecycle: search /smb/<server>/Images and confirm cifs/<server>@DR.KODR.LOCAL is added to /tmp/krb5cc_0; activate and verify /mnt/p uses sec=krb5,cruid=0
+  6. Bounded root checks: sudo -n sh -c 'ls -la /mnt/x; bash -n /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/KIT.sh'; sudo -n /usr/local/sbin/dr-post-mount-provision --access-self-test; sudo -n /usr/local/sbin/dr-launch-kit --access-self-test; then root executes only an approved harmless fixture and reads all runtime libraries
+  7. Deactivate the DRIP share, confirm /mnt/p is removed, then confirm KIT.sh EXIT cleanup removes /tmp/krb5cc_0
+  8. For another Arch domain user, stop/unmount first and have a local administrator run: sudo /usr/local/sbin/dr-tools-rebind <new-domain-user-uid>; verify the unit's cruid changes before access
   Mount must show sec=krb5,cruid=<logged-in-domain-user-uid>,vers=3.0; a normal-user ls alone is insufficient.
+EOF
+}
+
+render_debian_kit_compatibility_contract() {
+    cat << 'EOF'
+Ubuntu/Debian KIT compatibility contract (KIT.sh is shared and unchanged):
+  User login: KRB5CCNAME=FILE:/tmp/krb5cc_<domain-uid>_<random>
+  sudo launch: preserve that exact KRB5CCNAME; SUDO_UID identifies the domain user
+  KIT.sh: copy the user cache to /tmp/krb5cc_0, chown root:root, mode 0600, remove on EXIT
+  DRIP /smb and /mnt/p: sec=krb5,cruid=0; CIFS service tickets accumulate in /tmp/krb5cc_0
+  KIT /mnt/x: sec=krb5,cruid=<domain-user-uid>,vers=3.0
+  Debian DRIP paths: dynamic autofs /smb/<server>/<share>/ and /net/<server>/<share>/
+  Required live checks: root KIT read/execute, DRIP activation/deactivation, bounded read, and cache cleanup
 EOF
 }
 

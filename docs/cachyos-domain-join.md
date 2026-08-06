@@ -200,6 +200,53 @@ must also be run as root from the mounted share during live validation. Any
 `sudo sh`/fixture command belongs to the retained root-capable recovery
 terminal; it is not granted by the domain-user `mount-kit-tools` sudo rule.
 
+### KIT credential-cache ownership
+
+The shared `KIT.sh` is not modified. The launcher preserves only
+`KRB5CCNAME` for the exact `/usr/local/sbin/dr-launch-kit` sudo command through
+a command-scoped `env_keep` rule. `SUDO_UID` and `SUDO_USER` continue to be
+provided by sudo. Before launching `KIT.sh`, the root launcher requires:
+
+- a nonzero `SUDO_UID`;
+- a `FILE:` cache that is a regular non-symlink file owned by `SUDO_UID`;
+- mode 0600 or stricter;
+- `klist -s -c <cache>` success; and
+- a default principal in `DR.KODR.LOCAL`, with the path not equal to
+  `/tmp/krb5cc_0`.
+
+The provisioning launcher never creates or overwrites `/tmp/krb5cc_0`.
+`KIT.sh` remains solely responsible for copying the invoking user's cache to
+that root-owned path, adding CIFS service tickets, and removing it through its
+existing EXIT trap. A live validation must therefore prove the whole lifecycle:
+the cache is visible before launch, the exact `KRB5CCNAME` survives sudo, the
+KIT process is UID 0 with the invoking user's `SUDO_UID`, KIT creates the root
+cache with the matching principal, DRIP search adds a `cifs/<server>` ticket,
+`/smb/<server>/Images` and `/mnt/p` work with `cruid=0`, a bounded root read and
+execution succeed, deactivation removes `/mnt/p`, and KIT exit removes the
+root cache.
+
+The known-good Ubuntu ownership model remains explicit: DRIP `/smb` and
+`/mnt/p` use `sec=krb5,cruid=0`; `/mnt/x` uses
+`sec=krb5,cruid=<domain-user-uid>,vers=3.0`. A normal-user `ls` is not enough
+to validate KIT access.
+
+### Arch `/mnt/x` multi-user boundary
+
+Arch's systemd mount is deliberately bound to one selected domain-user UID;
+the adapter does not claim shared multi-user `/mnt/x` semantics. The generated
+`mount-kit-tools` helper reads the current `cruid` from the mount unit and
+refuses a different invoking UID. A local administrator must explicitly stop
+the automount and run:
+
+```bash
+sudo /usr/local/sbin/dr-tools-rebind <new-domain-user-uid>
+```
+
+The helper backs up the mount unit before changing `cruid`, reloads systemd,
+and restores the unit if reactivation fails. The backup/rollback scripts now
+include `/usr/local/sbin/dr-tools-rebind`. This is an explicit rebind workflow,
+not dynamic DRIP support; Arch DRIP remains blocked.
+
 Debian keeps the existing dynamic `/smb` and `/net` autofs maps, including
 `sec=krb5,cruid=${UID},vers=3.0`, and the existing autofs service behavior.
 
@@ -374,15 +421,18 @@ out. Domain membership rollback remains the human-approved Samba leave path.
 
 ## Status and known limitations
 
-Static and read-only validation is passing. ShellCheck remains unrun because
-the host does not have `shellcheck` installed; installing it is intentionally
-outside this no-live-change phase. The real package install, Samba join,
-SSSD/PAM activation, local fallback login, domain login/home creation, sudo,
-Kerberos CIFS mount, automount recovery after reboot, KIT, and completed-state
-rerun have not been validated on CachyOS. In particular, the
-the `sec=krb5,cruid=...` systemd mount behavior, root KIT access, machine
-password renewal, and the actual Tool Server must be tested with real SSSD
-credential caches. Arch DRIP remains explicitly unsupported until a dynamic
-implementation is delivered and tested.
+Static and read-only validation is passing: the fixture suite reports 113
+tests, including the cache validator, command-scoped sudoers, Arch rebind,
+Samba renewal policy, Debian autofs, and Ubuntu KIT compatibility contract.
+ShellCheck remains unrun because the host does not have `shellcheck` installed;
+installing it is intentionally outside this no-live-change phase. The real
+package install, Samba join, SSSD/PAM activation, local fallback login, domain
+login/home creation, sudo, Kerberos CIFS mount, automount recovery after
+reboot, KIT, and completed-state rerun have not been validated on CachyOS. In
+particular, the `sec=krb5,cruid=...` systemd mount behavior, root KIT cache
+lifecycle, machine-password renewal, and the actual Tool Server must be tested
+with real SSSD credential caches. Arch DRIP remains explicitly unsupported
+until dynamic `/smb`/`/net` access and the full KIT root-cache lifecycle are
+implemented and tested.
 
 Do not advertise or merge this branch as complete until those live tests pass.
