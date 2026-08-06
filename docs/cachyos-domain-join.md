@@ -196,7 +196,9 @@ sudo -n /usr/local/sbin/dr-launch-kit --access-self-test
 
 The last two helpers run as root and verify that the KIT installer, `KIT.sh`,
 and runtime files are readable through `/mnt/x`. A harmless executable fixture
-must also be run as root from the mounted share during live validation.
+must also be run as root from the mounted share during live validation. Any
+`sudo sh`/fixture command belongs to the retained root-capable recovery
+terminal; it is not granted by the domain-user `mount-kit-tools` sudo rule.
 
 Debian keeps the existing dynamic `/smb` and `/net` autofs maps, including
 `sec=krb5,cruid=${UID},vers=3.0`, and the existing autofs service behavior.

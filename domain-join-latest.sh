@@ -5408,7 +5408,7 @@ render_kit_root_access_test_plan() {
     cat << EOF
 KIT Kerberos ownership test plan (staged; not executed by preflight):
   1. Domain user ticket/list: klist -s; ls -la /mnt/x
-  2. Root-through-sudo list/execute: sudo -n /usr/local/bin/mount-kit-tools --cruid "\$(id -u $domain_user)"; sudo -n /usr/local/sbin/dr-launch-kit --access-self-test
+  2. Root-through-sudo list/execute: sudo -n /usr/local/bin/mount-kit-tools --cruid "\$(id -u $domain_user)"; sudo -n sh -c 'ls -la /mnt/x; bash -n /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/KIT.sh'; then run only an approved harmless executable fixture from /mnt/x
   3. Root post-mount read: sudo -n /usr/local/sbin/dr-post-mount-provision --access-self-test
   4. Root KIT/runtime read: sudo -n /usr/local/sbin/dr-launch-kit --access-self-test
   Mount must show sec=krb5,cruid=<logged-in-domain-user-uid>,vers=3.0; a normal-user ls alone is insufficient.

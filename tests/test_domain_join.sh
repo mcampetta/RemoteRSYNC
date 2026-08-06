@@ -183,6 +183,7 @@ test_kit_root_access_and_helpers() {
     plan="$(DR_JOIN_STATE_DIR="$TMP_DIR/kit-plan" bash -c "source '$SCRIPT'; render_kit_root_access_test_plan martin")"
     assert_contains "$plan" "Domain user ticket/list" "KIT staged domain-user test"
     assert_contains "$plan" "Root-through-sudo list/execute" "KIT staged root list/execute test"
+    assert_contains "$plan" "bash -n /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/KIT.sh" "KIT staged root execution check"
     assert_contains "$plan" "dr-post-mount-provision --access-self-test" "KIT staged post-mount read test"
     assert_contains "$plan" "dr-launch-kit --access-self-test" "KIT staged launcher/runtime read test"
     assert_contains "$plan" "sec=krb5,cruid=<logged-in-domain-user-uid>,vers=3.0" "KIT staged ownership model"
