@@ -1,85 +1,213 @@
 # CachyOS domain-join candidate
 
-This feature branch contains the candidate implementation. `main`, the
-production wrapper, and `ontrack.link/joindomain` are unchanged.
+This feature branch contains the CachyOS/Arch-family candidate. `main`,
+`domain-join-latest.sh` on `main`, the production wrapper, and
+`ontrack.link/joindomain` are unchanged.
 
-## Compatibility report
+The candidate does not claim completed CachyOS support. No package was
+installed and no live configuration, service, network, PAM, SSSD, hostname,
+DNS, Kerberos, sudoers, mount, or domain-membership change was made during
+this revision.
 
-The inspected workstation is CachyOS (`ID=cachyos`, `ID_LIKE=arch`), rolling,
-kernel `7.1.2-2-cachyos`, x86-64, with KDE Plasma in a remote xrdp X11 session.
-NetworkManager and systemd-resolved are active and enabled. Wi-Fi `wlan0` is
-connected through DHCP DNS `192.168.0.1`; Tailscale split DNS is also present.
-systemd-timesyncd is active but not synchronized. Public NTP requests timed
-out. The root filesystem is encrypted Btrfs with separate `/` and `/home`
-subvolumes and 136 GiB free. Snapper has a root configuration; no snapshot was
-created. The local administrator group is `wheel`. The expected `drone`
-break-glass account is absent and was not created.
+## Revised architecture
 
-Shared and portable behavior: state transitions, office/tool-server policy,
-hostname validation, DNS/Kerberos discovery, SSSD option rendering, CIFS
-helpers, sudo validation, diagnostics, and completed-workstation protection.
+Platform detection uses `/etc/os-release` `ID` and `ID_LIKE` and selects the
+families `debian`, `arch`, or recognized-but-unimplemented `fedora`.
+Debian/Ubuntu continue to use the existing realmd/adcli flow and traditional
+autofs implementation. Arch/CachyOS uses:
 
-Debian-family behavior: apt/dpkg locks and repair, `DEBIAN_FRONTEND`, apt
-background services, PackageKit, Debian package names, `debconf-set-selections`,
-`pam-auth-update`, `/etc/pam.d/common-*`, oddjob/`libpam-mkhomedir`, Debian
-service names, and unattended-upgrades.
+- Samba ADS (`net ads`) for discovery, interactive Kerberos authentication,
+  computer-account join/update, testjoin, leave, and machine-keytab creation.
+- SSSD's AD provider for NSS, PAM, identity, authentication, groups, and
+  cached credentials. Winbind is not enabled or started.
+- Native Arch PAM files (`system-auth`/`system-login`) with `pam_sss` and the
+  installed `pam_mkhomedir` module.
+- Native systemd `.mount` and `.automount` units for `/mnt/x`.
+- KDE-aware optional desktop integration. Desktop customization failures do
+  not fail core provisioning.
 
-Arch-family replacements: pacman `--needed` installation without `-Syu`,
-`chronyd`/`sshd`, `bind`/`openldap`, native `system-auth`/`system-login` PAM,
-`wheel`, and KDE-aware desktop handling.
+The `POSTJOIN_COMPLETE` guard remains before office prompts, hostname changes,
+package operations, NetworkManager/DNS, time, Kerberos, PAM, SSSD, mount, or
+domain operations. Only the existing explicit `--full-reconfigure` override
+can bypass it.
 
-Desktop-dependent behavior: GDM login-list policy, GNOME dconf/gsettings,
-GVFS trust metadata, wallpaper, and per-user launchers. KDE preserves user
-preferences and treats desktop customization as optional.
+## Configured-repository package mapping
 
-Needs live validation: NetworkManager/resolver behavior, office AD DNS,
-Kerberos SRV discovery, time synchronization, realm discovery, SSSD startup,
-offline local login, domain login/home creation, sudo, CIFS, autofs, desktop
-integration, KIT, and reboot persistence.
+The current configured repositories report these Arch mappings:
 
-Potentially unsafe operations: hostname/DNS/NetworkManager changes, clock
-stepping, PAM edits, SSSD enable/restart, sudoers writes, autofs restart,
-realm join/leave, display-manager changes, logout, and reboot.
+| Classification | Capability | Arch package/status |
+| --- | --- | --- |
+| Core AD login | SSSD | `sssd`, available, not installed |
+| Core AD login | Kerberos | `krb5`, installed |
+| Core AD login | PAM/home creation | `pam`, installed; `pam_mkhomedir.so` present |
+| Core AD login | local admin tooling | `sudo`, installed |
+| Arch join backend | Samba ADS | `samba`, installed |
+| Arch join backend | Samba client/net utility | `smbclient`, installed and supplied by the Samba package set |
+| Tool Server mounting | CIFS helper | `cifs-utils`, installed |
+| DNS/discovery | resolver tools | `bind`, installed |
+| Time provider option | chrony | `chrony`, available, not installed |
+| SSH handoff | OpenSSH | `openssh`, installed |
+| Diagnostics only | `sssctl` | `/usr/bin/sssctl` is in the official `sssd` file list; live install validation remains pending |
+| Diagnostics only | `ldapsearch` | `/usr/bin/ldapsearch` is in the official `openldap` file list; live install validation remains pending |
+| Optional desktop | desktop helpers | `xdg-utils`, installed |
+| Unavailable but no longer required | realmd | no configured package; not used on Arch |
+| Unavailable but no longer required | adcli | no configured package; not used on Arch |
+| Unavailable but no longer required | userspace autofs | no configured package; replaced by systemd automount |
+| Unavailable but no longer required | winbind | no Arch dependency; SSSD remains the identity stack |
 
-## Package mapping from configured repositories
+The Arch installer requests only the core/join/mount packages. It never runs
+`pacman -Syu` as incidental setup. `openldap` remains optional diagnostics; an
+Arch join does not use LDAP computer-object allocation.
 
-| Capability | Debian/Ubuntu | Arch/CachyOS | Current CachyOS result |
-| --- | --- | --- | --- |
-| realmd | `realmd` | no configured package | BLOCKED |
-| SSSD | `sssd` | `sssd` | available, not installed |
-| SSSD tools | `sssd-tools` | mapped to `sssd`; verify `sssctl` | command absent |
-| adcli | `adcli` | no configured package | BLOCKED |
-| Kerberos | `krb5-user` | `krb5` | installed |
-| Samba/winbind | `samba-common-bin`, `winbind` | `samba` | installed |
-| CIFS | `cifs-utils` | `cifs-utils` | installed |
-| autofs | `autofs` | no configured package | BLOCKED |
-| time sync | `chrony` | `chrony` or healthy timesyncd | timesyncd unhealthy |
-| DNS tools | `dnsutils` | `bind` | installed |
-| LDAP tools | `ldap-utils` | `openldap` | available, not installed |
-| PAM/home | `libpam-mkhomedir` or oddjob | `pam` | module present |
-| NetworkManager | `network-manager` | `networkmanager` | installed |
-| SSH | `openssh-server`, `ssh` | `openssh`, `sshd` | installed/active |
-| Desktop helpers | `xdg-utils` | `xdg-utils` | installed |
+## Samba 4.24 join and keytab strategy
 
-No AUR or third-party repository was enabled. No pacman database refresh or
-full-system upgrade was run. The missing realmd, adcli, and autofs capabilities
-require operator approval and an approved source before a real join is proposed.
+The installed Samba version is 4.24.5. Its local documentation states that
+`net ads keytab add` is removed after Samba 4.20 and that keytab content is
+declared with `sync machine password to keytab`, then created with
+`net ads keytab create`.
 
-## Adapter design
+The generated Arch `/etc/samba/smb.conf` contains the equivalent of:
 
-`detect_platform` uses `/etc/os-release` `ID` and `ID_LIKE` and selects the
-logical family `debian`, `arch`, or recognized-but-unimplemented `fedora`.
-Package, service, admin-group, PAM, auth-stack, and desktop decisions are
-centralized in adapter functions. Fedora is not advertised as supported.
+```ini
+[global]
+    workgroup = DR
+    realm = DR.KODR.LOCAL
+    security = ADS
+    client ipc signing = required
+    client min protocol = SMB2
+    idmap config * : backend = tdb
+    idmap config * : range = 100000-199999
+    kerberos method = secrets only
+    sync machine password to keytab = /etc/krb5.keytab:spn_prefixes=host:account_name:sync_spns:sync_kvno:machine_password
+```
 
-The completed-state guard remains before office prompts, hostname changes,
-package operations, NetworkManager/DNS, time, Kerberos, SSSD, and realm work.
-Read-only modes are parsed before that guard so a completed machine's report,
-preflight, or dry-run cannot refresh management sudo policy.
+The declarative rule generates `/etc/krb5.keytab` from the Samba machine
+secret and synchronizes the host/SPN entries without relying on legacy
+`net ads keytab add` behavior. The keytab is root-owned and mode 600.
 
-## Candidate commands
+After DNS, time, hostname, Kerberos, and package checkpoints pass, the human
+domain administrator runs the generated helper. Its sequence is:
 
-These use the feature branch raw file; the production short URL is not used:
+```text
+kdestroy
+kinit ADMIN_USER@DR.KODR.LOCAL                 # password entered by the human
+net ads join --use-kerberos=required           # creates or updates computer account
+net ads testjoin                               # validates local membership
+net ads keytab create                          # creates /etc/krb5.keytab
+klist -k /etc/krb5.keytab
+```
+
+No password is passed on a command line, put in an environment variable, or
+written to a file. The explicit leave path is
+`net ads leave --use-kerberos=required` with a human-provided Kerberos ticket.
+The helper's rollback prompt can remove local keytab/SSSD state and attempt an
+AD leave; it does not silently remove the AD computer object.
+
+## SSSD strategy
+
+Arch generates a complete SSSD configuration after the join and before SSSD
+is enabled. The relevant settings are:
+
+```ini
+[sssd]
+services = nss, pam
+domains = dr.kodr.local
+
+[domain/dr.kodr.local]
+id_provider = ad
+ad_domain = dr.kodr.local
+krb5_realm = DR.KODR.LOCAL
+use_fully_qualified_names = False
+access_provider = simple
+ad_enable_gc = false
+ldap_id_mapping = True
+cache_credentials = True
+fallback_homedir = /home/%u
+krb5_ccname_template = FILE:/tmp/krb5cc_%U
+```
+
+This preserves short domain-user names and SSSD UID/GID mapping. PAM changes
+are native Arch changes only; Debian `/etc/pam.d/common-*` files are never
+copied to Arch. Local `pam_unix` authentication remains in the native stack.
+
+## Tool Server systemd automount
+
+The established path remains `/mnt/x`, backed by `//<office>-tools/Tools`.
+Arch generates units whose names are obtained with `systemd-escape`:
+
+```text
+mnt-x.mount
+mnt-x.automount
+```
+
+The mount unit uses:
+
+```ini
+[Mount]
+What=//dr-ep1-tools/Tools
+Where=/mnt/x
+Type=cifs
+Options=_netdev,nofail,sec=krb5,multiuser,vers=3.0
+TimeoutSec=30s
+```
+
+The automount unit uses `TimeoutIdleSec=300s`. The automount itself has no
+network ordering dependency, so boot is not blocked; the mount unit waits for
+`network-online.target` and a failed access can be retried after network
+recovery. No password or domain credential is embedded. `mount-kit-tools`
+starts the automount through its narrow existing sudo rule and triggers the
+mount on access. `platform_verify_tools_mount` uses `systemd-analyze verify`
+and systemd state checks. The explicit uninstall adapter stops/disables both
+units, removes them, and reloads systemd.
+
+Debian keeps the existing dynamic `/smb` and `/net` autofs maps and autofs
+service behavior.
+
+## Break-glass account
+
+Production defaults to:
+
+```bash
+DR_LOCAL_ADMIN_USER="${DR_LOCAL_ADMIN_USER:-drone}"
+```
+
+The candidate machine has no `drone` account, and the script does not create
+one. An engineer may explicitly set an existing local account, for example:
+
+```bash
+DR_LOCAL_ADMIN_USER=martin \
+  wget -qO- https://raw.githubusercontent.com/mcampetta/RemoteRSYNC/feature/cachyos-domain-join/domain-join-latest.sh \
+  | sudo env DR_LOCAL_ADMIN_USER=martin bash -s -- --preflight
+```
+
+Before any PAM or SSSD change, the operator must verify manually that the
+override is a local `/etc/passwd` account, has a working local password, is in
+`wheel`, can obtain root without SSSD, can log in while SSSD is stopped, and
+will remain available in a separate privileged terminal. The script prints
+the account, source, administrator group, and `Password status: operator
+verification required`; it never tests or records the password.
+
+## Current time diagnosis
+
+The host currently reports:
+
+```text
+Active provider:  systemd-timesyncd
+Enabled provider: systemd-timesyncd
+Synchronized:    no
+Server:          time.cloudflare.com
+Packet count:    0
+Journal:         repeated UDP/123 timeouts
+Kerberos impact: BLOCKED
+```
+
+The candidate does not switch providers or change NTP servers. Preflight keeps
+an unsynchronized clock as a hard blocker and prints the proposed correction:
+check UDP/123 reachability and approved AD NTP sources, then make an
+operator-approved repair of the active provider. The current candidate host
+has not had that correction applied.
+
+## Read-only modes and captured result
 
 ```bash
 wget -qO- https://raw.githubusercontent.com/mcampetta/RemoteRSYNC/feature/cachyos-domain-join/domain-join-latest.sh | sudo bash -s -- --platform-report
@@ -87,88 +215,125 @@ wget -qO- https://raw.githubusercontent.com/mcampetta/RemoteRSYNC/feature/cachyo
 wget -qO- https://raw.githubusercontent.com/mcampetta/RemoteRSYNC/feature/cachyos-domain-join/domain-join-latest.sh | sudo bash -s -- --dry-run
 ```
 
-Read-only modes may also run without root from a local checkout. Preflight and
-dry-run return nonzero when blockers exist.
+Current host results after this revision:
 
-## Live-machine checkpoint
+- `--platform-report`: exit 0. CachyOS is detected as Arch; realmd, adcli,
+  autofs, and winbind are reported unavailable but not required.
+- `--preflight`: exit 1. Current blockers are unsynchronized time, failed
+  current-resolver AD SRV discovery, and absent default `drone`. Missing
+  `sssctl` and `ldapsearch` are warnings pending their optional/post-install
+  package checks.
+- `DR_LOCAL_ADMIN_USER=martin --preflight`: exit 1. The account is reported
+  as local and in `wheel`; password verification remains manual. Time and DNS
+  remain blockers.
+- `--dry-run`: exit 1 and prints the Arch Samba/systemd ordered plan. It
+  explicitly reports no reboot, logout, display-manager restart, security
+  disablement, or `pacman -Syu`.
 
-No persistent live-machine change is authorized by this branch work. Before
-any package or configuration change, the operator must approve this exact
-checkpoint:
+## Package-install checkpoint — not approved or executed
 
-- What changes: approved dependencies first, then staged configuration. PAM,
-  authentication, DNS/hostname, realm membership, sudoers, autofs, and service
-  changes remain separate checkpoints.
-- Why: this host lacks realmd/adcli/autofs, has an unsynchronized clock, and
-  lacks the expected `drone` break-glass account.
-- Command:
+After the current preflight blockers are resolved and the operator approves
+the dependency checkpoint, the exact core command is:
+
+```bash
+sudo pacman -S --needed sssd krb5 samba smbclient cifs-utils bind pam sudo openssh
+```
+
+If the approved time plan selects chrony instead of repairing the existing
+timesyncd provider, install it separately at that checkpoint:
+
+```bash
+sudo pacman -S --needed chrony
+```
+
+Do not append `-Syu` without a separate explicit approval. `openldap` is an
+optional diagnostic install:
+
+```bash
+sudo pacman -S --needed openldap
+```
+
+Immediately validate package signatures, command availability (`sssctl`,
+`ldapsearch`, `net`, `testparm`, `klist`, `mount.cifs`), `testparm`, and the
+staged SSSD/Kerberos/systemd files. No PAM, DNS, hostname, service, or join
+change belongs in this checkpoint.
+
+## Backup and rollback
+
+Before any persistent live change, retain a root shell and run:
 
 ```bash
 sudo ./scripts/dr-domain-join-backup.sh --create /var/lib/dr-domain-join/backups/$(date +%Y%m%d%H%M%S)
-```
-
-- Validation and rollback rehearsal:
-
-```bash
 sudo ./scripts/dr-domain-join-backup.sh --verify /var/lib/dr-domain-join/backups/<timestamp>
 sudo ./scripts/dr-domain-join-rollback.sh --dry-run /var/lib/dr-domain-join/backups/<timestamp>
 ```
 
-Backup creation is local disk I/O only: it does not restart services, change
-DNS, change hostname, install packages, alter PAM, or join the domain. Backups
-are root-readable and may contain sensitive local configuration; never copy
-them into Git or a world-readable directory. Rollback `--apply` is explicit,
-does not silently leave the realm, and never removes `drone`.
+The backup is root-readable and includes existing network/DNS/hostname/service
+state, relevant configuration, and the Arch `mnt-x.mount`/`mnt-x.automount`
+units. It does not copy domain passwords or put secrets in Git. No Btrfs
+snapshot was created; Snapper has a root configuration and a separate,
+operator-approved snapshot decision is still required.
+
+An explicit file rollback is:
+
+```bash
+sudo ./scripts/dr-domain-join-rollback.sh --apply /var/lib/dr-domain-join/backups/<timestamp>
+```
+
+This stops/removes candidate systemd units, restores backed-up files, checks
+sudoers, restores the recorded hostname, and leaves services stopped for
+review unless `--restart-services` is explicitly requested. It does not leave
+AD, delete `/etc/krb5.keytab`, remove users, remove `drone`, reboot, or log
+out. Domain membership rollback remains the human-approved Samba leave path.
 
 ## Manual validation checklist
 
-1. Confirm a clean feature-branch worktree, a retained root-capable terminal,
-   a working local `drone` (or an approved replacement), and verified backups.
-2. Resolve and approve an official/approved source for realmd, adcli, and
-   autofs. Do not enable AUR automatically.
-3. Install only approved dependencies idempotently; do not run `pacman -Syu` as
-   incidental setup.
-4. Generate Kerberos, SSSD, PAM, sudoers, and autofs files into staging and
-   validate them. Validate sudoers using a temporary full include structure.
-5. Validate NetworkManager/resolver state, AD search behavior, Kerberos SRV,
-   time synchronization, and `realm discover dr.kodr.local`.
-6. At the join checkpoint record current/proposed hostname, DNS, time result,
-   packages, files, service restarts, rollback command, and logout/reboot impact.
-7. Let the human operator type the domain credential directly. Never store it.
-8. Validate `realm list`, SSSD status, `sssctl config-check`, domain status,
-   `getent`, `id`, `kinit`, `klist`, and intended `sudo -l -U` behavior.
-9. Test domain login/home creation in a separate TTY or safe secondary session.
-   Confirm `drone` and the existing local account still work offline.
-10. Validate `dr-workstation`, CIFS Kerberos mounting, autofs, desktop
-    integration, and reboot persistence. Defer KIT until separately approved.
-11. Rerun normally and verify `POSTJOIN_COMPLETE` exits without prompts,
-    pacman, DNS/hostname/time/PAM/SSSD/realm changes, or service restarts.
+1. Resolve DNS against the office AD DNS path and repair/synchronize time with
+   explicit operator approval; keep the current root-capable terminal open.
+2. Confirm a clean feature-branch worktree, current backups, local break-glass
+   login, and any approved Btrfs snapshot.
+3. Approve and install only the exact dependencies above; do not full-upgrade
+   the system incidentally.
+4. Stage and validate Kerberos, SSSD, native PAM, sudoers, Samba, and both
+   systemd units. Use `testparm`, `systemd-analyze verify`, and `visudo`.
+5. Validate DNS SRV records, `kinit` readiness, and Samba discovery without a
+   join. Do not run `net ads join` until the join checkpoint is presented.
+6. At the credential boundary, let the human operator type the domain
+   credential into `kinit`; never pass or record it.
+7. Validate `net ads testjoin`, `net ads keytab create`, `klist -k`,
+   `sssctl config-check`, `sssctl domain-status`, SSSD status, `getent`, `id`,
+   and intended sudo policy.
+8. Test domain login and home creation from a separate TTY/secondary session;
+   test the local break-glass and existing personal account with network
+   disconnected or SSSD unavailable before closing recovery access.
+9. Validate `mount-kit-tools`, Kerberos CIFS access, automount recovery,
+   `dr-workstation`, desktop behavior, and reboot persistence. Defer KIT until
+   these phases pass and receive separate approval.
+10. Rerun the candidate normally and verify `POSTJOIN_COMPLETE` exits without
+    office prompts, pacman, DNS/hostname/time/PAM/SSSD changes, service
+    restarts, or Samba join operations.
 
 ## Ubuntu/Debian regression checklist
 
-- Supported Ubuntu/Debian detection and version rejection remain correct.
-- apt locks, PackageKit, dpkg repair, package fallbacks, and unattended-upgrade
-  handling remain confined to the Debian adapter.
-- `common-*` PAM, oddjob/`libpam-mkhomedir`, Debian chrony/ssh/GDM, Samba,
-  winbind, autofs, SSSD, sudoers, KIT, and state transitions remain unchanged.
-- A completed workstation exits before provisioning mutations; only
-  `--full-reconfigure` overrides it.
+- Detection/version checks for Ubuntu/Debian remain unchanged.
+- The existing apt/dpkg, PackageKit, unattended-upgrades, `debconf`,
+  `pam-auth-update`, common-PAM, oddjob/libpam-mkhomedir, chrony, GDM,
+  realmd/adcli, winbind, and autofs paths remain Debian-only.
+- Debian still allocates hostnames authoritatively through its existing LDAP
+  and realmd/adcli helper.
+- Shared office selection, state transitions, SSSD options, sudoers, KIT,
+  diagnostics, and the completed-workstation guard remain covered by fixture
+  tests.
 
-## Status and limitations
+## Status and known limitations
 
-This branch does not claim completed CachyOS support. Real join, package
-installation, PAM activation, SSSD authentication, offline local login, home
-creation, sudo, CIFS/autofs, KIT, reboot persistence, and joined-system rollback
-are unverified. The current machine is intentionally blocked before persistent
-changes by missing approved packages, time sync, and the absent break-glass
-account.
+Static and read-only validation is passing. ShellCheck remains unrun because
+the host does not have `shellcheck` installed; installing it is intentionally
+outside this no-live-change phase. The real package install, Samba join,
+SSSD/PAM activation, local fallback login, domain login/home creation, sudo,
+Kerberos CIFS mount, automount recovery after reboot, KIT, and completed-state
+rerun have not been validated on CachyOS. In particular, the
+`sec=krb5,multiuser` systemd mount behavior must be tested with real SSSD
+credential caches and the actual Tool Server.
 
-Proposed focused commits:
-
-```text
-refactor: isolate distro-specific platform operations
-test: add platform and state regression coverage
-feat: add CachyOS and Arch-family preflight support
-feat: add CachyOS domain provisioning adapter
-docs: add CachyOS validation and rollback guide
-```
+Do not advertise or merge this branch as complete until those live tests pass.
