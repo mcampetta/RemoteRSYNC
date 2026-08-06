@@ -43,10 +43,10 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.2.0-cachyos-candidate"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
-STATE_DIR="/var/lib/dr-domain-join"
+STATE_DIR="${DR_JOIN_STATE_DIR:-/var/lib/dr-domain-join}"
 STATE_FILE="$STATE_DIR/state"
 DOMAIN_TARGET_HOSTNAME=""
 HOSTNAME_CHANGED=0
@@ -63,6 +63,18 @@ WINS_SERVER="10.40.249.101"
 DNS_SEARCH="dr.kodr.local,corp.altegrity.com,corp.eddom.org,corp.kroll.com,ontrack.com,ccp.edp.local"
 DNS_TEST_ONLY=false
 FULL_RECONFIGURE=false
+PLATFORM_REPORT_ONLY=false
+PREFLIGHT_ONLY=false
+DRY_RUN_ONLY=false
+PLATFORM_FAMILY=""
+PLATFORM_SUPPORTED=false
+PLATFORM_PACKAGE_MANAGER=""
+PLATFORM_VERSION=""
+PLATFORM_DESKTOP=""
+PLATFORM_ADMIN_GROUP=""
+PLATFORM_REPORT_BLOCKERS=0
+PREFLIGHT_BLOCKERS=0
+OS_RELEASE_FILE="${DR_JOIN_OS_RELEASE_FILE:-/etc/os-release}"
 KIT_PROCESS_PATTERN="${KIT_PROCESS_PATTERN:-KIT}"
 KIT_INSTALLER_PATH="${KIT_INSTALLER_PATH:-/mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/KIT-installer-modified.sh}"
 BRAND_WALLPAPER_SOURCE="${BRAND_WALLPAPER_SOURCE:-/mnt/x/CRtools/Frozen/Branding/Wallpaper/1080p_ontrackwallpaper.jpg}"
@@ -121,6 +133,15 @@ load_config() {
 
 check_privileges() {
     if [ "$EUID" -ne 0 ]; then
+        local arg
+        for arg in "$@"; do
+            case "$arg" in
+                --platform-report|--preflight|--dry-run)
+                    print_warning "Read-only mode selected; root is not required"
+                    return 0
+                    ;;
+            esac
+        done
         print_error "This script must be run as root or with sudo"
         print_info 'Please run: wget -qO- http://ontrack.link/joindomain | sudo bash'
         exit 1
@@ -223,6 +244,13 @@ completed_workstation_rerun_guard() {
         return 0
     fi
 
+    # Read-only inspection modes must remain read-only even on a completed
+    # workstation. They are allowed to report the managed-workstation state,
+    # but must not refresh the management command or sudo policy.
+    if [ "$PLATFORM_REPORT_ONLY" = true ] || [ "$PREFLIGHT_ONLY" = true ] || [ "$DRY_RUN_ONLY" = true ]; then
+        return 0
+    fi
+
     # A completed-workstation rerun is allowed to refresh only the isolated
     # management command and its sudo policy. It must not enter provisioning or
     # touch hostname, NetworkManager, DNS, Chrony, Kerberos, SSSD, or the realm.
@@ -236,26 +264,541 @@ completed_workstation_rerun_guard() {
     exit 0
 }
 
-# ── OS detection ──────────────────────────────────────────────────────────────
+# ── Platform adapter layer ──────────────────────────────────────────────────
+#
+# Keep distro-specific package, service, PAM, and desktop behavior here. The
+# shared provisioning workflow below should depend on logical capabilities
+# rather than individual distribution names. Fedora is recognized so it can
+# receive a clear unsupported result later, but has no implementation here.
+
+PLATFORM_CAPABILITIES=(
+    realmd sssd sssd-tools adcli kerberos samba cifs autofs time-sync
+    networkmanager dns ldap sudo pam home-directory ssh-server winbind desktop-helper
+)
+
+platform_detect_desktop() {
+    local desktop="${XDG_CURRENT_DESKTOP:-}"
+
+    if [ -z "$desktop" ] && command -v loginctl >/dev/null 2>&1; then
+        desktop="$(loginctl show-session "${XDG_SESSION_ID:-}" -p Desktop --value 2>/dev/null || true)"
+    fi
+    if [ -z "$desktop" ] && [ -d /usr/share/plasma ]; then
+        desktop="KDE"
+    elif [ -z "$desktop" ] && [ -d /usr/share/gnome-shell ]; then
+        desktop="GNOME"
+    fi
+
+    case "${desktop,,}" in
+        *kde*|*plasma*) PLATFORM_DESKTOP="KDE Plasma" ;;
+        *gnome*) PLATFORM_DESKTOP="GNOME" ;;
+        *xfce*) PLATFORM_DESKTOP="XFCE" ;;
+        *mate*) PLATFORM_DESKTOP="MATE" ;;
+        "") PLATFORM_DESKTOP="Unknown" ;;
+        *) PLATFORM_DESKTOP="$desktop" ;;
+    esac
+}
+
+platform_validate_version() {
+    case "$PLATFORM_FAMILY" in
+        arch)
+            # Arch-family releases are rolling. CachyOS may expose BUILD_ID
+            # rather than a numeric VERSION_ID, so no numeric minimum applies.
+            return 0
+            ;;
+        debian)
+            case "$OS" in
+                ubuntu)
+                    [ -n "${VER:-}" ] || return 1
+                    [ "$(printf '%s\n' "$VER" "22.04" | sort -V | head -1)" = "22.04" ]
+                    ;;
+                debian)
+                    [ -n "${VER:-}" ] || return 1
+                    [ "$(printf '%s\n' "$VER" "13" | sort -V | head -1)" = "13" ]
+                    ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+detect_platform() {
+    if [ ! -f "$OS_RELEASE_FILE" ]; then
+        print_error "Cannot detect platform. $OS_RELEASE_FILE not found."
+        return 1
+    fi
+
+    # shellcheck disable=SC1090
+    . "$OS_RELEASE_FILE"
+    OS="${ID:-unknown}"
+    VER="${VERSION_ID:-${BUILD_ID:-rolling}}"
+    PLATFORM_VERSION="$VER"
+    PLATFORM_FAMILY=""
+
+    case "$OS" in
+        ubuntu|debian) PLATFORM_FAMILY="debian" ;;
+        arch|cachyos) PLATFORM_FAMILY="arch" ;;
+        fedora) PLATFORM_FAMILY="fedora" ;;
+    esac
+
+    if [ -z "$PLATFORM_FAMILY" ]; then
+        for family in $ID_LIKE; do
+            case "$family" in
+                debian) PLATFORM_FAMILY="debian"; break ;;
+                arch) PLATFORM_FAMILY="arch"; break ;;
+                fedora|rhel) PLATFORM_FAMILY="fedora"; break ;;
+            esac
+        done
+    fi
+
+    PLATFORM_SUPPORTED=false
+    case "$PLATFORM_FAMILY" in
+        debian|arch) PLATFORM_SUPPORTED=true ;;
+        fedora) PLATFORM_SUPPORTED=false ;;
+        *) PLATFORM_FAMILY="unknown" ;;
+    esac
+
+    case "$PLATFORM_FAMILY" in
+        debian) PLATFORM_PACKAGE_MANAGER="apt" ;;
+        arch) PLATFORM_PACKAGE_MANAGER="pacman" ;;
+        *) PLATFORM_PACKAGE_MANAGER="unknown" ;;
+    esac
+
+    platform_detect_desktop
+    if ! platform_validate_version; then
+        PLATFORM_SUPPORTED=false
+    fi
+}
 
 detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS=$ID
-        VER=$VERSION_ID
-    else
-        print_error "Cannot detect OS. /etc/os-release not found."
-        exit 1
+    detect_platform || return 1
+
+    if [ "$PLATFORM_SUPPORTED" != true ]; then
+        print_error "Unsupported platform: ID=${OS:-unknown} ID_LIKE=${ID_LIKE:-unknown} VERSION=${VER:-unknown}"
+        if [ "$PLATFORM_FAMILY" = "fedora" ]; then
+            print_error "Fedora-family support is reserved for a future adapter implementation."
+        else
+            print_error "Supported families in this candidate are Debian/Ubuntu and Arch/CachyOS."
+        fi
+        return 1
     fi
 
-    if [[ "$OS" != "ubuntu" && "$OS" != "debian" ]]; then
-        print_error "Unsupported OS: $OS"
-        print_error "This script only supports Ubuntu and Debian."
-        exit 1
-    fi
-
-    print_info "Detected OS: $OS $VER"
+    print_info "Detected platform: $OS $VER (family=$PLATFORM_FAMILY, desktop=$PLATFORM_DESKTOP)"
 }
+
+platform_package_name() {
+    local capability="$1"
+
+    case "$PLATFORM_FAMILY:$capability" in
+        debian:realmd) echo "realmd" ;;
+        debian:sssd) echo "sssd" ;;
+        debian:sssd-tools) echo "sssd-tools" ;;
+        debian:adcli) echo "adcli" ;;
+        debian:kerberos) echo "krb5-user" ;;
+        debian:samba) echo "samba-common-bin" ;;
+        debian:cifs) echo "cifs-utils" ;;
+        debian:autofs) echo "autofs" ;;
+        debian:time-sync) echo "chrony" ;;
+        debian:networkmanager) echo "network-manager" ;;
+        debian:dns) echo "dnsutils" ;;
+        debian:ldap) echo "ldap-utils" ;;
+        debian:sudo) echo "sudo" ;;
+        debian:pam) echo "libpam-modules" ;;
+        debian:home-directory)
+            if [ "$OS" = "debian" ]; then echo "oddjob-mkhomedir"; else echo "libpam-mkhomedir"; fi
+            ;;
+        debian:ssh-server) echo "openssh-server" ;;
+        debian:desktop-helper) echo "xdg-utils" ;;
+        debian:winbind) echo "winbind" ;;
+        debian:packagekit) echo "packagekit" ;;
+        debian:update-policy) echo "unattended-upgrades" ;;
+        arch:realmd) ;;
+        arch:sssd) echo "sssd" ;;
+        # Arch packages sssctl with sssd when present; verify the command
+        # after installation because no separate sssd-tools package exists.
+        arch:sssd-tools) echo "sssd" ;;
+        arch:adcli) ;;
+        arch:kerberos) echo "krb5" ;;
+        arch:samba) echo "samba" ;;
+        arch:cifs) echo "cifs-utils" ;;
+        arch:autofs) ;;
+        arch:time-sync) echo "chrony" ;;
+        arch:networkmanager) echo "networkmanager" ;;
+        arch:dns) echo "bind" ;;
+        arch:ldap) echo "openldap" ;;
+        arch:sudo) echo "sudo" ;;
+        arch:pam) echo "pam" ;;
+        arch:home-directory) echo "pam" ;;
+        arch:ssh-server) echo "openssh" ;;
+        arch:desktop-helper) echo "xdg-utils" ;;
+        arch:winbind) echo "samba" ;;
+        *) ;;
+    esac
+}
+
+platform_is_package_installed() {
+    local package="$1"
+    [ -n "$package" ] || return 1
+
+    case "$PLATFORM_FAMILY" in
+        debian)
+            dpkg-query -W -f='${Status}\n' "$package" 2>/dev/null | grep -q '^install ok installed$'
+            ;;
+        arch)
+            pacman -Qq "$package" >/dev/null 2>&1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+platform_is_package_available() {
+    local package="$1"
+    [ -n "$package" ] || return 1
+
+    case "$PLATFORM_FAMILY" in
+        debian) apt-cache show "$package" >/dev/null 2>&1 ;;
+        arch) pacman -Si "$package" >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+platform_prepare_package_manager() {
+    case "$PLATFORM_FAMILY" in
+        debian)
+            wait_for_apt_locks
+            ;;
+        arch)
+            local newest_db now age
+            newest_db="$(stat -c '%Y' /var/lib/pacman/sync/*.db 2>/dev/null | sort -nr | head -1 || true)"
+            now="$(date +%s)"
+            if [ -n "$newest_db" ]; then
+                age=$((now - newest_db))
+                if [ "$age" -gt 604800 ]; then
+                    print_warning "pacman sync databases are ${age}s old; no automatic pacman -Syu or database refresh will be performed"
+                fi
+            else
+                print_error "No pacman sync database is available"
+                return 1
+            fi
+            ;;
+        *)
+            print_error "No package-manager adapter exists for platform family '$PLATFORM_FAMILY'"
+            return 1
+            ;;
+    esac
+}
+
+platform_install_package() {
+    local capability="$1"
+    local package
+    package="$(platform_package_name "$capability")"
+
+    if [ -z "$package" ]; then
+        print_error "No package mapping exists for capability '$capability' on $PLATFORM_FAMILY"
+        return 1
+    fi
+    if platform_is_package_installed "$package"; then
+        print_info "$capability: $package is already installed"
+        return 0
+    fi
+    if ! platform_is_package_available "$package"; then
+        print_error "Required package '$package' for capability '$capability' is unavailable in configured repositories"
+        return 1
+    fi
+
+    case "$PLATFORM_FAMILY" in
+        debian) install_package "$package" ;;
+        arch)
+            platform_prepare_package_manager || return 1
+            print_info "Installing $package with pacman --needed (no full-system upgrade)"
+            pacman -S --needed --noconfirm "$package"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+platform_install_packages() {
+    local capability
+    platform_prepare_package_manager || return 1
+    for capability in "$@"; do
+        platform_install_package "$capability" || return 1
+    done
+}
+
+platform_service_name() {
+    case "$PLATFORM_FAMILY:$1" in
+        arch:time-sync) echo "chronyd" ;;
+        debian:time-sync) echo "chrony" ;;
+        arch:ssh-server) echo "sshd" ;;
+        debian:ssh-server) echo "ssh" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+platform_enable_service() {
+    local capability="$1"
+    local service
+    service="$(platform_service_name "$capability")"
+    systemctl enable --now "$service"
+}
+
+platform_admin_group() {
+    case "$PLATFORM_FAMILY" in
+        arch)
+            PLATFORM_ADMIN_GROUP="wheel"
+            ;;
+        debian)
+            if getent group sudo >/dev/null 2>&1; then
+                PLATFORM_ADMIN_GROUP="sudo"
+            else
+                PLATFORM_ADMIN_GROUP="adm"
+            fi
+            ;;
+        *) PLATFORM_ADMIN_GROUP="" ;;
+    esac
+    printf '%s\n' "$PLATFORM_ADMIN_GROUP"
+}
+
+platform_desktop_integration() {
+    case "$PLATFORM_DESKTOP" in
+        "GNOME") echo "GNOME best-effort dconf/gsettings integration" ;;
+        "KDE Plasma") echo "KDE Plasma: preserve user preferences; desktop files only" ;;
+        *) echo "Unsupported desktop: core provisioning continues; customization skipped" ;;
+    esac
+}
+
+platform_validate_auth_stack() {
+    local failed=0
+    case "$PLATFORM_FAMILY" in
+        arch)
+            for file in /etc/pam.d/system-auth /etc/pam.d/system-login; do
+                [ -f "$file" ] || failed=1
+            done
+            [ -f /usr/lib/security/pam_mkhomedir.so ] || failed=1
+            ;;
+        debian)
+            [ -f /etc/pam.d/common-auth ] || failed=1
+            [ -f /etc/pam.d/common-account ] || failed=1
+            [ -f /etc/pam.d/common-session ] || failed=1
+            ;;
+        *) failed=1 ;;
+    esac
+    return "$failed"
+}
+
+backup_config_file() {
+    local file="$1"
+    local backup
+    [ -e "$file" ] || return 0
+    backup="${file}.domain-join.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a -- "$file" "$backup"
+    chmod --reference="$file" "$backup" 2>/dev/null || true
+    print_info "Backed up $file to $backup"
+}
+
+platform_capability_status() {
+    local capability="$1"
+    local package
+    package="$(platform_package_name "$capability")"
+    if [ -z "$package" ]; then
+        printf 'BLOCKED|%s|no configured-repository mapping' "$capability"
+    elif platform_is_package_installed "$package"; then
+        printf 'PASS|%s|%s installed' "$capability" "$package"
+    elif platform_is_package_available "$package"; then
+        printf 'WARNING|%s|%s available but not installed' "$capability" "$package"
+    else
+        printf 'BLOCKED|%s|%s unavailable in configured repositories' "$capability" "$package"
+    fi
+}
+
+platform_report() {
+    local capability status name detail package_db
+    PLATFORM_REPORT_BLOCKERS=0
+    platform_admin_group >/dev/null
+
+    package_db="unknown"
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        package_db="$(stat -c '%y' /var/lib/pacman/sync/*.db 2>/dev/null | sort -r | head -1 || echo unavailable)"
+    elif [ "$PLATFORM_FAMILY" = "debian" ]; then
+        package_db="apt metadata directory: /var/lib/apt/lists"
+    fi
+
+    echo "Platform report"
+    echo "  Distro:              ${OS:-unknown}"
+    echo "  Platform family:     ${PLATFORM_FAMILY:-unknown}"
+    echo "  Version:             ${PLATFORM_VERSION:-unknown}"
+    echo "  Supported:           ${PLATFORM_SUPPORTED}"
+    echo "  Desktop:             ${PLATFORM_DESKTOP:-Unknown}"
+    echo "  Package manager:     ${PLATFORM_PACKAGE_MANAGER:-unknown}"
+    echo "  Package-manager DB:  $package_db"
+    echo "  Administrator group: ${PLATFORM_ADMIN_GROUP:-unavailable}"
+    echo "  Resolver:            $(if systemctl is-active --quiet systemd-resolved 2>/dev/null; then echo systemd-resolved; else echo /etc/resolv.conf; fi)"
+    echo "  Time provider:       $(if systemctl is-active --quiet chronyd 2>/dev/null; then echo chronyd; elif systemctl is-active --quiet chrony 2>/dev/null; then echo chrony; elif systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then echo systemd-timesyncd; else echo unknown; fi)"
+    echo "  Desktop adapter:     $(platform_desktop_integration)"
+    echo ""
+    echo "Capability/package mapping"
+    for capability in "${PLATFORM_CAPABILITIES[@]}"; do
+        IFS='|' read -r status name detail <<< "$(platform_capability_status "$capability")"
+        printf '  %-8s %-18s %s (%s)\n' "$status" "$name" "$detail" "$(platform_package_name "$name")"
+        [ "$status" = "BLOCKED" ] && PLATFORM_REPORT_BLOCKERS=$((PLATFORM_REPORT_BLOCKERS + 1))
+    done
+    echo ""
+    if [ "$PLATFORM_SUPPORTED" = true ] && [ "$PLATFORM_REPORT_BLOCKERS" -eq 0 ]; then
+        echo "PASS Supported platform and configured-repository capability map"
+    elif [ "$PLATFORM_SUPPORTED" = true ]; then
+        echo "BLOCKED Supported platform has unavailable or unmapped capabilities"
+    else
+        echo "BLOCKED Platform is unsupported or not implemented"
+    fi
+}
+
+preflight_pass() { printf 'PASS %s\n' "$*"; }
+preflight_warning() { printf 'WARNING %s\n' "$*"; }
+preflight_blocked() { PREFLIGHT_BLOCKERS=$((PREFLIGHT_BLOCKERS + 1)); printf 'BLOCKED %s\n' "$*"; }
+
+platform_preflight() {
+    local current_host dns_output ntp_synced
+    PREFLIGHT_BLOCKERS=0
+    platform_report
+
+    [ "$PLATFORM_SUPPORTED" = true ] || preflight_blocked "platform is not supported by this candidate"
+    [ "$PLATFORM_REPORT_BLOCKERS" -eq 0 ] || preflight_blocked "$PLATFORM_REPORT_BLOCKERS required package capabilities are unavailable or unmapped"
+
+    if nmcli general status >/dev/null 2>&1; then
+        preflight_pass "NetworkManager is queryable"
+    else
+        preflight_blocked "NetworkManager is unavailable or not queryable"
+    fi
+
+    dns_output="$(resolvectl status 2>/dev/null || true)"
+    if echo "$dns_output" | grep -qE 'DNS Servers:|Current DNS Server:' || grep -qE '^[[:space:]]*nameserver[[:space:]]+' /etc/resolv.conf 2>/dev/null; then
+        preflight_pass "A resolver and DNS server are configured"
+    else
+        preflight_blocked "No DNS server is visible in resolver state"
+    fi
+
+    if [ "${DR_JOIN_TEST_MODE:-false}" = true ]; then
+        preflight_warning "Fixture test mode: external DNS and realm probes skipped"
+    elif command -v dig >/dev/null 2>&1; then
+        if timeout 5s dig +time=2 +tries=1 +short SRV "_kerberos._tcp.$DOMAIN" 2>/dev/null | grep -q .; then
+            preflight_pass "Kerberos SRV discovery works for $DOMAIN"
+        else
+            preflight_blocked "Kerberos SRV discovery failed for $DOMAIN"
+        fi
+    else
+        preflight_blocked "dig is unavailable; cannot validate Kerberos SRV discovery"
+    fi
+
+    ntp_synced="$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || true)"
+    if [ "$ntp_synced" = yes ] || chronyc tracking 2>/dev/null | grep -qE '^Leap status[[:space:]]*:[[:space:]]*Normal'; then
+        preflight_pass "System clock is synchronized"
+    else
+        preflight_blocked "System clock is not synchronized; no time repair will be attempted"
+    fi
+
+    current_host="$(hostnamectl --static 2>/dev/null || hostname 2>/dev/null || true)"
+    if is_valid_ad_hostname "$current_host"; then
+        preflight_pass "Current hostname is AD-safe: $current_host"
+    else
+        preflight_warning "Current hostname is not AD-safe and will require an explicit hostname-policy decision: ${current_host:-unknown}"
+    fi
+
+    if [ "${DR_JOIN_TEST_MODE:-false}" = true ]; then
+        preflight_warning "Fixture test mode: realm discovery skipped"
+    elif command -v realm >/dev/null 2>&1; then
+        if realm discover "$DOMAIN" >/dev/null 2>&1; then
+            preflight_pass "Realm discovery works for $DOMAIN"
+        else
+            preflight_blocked "Realm discovery failed for $DOMAIN"
+        fi
+    else
+        preflight_blocked "realm command is unavailable; realm discovery cannot run"
+    fi
+
+    for command_name in realm adcli kinit smbclient mount.cifs automount visudo; do
+        if command -v "$command_name" >/dev/null 2>&1; then
+            preflight_pass "Required command available: $command_name"
+        else
+            preflight_blocked "Required command unavailable: $command_name"
+        fi
+    done
+
+    for command_name in ldapsearch sssctl; do
+        if command -v "$command_name" >/dev/null 2>&1; then
+            preflight_pass "Required diagnostic command available: $command_name"
+        else
+            preflight_blocked "Required diagnostic command unavailable: $command_name"
+        fi
+    done
+
+    if platform_validate_auth_stack; then
+        preflight_pass "Native PAM/authentication stack is present"
+    else
+        preflight_blocked "Native PAM/authentication stack is incomplete"
+    fi
+
+    if [ -r "$STATE_FILE" ]; then
+        preflight_pass "Persistent state file exists and is readable: $STATE_FILE"
+    elif [ -f "$STATE_FILE" ]; then
+        preflight_warning "Persistent state file exists but is not readable by this user: $STATE_FILE"
+    else
+        preflight_warning "No persistent state file exists yet: $STATE_FILE"
+    fi
+    if getent passwd drone >/dev/null 2>&1; then
+        preflight_pass "Local break-glass account drone is present"
+    else
+        preflight_blocked "Local break-glass account drone is not present; no account will be created automatically"
+    fi
+
+    if [ "$(df -Pk / | awk 'NR==2 {print $4}')" -ge 5242880 ] 2>/dev/null; then
+        preflight_pass "At least 5 GiB is available on /"
+    else
+        preflight_warning "Less than 5 GiB is available on /"
+    fi
+    if [ -f /var/run/reboot-required ] || command -v needs-restarting >/dev/null 2>&1 && needs-restarting -r >/dev/null 2>&1; then
+        preflight_warning "The host may require a reboot; no reboot will be initiated"
+    else
+        preflight_pass "No reboot-required marker is visible"
+    fi
+
+    if [ -d "$STATE_DIR" ]; then
+        preflight_pass "State/backup parent directory exists: $STATE_DIR"
+    else
+        preflight_warning "State/backup parent directory does not exist yet: $STATE_DIR"
+    fi
+
+    if [ "$PREFLIGHT_BLOCKERS" -eq 0 ]; then
+        echo "PASS Preflight completed with no blockers"
+        return 0
+    fi
+    echo "BLOCKED Preflight found $PREFLIGHT_BLOCKERS blocker(s); no persistent changes were made"
+    return 1
+}
+
+platform_dry_run() {
+    platform_preflight || true
+    echo ""
+    echo "Ordered dry-run plan (no persistent changes made)"
+    echo "  WOULD CHANGE packages: logical capabilities mapped above, using $PLATFORM_PACKAGE_MANAGER --needed"
+    echo "  WOULD CHANGE hostname and /etc/hosts after explicit operator confirmation"
+    echo "  WOULD CHANGE NetworkManager search domains; DNS servers remain DHCP/VPN unless explicit override is configured"
+    echo "  WOULD CHANGE time configuration using the platform time-service adapter"
+    echo "  WOULD CHANGE /etc/krb5.conf, /etc/sssd/sssd.conf, native PAM files, /etc/sudoers.d/*, /etc/samba/smb.conf, /etc/nsswitch.conf"
+    echo "  WOULD CHANGE /etc/auto.master.d/*, /etc/auto.net.cifs, /usr/local/bin/*, /usr/local/sbin/*, desktop integration files"
+    echo "  WOULD ENABLE/RESTART services: $(platform_service_name time-sync), sssd, winbind, autofs, $(platform_service_name ssh-server)"
+    echo "  WOULD JOIN realm: $DOMAIN only at the human credential checkpoint"
+    echo "  WOULD NOT reboot, log out, restart a display manager, disable security controls, or run pacman -Syu"
+    if [ "$PREFLIGHT_BLOCKERS" -gt 0 ] || [ "$PLATFORM_REPORT_BLOCKERS" -gt 0 ]; then
+        echo "BLOCKED Dry-run plan is not executable until preflight blockers are resolved"
+        return 1
+    fi
+    echo "PASS Dry-run plan is internally complete; no persistent changes were made"
+    return 0
+}
+
+# ── OS detection ──────────────────────────────────────────────────────────────
 
 # ── Package helpers ───────────────────────────────────────────────────────────
 
@@ -604,6 +1147,7 @@ EOF
 
 load_state() {
     [ -f "$STATE_FILE" ] || return 1
+    [ -r "$STATE_FILE" ] || return 1
     # shellcheck disable=SC1090
     . "$STATE_FILE"
 
@@ -667,10 +1211,19 @@ update_hosts_for_hostname() {
 }
 
 ensure_local_pam_survives_sssd_failure() {
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        # Arch uses pambase's system-auth/system-login includes rather than
+        # Debian's common-* files. The native adapter adds pam_sss with
+        # user_unknown=ignore and keeps pam_unix in the stack so local users
+        # remain usable when the domain is offline.
+        print_info "Arch PAM resilience is provided by the native system-auth adapter"
+        return 0
+    fi
+
     local acct="/etc/pam.d/common-account"
 
     [ -f "$acct" ] || return 0
-    cp "$acct" "${acct}.domain-join.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    backup_config_file "$acct"
 
     if grep -q 'pam_sss.so' "$acct"; then
         sed -i -E 's/^account[[:space:]]+\[[^]]*\][[:space:]]+pam_sss\.so.*/account [success=ok new_authtok_reqd=done ignore=ignore user_unknown=ignore default=ignore] pam_sss.so/' "$acct"
@@ -1020,7 +1573,6 @@ validate_existing_join() {
 
     if adcli testjoin -D "$DOMAIN" >/dev/null 2>&1; then
         print_info "Machine account validation succeeded"
-        systemctl enable --now sssd >/dev/null 2>&1 || true
         return 0
     fi
 
@@ -1710,12 +2262,9 @@ prompt_sudo_user() {
 # ── Install domain packages ───────────────────────────────────────────────────
 
 install_time_sync_prerequisites() {
-    # IMPORTANT: Do not run apt-get here. If the workstation clock is behind or
-    # ahead of the repository timestamps, apt will fail with "Release file ...
-    # is not valid yet" before we get a chance to repair time. This function is
-    # intentionally limited to checking already-present tooling. The full package
-    # install occurs after sync_time() has repaired/verified the clock.
-    print_info "Checking time/DNS prerequisite tools without using apt..."
+    # IMPORTANT: Do not run a package manager here. A bad clock can invalidate
+    # both apt metadata and pacman signatures before time has been repaired.
+    print_info "Checking time/DNS prerequisite tools without using a package manager..."
 
     if ! command -v nmcli >/dev/null 2>&1; then
         print_warning "nmcli not found; NetworkManager DNS configuration may not be available"
@@ -1795,8 +2344,44 @@ $/, ""); print; exit}')
     return 1
 }
 
+bootstrap_time_before_packages() {
+    if [ "$PLATFORM_FAMILY" = "debian" ]; then
+        bootstrap_time_before_apt
+        return $?
+    fi
+
+    print_info "Bootstrapping system clock before package installation..."
+    if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+        timedatectl set-ntp true >/dev/null 2>&1 || true
+    elif command -v chronyc >/dev/null 2>&1; then
+        platform_enable_service time-sync >/dev/null 2>&1 || true
+        chronyc -a makestep >/dev/null 2>&1 || true
+    fi
+
+    if timedatectl show --property=NTPSynchronized --value 2>/dev/null | grep -q '^yes$' || \
+       chronyc tracking 2>/dev/null | grep -qE '^Leap status[[:space:]]*:[[:space:]]*Normal'; then
+        print_info "Clock synchronization is confirmed"
+        return 0
+    fi
+
+    print_warning "Clock synchronization could not be confirmed before package installation"
+    return 1
+}
+
 install_domain_packages() {
     print_info "Installing domain packages..."
+
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        # No pacman -Syu is performed here. The configured sync databases are
+        # inspected and only the mapped capabilities are installed with
+        # --needed. Missing realmd/adcli/autofs are intentional blockers until
+        # an approved repository/package source is available.
+        platform_install_packages \
+            realmd sssd sssd-tools adcli kerberos samba cifs autofs time-sync \
+            dns ldap ssh-server desktop-helper || return 1
+        return 0
+    fi
+
     trap 'if [ "$APT_BACKGROUND_GUARD_ACTIVE" -eq 1 ]; then restore_apt_respawn_units; APT_BACKGROUND_GUARD_ACTIVE=0; fi' RETURN
 
     wait_for_apt_locks || return 1
@@ -1826,7 +2411,7 @@ install_domain_packages() {
     install_package "unattended-upgrades"
     install_package "apt-listchanges"
     install_package "needrestart"
-    systemctl enable --now ssh > /dev/null 2>&1 || true
+    systemctl enable --now "$(platform_service_name ssh-server)" > /dev/null 2>&1 || true
 
     # Home directory creation: oddjob on Debian, libpam-mkhomedir on Ubuntu
     if [[ "$OS" == "debian" ]]; then
@@ -1849,6 +2434,11 @@ install_domain_packages() {
 # surfaced through syslog and MOTD so technicians can schedule downtime safely.
 
 configure_no_reboot_policy() {
+    if [ "$PLATFORM_FAMILY" != "debian" ]; then
+        print_info "Skipping Debian unattended-upgrade/no-reboot policy on $PLATFORM_FAMILY"
+        return 0
+    fi
+
     print_info "Configuring no-auto-reboot update policy for KIT workstations..."
 
     mkdir -p /etc/apt/apt.conf.d
@@ -2044,6 +2634,7 @@ configure_dns_servers() {
         return 0
     fi
 
+    backup_config_file /etc/NetworkManager/system-connections
     print_info "Applying DNS override to connection '$connection': $DNS_SERVERS"
     nmcli connection modify "$connection" ipv4.dns "$DNS_SERVERS"
     nmcli connection up "$connection" > /dev/null
@@ -2094,6 +2685,7 @@ configure_chrony() {
         return 0
     fi
 
+    backup_config_file "$chrony_conf"
     print_info "Configuring chrony to use current domain DNS/DC servers as NTP sources: $ntp_servers"
 
     # Clean up bad/duplicate entries from earlier test runs. This keeps the
@@ -2126,7 +2718,7 @@ configure_chrony() {
         echo "# END domain-join chrony sources"
     } >> "$chrony_conf"
 
-    systemctl restart chrony > /dev/null 2>&1 || true
+    systemctl restart "$(platform_service_name time-sync)" > /dev/null 2>&1 || true
     print_info "chrony NTP sources configured"
 }
 
@@ -2172,8 +2764,25 @@ force_step_from_chrony_offset() {
 }
 
 sync_time() {
+    if [ "$PLATFORM_FAMILY" = "arch" ] && ! command -v chronyc >/dev/null 2>&1; then
+        print_info "Using systemd-timesyncd for time synchronization on Arch family"
+        timedatectl set-ntp true >/dev/null 2>&1 || true
+        local timesync_retries=6
+        local timesync_count=0
+        while [ "$timesync_count" -lt "$timesync_retries" ]; do
+            if timedatectl show --property=NTPSynchronized --value 2>/dev/null | grep -q '^yes$'; then
+                print_info "Clock is synchronized via systemd-timesyncd"
+                return 0
+            fi
+            sleep 5
+            timesync_count=$((timesync_count + 1))
+        done
+        print_warning "systemd-timesyncd did not confirm synchronization"
+        return 1
+    fi
+
     print_info "Enabling time synchronization via chrony..."
-    systemctl enable --now chrony > /dev/null 2>&1
+    platform_enable_service time-sync > /dev/null 2>&1
 
     # Ask chrony to take immediate measurements and step the clock if needed.
     chronyc -a burst 4/4 > /dev/null 2>&1 || true
@@ -2184,7 +2793,7 @@ sync_time() {
     # still not select a source. Force a one-time step from a valid NTP offset.
     if ! chronyc tracking 2>/dev/null | grep -qE '^Leap status[[:space:]]*:[[:space:]]*Normal'; then
         force_step_from_chrony_offset || true
-        systemctl restart chrony > /dev/null 2>&1 || true
+        systemctl restart "$(platform_service_name time-sync)" > /dev/null 2>&1 || true
         chronyc -a burst 4/4 > /dev/null 2>&1 || true
         sleep 2
         chronyc -a makestep > /dev/null 2>&1 || true
@@ -2221,13 +2830,8 @@ sync_time() {
 # full leave/rejoin to fix. Also sets rdns = false to prevent SSSD GSSAPI
 # failures in environments where the DC's IP has no PTR record.
 
-verify_krb5_conf() {
-    local krb5_conf="/etc/krb5.conf"
-    print_info "Verifying Kerberos configuration ($krb5_conf)..."
-
-    if [ ! -f "$krb5_conf" ]; then
-        print_info "$krb5_conf not found — creating with correct settings"
-        cat > "$krb5_conf" << EOF
+render_krb5_config() {
+    cat << EOF
 [libdefaults]
     default_realm = $REALM
     udp_preference_limit = 0
@@ -2243,8 +2847,19 @@ verify_krb5_conf() {
     .$DOMAIN = $REALM
     $DOMAIN = $REALM
 EOF
+}
+
+verify_krb5_conf() {
+    local krb5_conf="/etc/krb5.conf"
+    print_info "Verifying Kerberos configuration ($krb5_conf)..."
+
+    if [ ! -f "$krb5_conf" ]; then
+        print_info "$krb5_conf not found — creating with correct settings"
+        render_krb5_config > "$krb5_conf"
         return 0
     fi
+
+    backup_config_file "$krb5_conf"
 
     # Check and fix default_realm
     local current_realm
@@ -2317,6 +2932,7 @@ configure_fqdn() {
     fi
 
     print_info "Configuring machine FQDN in /etc/hosts ($fqdn)..."
+    backup_config_file /etc/hosts
 
     if grep -q "^127\.0\.1\.1" /etc/hosts; then
         # Replace the first 127.0.1.1 line to include the FQDN
@@ -2433,7 +3049,49 @@ join_domain() {
 
 # ── Configure PAM for home directory creation ─────────────────────────────────
 
-configure_pam_mkhomedir() {
+render_arch_pam_sss_lines() {
+    cat << 'EOF'
+auth       [success=1 default=ignore]  pam_sss.so          forward_pass
+account    [success=1 default=ignore] pam_sss.so
+session    optional                   pam_sss.so
+session    required                   pam_mkhomedir.so    skel=/etc/skel/ umask=0077
+EOF
+}
+
+configure_arch_pam() {
+    local pam_file="/etc/pam.d/system-auth"
+    local mkhomedir_line="session    required                   pam_mkhomedir.so    skel=/etc/skel/ umask=0077"
+
+    if [ ! -f "$pam_file" ]; then
+        print_error "Arch PAM file is missing: $pam_file"
+        return 1
+    fi
+    backup_config_file "$pam_file"
+
+    # Add SSSD authentication after the native local-auth line. The SSSD
+    # account control explicitly ignores unknown/offline domain identities;
+    # pam_unix remains authoritative for local accounts.
+    if ! grep -qE '^[[:space:]]*auth[[:space:]].*pam_sss\.so' "$pam_file"; then
+        sed -i '/^[[:space:]]*auth[[:space:]].*pam_unix\.so/i auth       [success=1 default=ignore]  pam_sss.so          forward_pass' "$pam_file"
+    fi
+    if ! grep -qE '^[[:space:]]*account[[:space:]].*pam_sss\.so' "$pam_file"; then
+        sed -i '/^[[:space:]]*account[[:space:]].*pam_unix\.so/i account    [success=1 default=ignore] pam_sss.so' "$pam_file"
+    fi
+    if ! grep -qE '^[[:space:]]*session[[:space:]].*pam_sss\.so' "$pam_file"; then
+        sed -i '/^[[:space:]]*session[[:space:]].*pam_unix\.so/a session    optional                   pam_sss.so' "$pam_file"
+    fi
+    if ! grep -qF 'pam_mkhomedir.so' "$pam_file"; then
+        printf '\n%s\n' "$mkhomedir_line" >> "$pam_file"
+    fi
+
+    if ! grep -qE 'pam_sss\.so|pam_mkhomedir\.so' "$pam_file"; then
+        print_error "Arch PAM adapter did not produce the expected SSSD/home-directory modules"
+        return 1
+    fi
+    print_info "Configured native Arch PAM stack in $pam_file"
+}
+
+configure_debian_pam_mkhomedir() {
     if [[ "$OS" == "debian" ]]; then
         print_info "Configuring PAM home directory creation (oddjob)..."
         pam-auth-update --enable mkhomedir
@@ -2444,6 +3102,7 @@ configure_pam_mkhomedir() {
         if grep -qF "pam_mkhomedir.so" "$pam_session" 2>/dev/null; then
             print_info "pam_mkhomedir already configured in $pam_session"
         else
+            backup_config_file "$pam_session"
             echo "$mkhomedir_line" >> "$pam_session"
             print_info "Added pam_mkhomedir to $pam_session"
         fi
@@ -2454,11 +3113,31 @@ configure_pam_mkhomedir() {
     # password for SSSD to reuse. Remove it so pam_sss.so prompts independently.
     local pam_auth="/etc/pam.d/common-auth"
     if grep -q "pam_sss\.so.*use_first_pass" "$pam_auth" 2>/dev/null; then
+        backup_config_file "$pam_auth"
         sed -i '/pam_sss\.so/ s/[[:space:]]*use_first_pass//' "$pam_auth"
         print_info "Removed use_first_pass from pam_sss.so in $pam_auth"
     else
         print_info "use_first_pass not set on pam_sss.so in $pam_auth — no change needed"
     fi
+}
+
+platform_configure_pam() {
+    case "$PLATFORM_FAMILY" in
+        arch) configure_arch_pam ;;
+        debian) configure_debian_pam_mkhomedir ;;
+        *)
+            print_error "No PAM adapter exists for platform family '$PLATFORM_FAMILY'"
+            return 1
+            ;;
+    esac
+}
+
+configure_pam_mkhomedir() {
+    platform_validate_auth_stack || {
+        print_error "Native PAM/authentication prerequisites are not present"
+        return 1
+    }
+    platform_configure_pam
 }
 
 # ── Allow all domain users to log in ─────────────────────────────────────────
@@ -2511,6 +3190,25 @@ set_sssd_global_option() {
     fi
 }
 
+render_sssd_config() {
+    cat << EOF
+[sssd]
+services = nss, pam
+domains = $DOMAIN
+
+[domain/$DOMAIN]
+id_provider = ad
+ad_domain = $DOMAIN
+krb5_realm = $REALM
+use_fully_qualified_names = False
+access_provider = simple
+ad_enable_gc = false
+krb5_renewable_lifetime = 7d
+krb5_renew_interval = 1h
+krb5_ccname_template = FILE:/tmp/krb5cc_%U
+EOF
+}
+
 configure_sssd_settings() {
     local sssd_conf="/etc/sssd/sssd.conf"
     print_info "Applying SSSD settings ($sssd_conf)..."
@@ -2519,6 +3217,8 @@ configure_sssd_settings() {
         print_warning "$sssd_conf not found — skipping SSSD settings (realm join may not have run)"
         return 0
     fi
+
+    backup_config_file "$sssd_conf"
 
     if grep -q "^\s*ad_enable_gc\s*=" "$sssd_conf"; then
         print_info "ad_enable_gc already set in $sssd_conf"
@@ -2602,6 +3302,70 @@ ensure_directory_path() {
 # has already been provisioned. This avoids hand-editing /etc/sudoers.d and
 # gives future releases one managed place to evolve workstation authorization.
 
+sudoers_escape_identifier() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value// /\\ }"
+    value="${value//#/\\#}"
+    value="${value//,/\\,}"
+    printf '%s\n' "$value"
+}
+
+normalize_domain_user_for_sudoers() {
+    local user="${1:-}"
+    user="${user##*\\}"
+    user="${user%%@*}"
+    case "$user" in
+        ""|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    printf '%s\n' "$user"
+}
+
+render_workstation_sudoers() {
+    local users_group admins_group
+    users_group="$(sudoers_escape_identifier "$DR_WORKSTATION_USERS_GROUP")"
+    admins_group="$(sudoers_escape_identifier "$DR_WORKSTATION_ADMINS_GROUP")"
+    cat << EOF
+# Managed by Ontrack Recovery Workstation Provisioner
+# Members of $DR_WORKSTATION_ADMINS_GROUP are workstation administrators.
+%$admins_group ALL=(ALL:ALL) ALL
+
+# Every authenticated DR domain user may mount the standard Tool Server.
+# SSSD is configured with use_fully_qualified_names=False, so the AD group is
+# exposed as the short group name "domain users". The escaped space is required.
+%domain\\ users ALL=(root) NOPASSWD: /usr/local/bin/mount-kit-tools
+
+# Locally managed workstation users may also run the remaining managed helpers.
+%$users_group ALL=(root) NOPASSWD: /usr/local/bin/mount-kit-tools
+%$users_group ALL=(root) NOPASSWD: /usr/local/sbin/dr-post-mount-provision
+%$users_group ALL=(root) NOPASSWD: /usr/local/sbin/dr-launch-kit
+EOF
+}
+
+stage_generated_configurations() {
+    local stage_dir="${1:-}"
+    [ -n "$stage_dir" ] || {
+        print_error "A staging directory is required"
+        return 1
+    }
+    mkdir -p "$stage_dir"
+    render_krb5_config > "$stage_dir/krb5.conf"
+    render_sssd_config > "$stage_dir/sssd.conf"
+    render_autofs_master_maps > "$stage_dir/auto.master"
+    render_autofs_cifs_map > "$stage_dir/auto.net.cifs"
+    render_workstation_sudoers > "$stage_dir/sudoers.d-zz-dr_workstation_users"
+    render_arch_pam_sss_lines > "$stage_dir/system-auth-adapter.lines"
+    chmod 600 "$stage_dir/krb5.conf" "$stage_dir/sssd.conf"
+    chmod 440 "$stage_dir/sudoers.d-zz-dr_workstation_users"
+    printf '%s\n' "$stage_dir"
+}
+
+render_domain_user_sudoers() {
+    local user
+    user="$(normalize_domain_user_for_sudoers "${1:-}")" || return 1
+    printf '%s ALL=(root) NOPASSWD: /usr/local/bin/mount-kit-tools\n' "$(sudoers_escape_identifier "$user")"
+}
+
 install_dr_workstation_manager() {
     print_info "Installing Ontrack workstation user management command..."
 
@@ -2609,21 +3373,8 @@ install_dr_workstation_manager() {
     groupadd -f "$DR_WORKSTATION_ADMINS_GROUP"
 
     local sudoers_file="/etc/sudoers.d/zz-dr_workstation_users"
-    cat > "$sudoers_file" << EOF
-# Managed by Ontrack Recovery Workstation Provisioner
-# Members of $DR_WORKSTATION_ADMINS_GROUP are workstation administrators.
-%$DR_WORKSTATION_ADMINS_GROUP ALL=(ALL:ALL) ALL
-
-# Every authenticated DR domain user may mount the standard Tool Server.
-# SSSD is configured with use_fully_qualified_names=False, so the AD group is
-# exposed as the short group name "domain users". The escaped space is required.
-%domain\ users ALL=(root) NOPASSWD: /usr/local/bin/mount-kit-tools
-
-# Locally managed workstation users may also run the remaining managed helpers.
-%$DR_WORKSTATION_USERS_GROUP ALL=(root) NOPASSWD: /usr/local/bin/mount-kit-tools
-%$DR_WORKSTATION_USERS_GROUP ALL=(root) NOPASSWD: /usr/local/sbin/dr-post-mount-provision
-%$DR_WORKSTATION_USERS_GROUP ALL=(root) NOPASSWD: /usr/local/sbin/dr-launch-kit
-EOF
+    backup_config_file "$sudoers_file"
+    render_workstation_sudoers > "$sudoers_file"
     chmod 440 "$sudoers_file"
     chown root:root "$sudoers_file"
 
@@ -3633,6 +4384,27 @@ EOF
 }
 
 
+render_autofs_master_maps() {
+    cat << 'EOF'
+/smb    /etc/auto.net.cifs    --timeout=300 --ghost
+/net    /etc/auto.net.cifs    --timeout=300 --ghost
+EOF
+}
+
+render_autofs_cifs_map() {
+    cat << 'EOF'
+#!/bin/bash
+key="$1"
+[ -n "$key" ] || exit 1
+mapfile="/etc/autofs.d/$key"
+mkdir -p /etc/autofs.d
+if [ ! -f "$mapfile" ]; then
+    printf '*\t-fstype=cifs,sec=krb5,cruid=${UID},vers=3.0\t://%s/&\n' "$key" > "$mapfile"
+fi
+printf -- '-fstype=autofs\tfile:%s\n' "$mapfile"
+EOF
+}
+
 configure_autofs_cifs() {
     print_info "Configuring CIFS access for DRIP and KIT tools..."
 
@@ -3650,32 +4422,22 @@ configure_autofs_cifs() {
     mkdir -p /mnt/x
 
     # Remove old /mnt/x autofs configuration from earlier script versions.
+    backup_config_file /etc/auto.master.d/mnt.autofs
+    backup_config_file /etc/auto.mnt.direct
+    backup_config_file /etc/auto.mnt
+    backup_config_file /etc/auto.master.d/smb.autofs
+    backup_config_file /etc/auto.master.d/net.autofs
+    backup_config_file /etc/auto.net.cifs
     rm -f /etc/auto.master.d/mnt.autofs /etc/auto.mnt.direct /etc/auto.mnt
 
-    cat > /etc/auto.master.d/smb.autofs << 'EOF'
-/smb    /etc/auto.net.cifs    --timeout=300 --ghost
-EOF
-    cat > /etc/auto.master.d/net.autofs << 'EOF'
-/net    /etc/auto.net.cifs    --timeout=300 --ghost
-EOF
+    render_autofs_master_maps | awk 'NR == 1' > /etc/auto.master.d/smb.autofs
+    render_autofs_master_maps | awk 'NR == 2' > /etc/auto.master.d/net.autofs
 
     # Executable map: called by autofs with the server hostname as $1.
     # Creates a per-server wildcard share map and returns a nested autofs mount.
     # cruid=${UID} tells the CIFS kernel module to use the accessing user's
     # Kerberos ticket — no root credentials or share enumeration required.
-    cat > /etc/auto.net.cifs << 'EOF'
-#!/bin/bash
-key="$1"
-[ -z "$key" ] && exit 1
-
-mkdir -p /etc/autofs.d
-mapfile="/etc/autofs.d/$key"
-if [ ! -f "$mapfile" ]; then
-    printf '*\t-fstype=cifs,sec=krb5,cruid=${UID},vers=3.0\t://%s/&\n' "$key" > "$mapfile"
-fi
-
-printf -- '-fstype=autofs\tfile:%s\n' "$mapfile"
-EOF
+    render_autofs_cifs_map > /etc/auto.net.cifs
 
     chmod +x /etc/auto.net.cifs
 
@@ -4127,6 +4889,7 @@ configure_dns_search_domains() {
         return 0
     fi
 
+    backup_config_file /etc/NetworkManager/system-connections
     print_info "Applying DNS search domains to connection '$connection'..."
     nmcli connection modify "$connection" ipv4.dns-search "$DNS_SEARCH"
     nmcli connection up "$connection" > /dev/null
@@ -4172,11 +4935,18 @@ configure_samba() {
     local smb_conf="/etc/samba/smb.conf"
     print_info "Configuring $smb_conf..."
 
+    if [ ! -f "$smb_conf" ]; then
+        mkdir -p "$(dirname "$smb_conf")"
+        printf '[global]\n' > "$smb_conf"
+    fi
+
     if grep -q "^[[:space:]]*workgroup = $WORKGROUP" "$smb_conf" 2>/dev/null && \
        grep -q "^[[:space:]]*realm = $REALM" "$smb_conf" 2>/dev/null; then
         print_info "smb.conf is already configured — skipping"
         return 0
     fi
+
+    backup_config_file "$smb_conf"
 
     # Set workgroup
     if grep -q "^[[:space:]]*workgroup" "$smb_conf"; then
@@ -4213,6 +4983,7 @@ configure_wins_resolution() {
         return 0
     fi
 
+    backup_config_file "$nsswitch"
     if sed -i '/^hosts:/s/dns/wins dns/' "$nsswitch"; then
         print_info "Added wins to hosts resolution in $nsswitch"
     else
@@ -4296,6 +5067,22 @@ EOF
 
     print_info "Local accounts remain available by typing the username manually"
 }
+# ── Desktop integration adapter ─────────────────────────────────────────────
+
+configure_desktop_integration() {
+    case "$PLATFORM_DESKTOP" in
+        "GNOME")
+            configure_gdm_login_prompt
+            ;;
+        "KDE Plasma")
+            print_info "KDE Plasma detected; preserving user preferences and installing only shared desktop launchers"
+            ;;
+        *)
+            print_warning "Desktop '$PLATFORM_DESKTOP' is not supported by the customization adapter; core provisioning continues"
+            ;;
+    esac
+}
+
 # ── Check display manager ─────────────────────────────────────────────────────
 # Do NOT restart the display manager automatically. Restarting GDM or LightDM
 # while the script is running inside a desktop session kills that session,
@@ -4363,6 +5150,15 @@ prompt_office_code() {
 parse_args() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
+            --platform-report)
+                PLATFORM_REPORT_ONLY=true
+                ;;
+            --preflight)
+                PREFLIGHT_ONLY=true
+                ;;
+            --dry-run)
+                DRY_RUN_ONLY=true
+                ;;
             --dns-test)
                 DNS_TEST_ONLY=true
                 ;;
@@ -4371,8 +5167,11 @@ parse_args() {
                 ;;
             -h|--help)
                 echo 'Usage: wget -qO- http://ontrack.link/joindomain | sudo bash'
-                echo 'Args:  wget -qO- http://ontrack.link/joindomain | sudo bash -s -- [OFFICE_CODE] [--dns-test]'
+                echo 'Args:  wget -qO- http://ontrack.link/joindomain | sudo bash -s -- [OFFICE_CODE] [--platform-report|--preflight|--dry-run|--dns-test]'
                 echo "  If no office code has been saved, you will be prompted for it."
+                echo "  --platform-report   Read-only platform, package, service, PAM, and desktop report."
+                echo "  --preflight         Read-only readiness validation; blockers return nonzero."
+                echo "  --dry-run           Read-only ordered plan; blockers return nonzero."
                 echo "  --dns-test          Apply DNS/search settings and test realm discovery only."
                 echo "  --full-reconfigure  Engineering override for a completed workstation."
                 exit 0
@@ -4394,6 +5193,11 @@ parse_args() {
         esac
         shift
     done
+
+    # The inspection modes must not prompt for office selection or save state.
+    if [ "$PLATFORM_REPORT_ONLY" = true ] || [ "$PREFLIGHT_ONLY" = true ] || [ "$DRY_RUN_ONLY" = true ]; then
+        return 0
+    fi
 
     # If the office was not provided on the command line, reuse the value saved
     # during the first run. This prevents the post-join rerun from asking again.
@@ -4419,13 +5223,9 @@ parse_args() {
     fi
 
     # Normalize and persist the selected office code for future reruns without
-    # clobbering the installer state machine.
+    # clobbering the installer state machine. The actual state write is delayed
+    # until the read-only preflight has passed in main().
     OFFICE_CODE="$(echo "$OFFICE_CODE" | tr '[:lower:]' '[:upper:]' | xargs)"
-    if [ ! -f "$STATE_FILE" ]; then
-        save_state "OFFICE_CODE_SELECTED"
-    else
-        save_state "${STAGE:-OFFICE_CODE_SELECTED}"
-    fi
 
     case "$OFFICE_CODE" in
         PL|PL1)
@@ -4438,6 +5238,21 @@ parse_args() {
     print_info "Office: $OFFICE_CODE — tools server: $TOOLS_SERVER"
 }
 
+# Parse only the mode/override flags before the completed-workstation guard.
+# This function intentionally performs no prompts, state writes, package
+# checks, service operations, or configuration changes.
+parse_mode_args() {
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --platform-report) PLATFORM_REPORT_ONLY=true ;;
+            --preflight) PREFLIGHT_ONLY=true ;;
+            --dry-run) DRY_RUN_ONLY=true ;;
+            --full-reconfigure) FULL_RECONFIGURE=true ;;
+        esac
+    done
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 main() {
@@ -4447,28 +5262,46 @@ main() {
   echo "=========================================="
     echo ""
 
-    check_privileges
+    check_privileges "$@"
     load_state || true
+    parse_mode_args "$@"
     completed_workstation_rerun_guard "$@"
     parse_args "$@"
-    print_resume_state
-    ensure_local_pam_survives_sssd_failure
-    disable_sssd_if_not_joined
-    print_machine_status
-    validate_or_fix_hostname || exit 1
 
-if [ -f "$STATE_FILE" ] && grep -q 'STAGE="REBOOT_REQUIRED_AFTER_HOSTNAME"' "$STATE_FILE" 2>/dev/null; then
-    current_hn="$(hostnamectl --static 2>/dev/null || hostname)"
-    if [ -n "${DOMAIN_TARGET_HOSTNAME:-}" ] && [ "$current_hn" = "$DOMAIN_TARGET_HOSTNAME" ]; then
-        print_info "Hostname reboot requirement satisfied for $current_hn"
-        save_state "PREJOIN_AFTER_HOSTNAME_REBOOT"
+    if [ "$PLATFORM_REPORT_ONLY" = true ] || [ "$PREFLIGHT_ONLY" = true ] || [ "$DRY_RUN_ONLY" = true ]; then
+        if ! detect_os; then
+            if [ "$PLATFORM_REPORT_ONLY" = true ]; then
+                platform_report
+                exit 0
+            fi
+            if [ "$PREFLIGHT_ONLY" = true ]; then
+                platform_preflight
+                exit $?
+            fi
+            platform_dry_run
+            exit $?
+        fi
+        load_config
+        if [ "$PLATFORM_REPORT_ONLY" = true ]; then
+            platform_report
+            exit 0
+        elif [ "$PREFLIGHT_ONLY" = true ]; then
+            platform_preflight
+            exit $?
+        else
+            platform_dry_run
+            exit $?
+        fi
     fi
-fi
 
-
-    # --- Checks and upfront prompts (interactive) ---
-    detect_os
+    # Detect the platform before any normal-run prompt or modifying helper.
+    # This also ensures the initial live checkpoint is preceded by a complete
+    # read-only platform/preflight pass.
+    detect_os || exit 1
     load_config
+
+    print_resume_state
+    print_machine_status
 
     # --- Summary ---
     if realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
@@ -4509,6 +5342,33 @@ fi
     esac
     echo ""
 
+    if ! platform_preflight; then
+        print_error "Read-only preflight did not pass; no hostname, DNS, package, PAM, SSSD, sudoers, autofs, or realm changes will be made."
+        exit 2
+    fi
+
+    validate_or_fix_hostname || exit 1
+
+    if [ -f "$STATE_FILE" ] && grep -q 'STAGE="REBOOT_REQUIRED_AFTER_HOSTNAME"' "$STATE_FILE" 2>/dev/null; then
+        current_hn="$(hostnamectl --static 2>/dev/null || hostname)"
+        if [ -n "${DOMAIN_TARGET_HOSTNAME:-}" ] && [ "$current_hn" = "$DOMAIN_TARGET_HOSTNAME" ]; then
+            print_info "Hostname reboot requirement satisfied for $current_hn"
+            save_state "PREJOIN_AFTER_HOSTNAME_REBOOT"
+        fi
+    fi
+
+    if [ ! -f "$STATE_FILE" ]; then
+        save_state "OFFICE_CODE_SELECTED"
+    else
+        save_state "${STAGE:-OFFICE_CODE_SELECTED}"
+    fi
+
+    # This is the first modifying phase of a normal run. Keep these safeguards
+    # out of --platform-report/--preflight/--dry-run and out of the initial
+    # repository-only validation path.
+    ensure_local_pam_survives_sssd_failure
+    disable_sssd_if_not_joined
+
     # --- Automated steps (no further input required) ---
     # Time/DNS must be healthy on every run — including post-join reruns —
     # before apt, Kerberos, SSSD, or domain configuration is touched.
@@ -4516,10 +5376,12 @@ fi
     install_time_sync_prerequisites
     configure_dns_servers
     configure_dns_search_domains
-    bootstrap_time_before_apt || true
+    bootstrap_time_before_packages || exit 2
 
-    print_info "Pre-flight package manager check: verifying apt/dpkg are not locked before installation..."
-    wait_for_apt_locks || exit 1
+    if [ "$PLATFORM_FAMILY" = "debian" ]; then
+        print_info "Pre-flight package manager check: verifying apt/dpkg are not locked before installation..."
+        wait_for_apt_locks || exit 1
+    fi
 
     if [ "$DNS_TEST_ONLY" = true ]; then
         verify_ad_discovery
@@ -4539,7 +5401,7 @@ fi
     configure_realm_permissions
     configure_sssd_settings
     enable_sssd
-    configure_gdm_login_prompt
+    configure_desktop_integration
     install_dr_workstation_manager
     configure_autofs_cifs
     configure_sudoers
@@ -4576,4 +5438,6 @@ fi
     fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
