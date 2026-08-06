@@ -85,12 +85,15 @@ CONFIG_FILE="/etc/domain-join.conf"
 DR_WORKSTATION_USERS_GROUP="dr-workstation-users"
 DR_WORKSTATION_ADMINS_GROUP="dr-workstation-admins"
 DR_LOCAL_ADMIN_USER="${DR_LOCAL_ADMIN_USER:-drone}"
-# The production workflow depends on KIT/IOLib dynamic DRIP paths.  Arch's
-# fixed /mnt/x systemd mount does not provide /smb/<server>/<share> or
-# /net/<server>/<share>; keep that requirement explicit rather than silently
-# claiming compatibility.  A candidate may opt into KIT-only validation with
-# DRIP_REQUIRED=false, but completion remains blocked when it is true.
+# The production workflow depends on KIT/IOLib DRIP paths. Arch provides only
+# configured /smb/server/share roots through systemd automount units; arbitrary
+# dynamic /smb or /net paths remain unsupported. A candidate may opt into
+# KIT-only validation with DRIP_REQUIRED=false, but completion remains blocked
+# when configured DRIP roots are required and unvalidated.
 DRIP_REQUIRED="${DRIP_REQUIRED:-true}"
+DR_DRIP_SEARCH_ROOTS="${DR_DRIP_SEARCH_ROOTS:-dr-ep-drip04/Images}"
+DR_DRIP_MANIFEST="${DR_DRIP_MANIFEST:-/var/lib/dr-domain-join/drip-units.manifest}"
+DR_DRIP_UNIT_DIR="${DR_DRIP_UNIT_DIR:-/etc/systemd/system}"
 # A systemd .mount unit is generated before a user accesses /mnt/x, so it
 # needs the UID of the domain user's Kerberos cache at generation time.  The
 # normal path derives this from DOMAIN_SUDO_USER; an explicit UID is useful for
@@ -312,17 +315,33 @@ platform_capability_required() {
     esac
 }
 
-# DRIP is a path contract, not merely a CIFS capability.  KIT/IOLib expects
-# autofs-style dynamic server/share resolution beneath both prefixes.  The
-# Arch adapter currently implements only the fixed Tool Server path /mnt/x.
+# DRIP is a path contract, not merely a CIFS capability. Debian retains its
+# dynamic autofs implementation. Arch implements only explicitly configured
+# /smb/server/share roots; arbitrary dynamic roots remain unsupported.
 platform_drip_supported() {
-    [ "$PLATFORM_FAMILY" = "debian" ]
+    if [ "$PLATFORM_FAMILY" = "debian" ]; then
+        return 0
+    fi
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 1
+    platform_validate_drip_search_roots >/dev/null 2>&1
 }
 
 platform_drip_path_supported() {
     local path="${1:-}"
     case "$path" in
-        /smb/*|/net/*) platform_drip_supported ;;
+        /smb/*)
+            local relative entry
+            [ "$PLATFORM_FAMILY" = "debian" ] && return 0
+            relative="${path#/smb/}"
+            platform_validate_drip_search_roots >/dev/null 2>&1 || return 1
+            while IFS= read -r entry; do
+                case "$relative" in
+                    "$entry"|"$entry"/*) return 0 ;;
+                esac
+            done < <(platform_drip_search_entries)
+            return 1
+            ;;
+        /net/*) [ "$PLATFORM_FAMILY" = "debian" ] ;;
         *) return 1 ;;
     esac
 }
@@ -331,18 +350,58 @@ platform_drip_requirement_satisfied() {
     [ "$DRIP_REQUIRED" != true ] || platform_drip_supported
 }
 
+platform_drip_search_entries() {
+    local roots="${DR_DRIP_SEARCH_ROOTS:-}"
+    [ -n "$roots" ] || return 0
+    case "$roots" in
+        *$'\n'*|*$'\r'*|*$'\t'*) return 1 ;;
+    esac
+    # Configuration is whitespace-delimited. Validation rejects whitespace
+    # inside an individual server/share entry, so this cannot split a valid
+    # component ambiguously.
+    read -r -a _drip_entries <<< "$roots"
+    printf '%s\n' "${_drip_entries[@]}"
+}
+
+validate_drip_search_root_entry() {
+    local entry="${1:-}"
+    local server share extra
+    case "$entry" in
+        ''|*[$'\t\r\n ']*|*\\*|*..*|*[\'\"\$\`\;\|\&\<\>\(\)\{\}\[\]]*) return 1 ;;
+    esac
+    IFS=/ read -r server share extra <<< "$entry"
+    [ -n "$server" ] && [ -n "$share" ] && [ -z "${extra:-}" ] || return 1
+    printf '%s\n' "$server" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$' || return 1
+    printf '%s\n' "$share" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' || return 1
+    return 0
+}
+
+platform_validate_drip_search_roots() {
+    local entry count=0
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        validate_drip_search_root_entry "$entry" || return 1
+        count=$((count + 1))
+    done < <(platform_drip_search_entries)
+    [ "$count" -gt 0 ]
+}
+
 platform_validate_drip_requirement() {
     if platform_drip_supported; then
-        preflight_pass "DRIP dynamic paths are provided by the Debian autofs adapter"
+        if [ "$PLATFORM_FAMILY" = "debian" ]; then
+            preflight_pass "DRIP dynamic paths are provided by the Debian autofs adapter"
+        else
+            preflight_pass "Configured Arch DRIP roots are syntactically valid; live DRIP validation remains required"
+        fi
         return 0
     fi
 
     if [ "$DRIP_REQUIRED" = true ]; then
-        preflight_blocked "Arch DRIP is unsupported: /smb/<server>/<share>/ and /net/<server>/<share>/ require dynamic mounts"
+        preflight_blocked "Arch DRIP configuration is invalid or empty; configured-root /smb support cannot be enabled"
         return 1
     fi
 
-    preflight_warning "Arch DRIP is unsupported; /smb/<server>/<share>/ and /net/<server>/<share>/ are not generated (DRIP_REQUIRED=false)"
+    preflight_warning "Arch configured-root DRIP is invalid or empty; no /smb roots will be generated (DRIP_REQUIRED=false)"
     return 0
 }
 
@@ -724,10 +783,14 @@ platform_report() {
     echo "  Time provider:       $(platform_time_provider active)"
     echo "  Time enabled:        $(platform_time_provider enabled)"
     echo "  Desktop adapter:     $(platform_desktop_integration)"
-    if platform_drip_supported; then
+    if [ "$PLATFORM_FAMILY" = "debian" ]; then
         echo "  DRIP support:        supported via dynamic Debian autofs (/smb and /net)"
+    elif platform_drip_supported; then
+        echo "  DRIP support:        configured-root Arch systemd automounts (/smb only)"
+        echo "  DRIP search roots:   ${DR_DRIP_SEARCH_ROOTS:-none}"
+        echo "  DRIP scope:          arbitrary dynamic /smb and /net paths are unsupported"
     else
-        echo "  DRIP support:        UNSUPPORTED on Arch (fixed /mnt/x does not provide /smb or /net)"
+        echo "  DRIP support:        BLOCKED (configured Arch roots are invalid or unavailable)"
     fi
     if [ "$PLATFORM_FAMILY" = "arch" ]; then
         echo "  /mnt/x ownership:    selected domain-user UID; explicit dr-tools-rebind required when users change"
@@ -1002,11 +1065,11 @@ platform_dry_run() {
     echo "  WOULD CHANGE time configuration using the platform time-service adapter"
     echo "  WOULD CHANGE /etc/krb5.conf, /etc/sssd/sssd.conf, native PAM files, /etc/sudoers.d/*, /etc/samba/smb.conf, /etc/nsswitch.conf"
     if [ "$PLATFORM_FAMILY" = "arch" ]; then
-        echo "  DRIP support: UNSUPPORTED for /smb/<server>/<share>/ and /net/<server>/<share>/"
-        if [ "$DRIP_REQUIRED" = true ]; then
-            echo "  WOULD BLOCK completion: set DRIP_REQUIRED=false only for an explicitly approved KIT-only candidate"
-        fi
+        echo "  WOULD CHANGE configured /smb roots: ${DR_DRIP_SEARCH_ROOTS:-none}"
+        echo "  DRIP support: configured-root /smb only; arbitrary /smb and /net paths remain unsupported"
+        echo "  WOULD START configured DRIP automounts only for the KIT launch; no global enablement"
         echo "  WOULD CHANGE /etc/systemd/system/mnt-x.mount and /etc/systemd/system/mnt-x.automount"
+        echo "  WOULD CHANGE configured DRIP .mount/.automount units and $DR_DRIP_MANIFEST"
         echo "  WOULD USE CIFS ownership: sec=krb5,cruid=<logged-in-domain-user-uid>,vers=3.0"
         echo "  WOULD INSTALL /usr/local/sbin/dr-tools-rebind for explicit selected-user remounts; shared multi-user /mnt/x is not claimed"
         echo "  WOULD CHANGE /etc/systemd/system/dr-domain-machine-password-renew.{service,timer} and /usr/local/sbin/dr-domain-machine-password-renew"
@@ -1370,6 +1433,7 @@ DOMAIN="${DOMAIN:-}"
 TARGET_HOSTNAME="${DOMAIN_TARGET_HOSTNAME:-}"
 DOMAIN_SUDO_USER="${DOMAIN_SUDO_USER:-}"
 DR_TOOLS_MOUNT_CRUID="${DR_TOOLS_MOUNT_CRUID:-}"
+DR_DRIP_SEARCH_ROOTS="${DR_DRIP_SEARCH_ROOTS:-}"
 HOSTNAME_CHANGED="${HOSTNAME_CHANGED:-0}"
 EOF
     chmod 600 "$STATE_FILE"
@@ -1384,12 +1448,116 @@ load_state() {
     [ -n "${OFFICE_CODE:-}" ] && OFFICE_CODE="$OFFICE_CODE"
     [ -n "${DOMAIN_SUDO_USER:-}" ] && DOMAIN_SUDO_USER="$DOMAIN_SUDO_USER"
     [ -n "${DR_TOOLS_MOUNT_CRUID:-}" ] && DR_TOOLS_MOUNT_CRUID="$DR_TOOLS_MOUNT_CRUID"
+    [ -n "${DR_DRIP_SEARCH_ROOTS:-}" ] && DR_DRIP_SEARCH_ROOTS="$DR_DRIP_SEARCH_ROOTS"
     [ -n "${TARGET_HOSTNAME:-}" ] && DOMAIN_TARGET_HOSTNAME="$TARGET_HOSTNAME"
     return 0
 }
 
 clear_state() {
     rm -f "$STATE_FILE"
+}
+
+LIVE_VALIDATION_STATES=(
+    DOMAIN_JOIN_COMPLETE
+    IDENTITY_VALIDATED
+    TOOLS_MOUNT_VALIDATED
+    KIT_CREDENTIAL_LIFECYCLE_VALIDATED
+    DRIP_SEARCH_VALIDATED
+    DRIP_ACTIVATION_VALIDATED
+    DRIP_BOUNDED_READ_VALIDATED
+    DRIP_CLEANUP_VALIDATED
+)
+
+live_validation_marker_dir() {
+    printf '%s\n' "$STATE_DIR/live-validation"
+}
+
+platform_live_validation_complete() {
+    local required_state
+    for required_state in DOMAIN_JOIN_COMPLETE IDENTITY_VALIDATED TOOLS_MOUNT_VALIDATED KIT_CREDENTIAL_LIFECYCLE_VALIDATED; do
+        [ -f "$(live_validation_marker_dir)/$required_state" ] || return 1
+    done
+    if [ "$DRIP_REQUIRED" = true ]; then
+        for required_state in DRIP_SEARCH_VALIDATED DRIP_ACTIVATION_VALIDATED DRIP_BOUNDED_READ_VALIDATED DRIP_CLEANUP_VALIDATED; do
+            [ -f "$(live_validation_marker_dir)/$required_state" ] || return 1
+        done
+    fi
+}
+
+render_live_validation_helper() {
+    cat << EOF
+#!/bin/bash
+set -euo pipefail
+
+STATE_DIR="$STATE_DIR"
+STATE_FILE="$STATE_FILE"
+DRIP_REQUIRED="$DRIP_REQUIRED"
+MARKER_DIR="\$STATE_DIR/live-validation"
+VALID_STATES="DOMAIN_JOIN_COMPLETE IDENTITY_VALIDATED TOOLS_MOUNT_VALIDATED KIT_CREDENTIAL_LIFECYCLE_VALIDATED DRIP_SEARCH_VALIDATED DRIP_ACTIVATION_VALIDATED DRIP_BOUNDED_READ_VALIDATED DRIP_CLEANUP_VALIDATED"
+
+require_root() {
+    [ "\$(id -u)" -eq 0 ] || { echo "Run this validation helper as root." >&2; exit 1; }
+}
+
+valid_state() {
+    case " \$VALID_STATES " in *" \$1 "*) return 0 ;; *) return 1 ;; esac
+}
+
+complete() {
+    local state
+    for state in DOMAIN_JOIN_COMPLETE IDENTITY_VALIDATED TOOLS_MOUNT_VALIDATED KIT_CREDENTIAL_LIFECYCLE_VALIDATED; do
+        [ -f "\$MARKER_DIR/\$state" ] || return 1
+    done
+    if [ "\$DRIP_REQUIRED" = true ]; then
+        for state in DRIP_SEARCH_VALIDATED DRIP_ACTIVATION_VALIDATED DRIP_BOUNDED_READ_VALIDATED DRIP_CLEANUP_VALIDATED; do
+            [ -f "\$MARKER_DIR/\$state" ] || return 1
+        done
+    fi
+}
+
+promote_state_if_complete() {
+    local tmp
+    complete || return 0
+    [ -f "\$STATE_FILE" ] || return 0
+    tmp="\$STATE_FILE.tmp.\$\$"
+    awk '
+        /^STAGE=/ { print "STAGE=\\"POSTJOIN_COMPLETE\\""; next }
+        { print }
+    ' "\$STATE_FILE" > "\$tmp"
+    chmod 600 "\$tmp"
+    chown root:root "\$tmp" 2>/dev/null || true
+    mv -f -- "\$tmp" "\$STATE_FILE"
+    echo "POSTJOIN_COMPLETE recorded after all required live validation states were recorded."
+}
+
+require_root
+case "\${1:---status}" in
+    --status)
+        for state in \$VALID_STATES; do
+            if [ -f "\$MARKER_DIR/\$state" ]; then echo "PASS \$state"; else echo "PENDING \$state"; fi
+        done
+        if complete; then echo "PASS completion-gate"; else echo "PENDING completion-gate"; fi
+        ;;
+    --record)
+        valid_state "\${2:-}" || { echo "Unknown validation state." >&2; exit 2; }
+        mkdir -p "\$MARKER_DIR"
+        printf 'recorded_at=%s\\noperator=%s\\n' "\$(date -Is)" "\${SUDO_USER:-root}" > "\$MARKER_DIR/\$2"
+        chmod 600 "\$MARKER_DIR/\$2"
+        chown root:root "\$MARKER_DIR/\$2" 2>/dev/null || true
+        echo "Recorded \$2. This command records operator evidence; it does not perform the live test."
+        promote_state_if_complete
+        ;;
+    *) echo "Usage: dr-domain-join-live-validate {--status|--record STATE}" >&2; exit 2 ;;
+esac
+EOF
+}
+
+install_live_validation_helper() {
+    local helper="/usr/local/sbin/dr-domain-join-live-validate"
+    backup_config_file "$helper"
+    render_live_validation_helper > "$helper"
+    chmod 755 "$helper"
+    chown root:root "$helper"
 }
 
 print_resume_state() {
@@ -3790,11 +3958,14 @@ platform_machine_account_renewal_policy() {
             cat << 'EOF'
 Arch machine-account renewal policy:
   authority: dr-domain-machine-password-renew.service/timer
-  interval: 25 days plus a randomized delay, before SSSD's 30-day default
+  schedule: daily with Persistent=true and RandomizedDelaySec=6h
+  age gate: no password rotation until 25 days after the last successful rotation
   SSSD renewal: disabled with ad_maximum_machine_account_password_age=0
   ad_update_samba_machine_account_password: false (SSSD realm/adcli helper unavailable)
-  sequence: net ads testjoin -> net ads changetrustpw -P -> net ads keytab create -> klist -k -> net ads testjoin
-  synchronization: Samba secrets.tdb is updated by changetrustpw; keytab is rebuilt from the resulting Samba secret
+  authority: this helper alone updates Samba secrets.tdb and /etc/krb5.keytab
+  normal sequence: age gate -> preflight -> testjoin -> changetrustpw -P -> bounded keytab create -> klist -k -> testjoin -> SSSD refresh -> timestamp
+  repair sequence: preflight -> testjoin -> keytab create from the current Samba secret; no password rotation
+  failure state: a root-owned repair marker is written if password rotation succeeds but keytab regeneration fails
 EOF
             ;;
         debian)
@@ -3808,32 +3979,179 @@ EOF
 }
 
 render_arch_machine_account_renewal_helper() {
-    cat << 'EOF'
+    cat << EOF
 #!/bin/bash
 set -euo pipefail
 
-KEYTAB="/etc/krb5.keytab"
-LOCK_DIR="/run/dr-domain-machine-password-renew.lock"
+DOMAIN="$DOMAIN"
+REALM="$REALM"
+STATE_DIR="\${DR_RENEWAL_STATE_DIR:-$STATE_DIR}"
+LAST_SUCCESS="\$STATE_DIR/machine-password-last-success"
+REPAIR_MARKER="\$STATE_DIR/machine-password-keytab-repair-needed"
+LOCK_DIR="\${DR_RENEWAL_LOCK_DIR:-/run/dr-domain-machine-password-renew.lock}"
+KEYTAB="\${DR_RENEWAL_KEYTAB:-/etc/krb5.keytab}"
+MIN_AGE_SECONDS=2160000
+RETRY_DELAYS=(2 5 10)
+REPAIR_DIAGNOSTIC="\$STATE_DIR/keytab-before-failed-renewal.\$(date +%s)"
 
 cleanup() {
-    rmdir "$LOCK_DIR" 2>/dev/null || true
+    rmdir "\$LOCK_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
 
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+fail() {
+    echo "Machine-account renewal blocked: \$*" >&2
+    exit 1
+}
+
+require_root() {
+    [ "\$(id -u)" -eq 0 ] || fail "run as root"
+}
+
+preflight() {
+    local synchronized dc
+    synchronized="\$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+    [ "\$synchronized" = yes ] || fail "system clock is not synchronized"
+    command -v host >/dev/null 2>&1 || fail "host is required for AD SRV discovery"
+    host -t SRV "_kerberos._tcp.\$DOMAIN" >/dev/null 2>&1 || fail "AD Kerberos SRV discovery failed"
+    dc="\$(host -t SRV "_kerberos._tcp.\$DOMAIN" 2>/dev/null | awk 'NF >= 8 {sub(/\.$/, "", \$NF); print \$NF; exit}')"
+    [ -n "\$dc" ] || fail "no domain controller was returned by SRV discovery"
+    getent hosts "\$dc" >/dev/null 2>&1 || fail "domain controller does not resolve"
+    timeout 5 bash -c ":</dev/tcp/\$dc/88" >/dev/null 2>&1 || fail "domain controller port 88 is unreachable"
+    command -v net >/dev/null 2>&1 || fail "Samba net is unavailable"
+    command -v testparm >/dev/null 2>&1 || fail "testparm is unavailable"
+    testparm -s /etc/samba/smb.conf >/dev/null 2>&1 || fail "smb.conf is invalid"
+    [ -r "\$KEYTAB" ] || fail "keytab is not readable"
+    [ -d "\$(dirname -- "\$KEYTAB")" ] && [ -w "\$(dirname -- "\$KEYTAB")" ] || fail "keytab parent is not writable"
+    [ "\$(df -Pk "\$(dirname -- "\$KEYTAB")" | awk 'NR == 2 {print \$4}')" -ge 1024 ] || fail "insufficient free space for keytab diagnostics"
+    if command -v sssctl >/dev/null 2>&1; then
+        sssctl config-check >/dev/null 2>&1 || fail "SSSD configuration check failed"
+    fi
+}
+
+validate_keytab() {
+    local host_name
+    command -v klist >/dev/null 2>&1 || { echo "klist is unavailable" >&2; return 1; }
+    klist -k "\$KEYTAB" >/dev/null 2>&1 || { echo "keytab cannot be read" >&2; return 1; }
+    LC_ALL=C klist -k "\$KEYTAB" | grep -qi "\$REALM" || { echo "keytab has no \$REALM principal" >&2; return 1; }
+    host_name="\$(hostname -s 2>/dev/null || hostname)"
+    LC_ALL=C klist -k "\$KEYTAB" | grep -Eiq "(host|cifs)/\${host_name}([.@]|$)" || {
+        echo "keytab has no host/cifs principal for \$host_name" >&2
+        return 1
+    }
+}
+
+write_repair_marker() {
+    mkdir -p "\$STATE_DIR"
+    printf 'password_rotation_completed=unknown-keytab-sync-failed\\nold_keytab_diagnostic=%s\\n' "\$REPAIR_DIAGNOSTIC" > "\$REPAIR_MARKER"
+    chmod 600 "\$REPAIR_MARKER"
+    chown root:root "\$REPAIR_MARKER" 2>/dev/null || true
+    echo "CRITICAL: Samba password changed but keytab regeneration failed." >&2
+    echo "The old keytab is diagnostic evidence only; restoring it does not restore the old AD password." >&2
+    echo "Run: dr-domain-machine-password-renew --repair-keytab" >&2
+}
+
+renew_keytab() {
+    local delay
+    for delay in "\${RETRY_DELAYS[@]}"; do
+        if net ads keytab create; then
+            return 0
+        fi
+        sleep "\$delay"
+    done
+    return 1
+}
+
+refresh_sssd() {
+    if command -v sss_cache >/dev/null 2>&1; then
+        sss_cache -E >/dev/null 2>&1 || true
+    fi
+    if systemctl is-active --quiet sssd 2>/dev/null; then
+        systemctl reload sssd >/dev/null 2>&1 || systemctl try-restart sssd >/dev/null 2>&1
+    fi
+    if command -v sssctl >/dev/null 2>&1; then
+        sssctl config-check >/dev/null 2>&1 || fail "SSSD validation failed after renewal"
+    fi
+}
+
+atomic_success_timestamp() {
+    local tmp
+    mkdir -p "\$STATE_DIR"
+    tmp="\$LAST_SUCCESS.tmp.\$\$"
+    date +%s > "\$tmp"
+    chmod 600 "\$tmp"
+    chown root:root "\$tmp" 2>/dev/null || true
+    mv -f -- "\$tmp" "\$LAST_SUCCESS"
+}
+
+require_root
+mkdir -p "\$STATE_DIR"
+if ! mkdir "\$LOCK_DIR" 2>/dev/null; then
     echo "Machine-account renewal is already running; exiting." >&2
     exit 0
 fi
 
-net ads testjoin >/dev/null
-net ads changetrustpw -P
-# Samba 4.21+ creates the keytab according to the declarative
-# 'sync machine password to keytab' rule. Rebuild it after every password
-# change so secrets.tdb and /etc/krb5.keytab cannot drift apart.
-net ads keytab create
-klist -k "$KEYTAB" >/dev/null
-grep -qi 'DR.KODR.LOCAL' <(klist -k "$KEYTAB")
-net ads testjoin >/dev/null
+mode="\${1:-}"
+case "\$mode" in
+    --force|--repair-keytab|"") ;;
+    *) echo "Usage: dr-domain-machine-password-renew [--force|--repair-keytab]" >&2; exit 2 ;;
+esac
+
+if [ -e "\$REPAIR_MARKER" ]; then
+    preflight
+    net ads testjoin >/dev/null 2>&1 || fail "net ads testjoin failed"
+    renew_keytab || fail "keytab repair from the current Samba secret failed"
+    validate_keytab || fail "repaired keytab validation failed"
+    refresh_sssd
+    rm -f -- "\$REPAIR_MARKER"
+    echo "Outstanding keytab repair completed; no password rotation was performed."
+    exit 0
+fi
+
+if [ "\$mode" = --repair-keytab ]; then
+    preflight
+    net ads testjoin >/dev/null 2>&1 || fail "net ads testjoin failed"
+    renew_keytab || fail "keytab repair failed"
+    validate_keytab || fail "repaired keytab validation failed"
+    refresh_sssd
+    rm -f -- "\$REPAIR_MARKER"
+    echo "Keytab repaired from the current Samba machine secret; no password rotation was performed."
+    exit 0
+fi
+
+now="\$(date +%s)"
+last=0
+if [ -r "\$LAST_SUCCESS" ]; then
+    last="\$(cat "\$LAST_SUCCESS")"
+fi
+case "\$last" in ''|*[!0-9]*) last=0 ;; esac
+if [ "\$mode" != --force ] && [ "\$last" -gt 0 ] && [ "\$((now - last))" -lt "\$MIN_AGE_SECONDS" ]; then
+    echo "Machine-account password is younger than 25 days; no rotation performed."
+    exit 0
+fi
+
+preflight
+net ads testjoin >/dev/null 2>&1 || fail "net ads testjoin failed"
+
+if [ -s "\$KEYTAB" ]; then
+    cp -- "\$KEYTAB" "\$REPAIR_DIAGNOSTIC"
+    chmod 600 "\$REPAIR_DIAGNOSTIC"
+    chown root:root "\$REPAIR_DIAGNOSTIC" 2>/dev/null || true
+fi
+net ads changetrustpw -P || fail "Samba machine-password rotation failed"
+if ! renew_keytab; then
+    write_repair_marker
+    exit 1
+fi
+if ! validate_keytab; then
+    write_repair_marker
+    exit 1
+fi
+net ads testjoin >/dev/null 2>&1 || fail "net ads testjoin failed after keytab regeneration"
+refresh_sssd
+atomic_success_timestamp
+rm -f -- "\$REPAIR_MARKER"
+echo "Samba machine password and SSSD keytab renewed successfully."
 EOF
 }
 
@@ -3856,10 +4174,9 @@ render_arch_machine_account_renewal_timer() {
 Description=Periodic Samba AD machine-account renewal
 
 [Timer]
-OnBootSec=15min
-OnUnitActiveSec=25d
-RandomizedDelaySec=6h
+OnCalendar=daily
 Persistent=true
+RandomizedDelaySec=6h
 
 [Install]
 WantedBy=timers.target
@@ -3872,6 +4189,17 @@ platform_machine_account_renewal_service_name() {
 
 platform_machine_account_renewal_timer_name() {
     echo "dr-domain-machine-password-renew.timer"
+}
+
+platform_initialize_machine_account_renewal_state() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+    local marker="$STATE_DIR/machine-password-last-success"
+    [ -f "$marker" ] && return 0
+    mkdir -p "$STATE_DIR"
+    date +%s > "$marker"
+    chmod 600 "$marker"
+    chown root:root "$marker" 2>/dev/null || true
+    print_info "Initialized the Arch machine-password age clock after successful join validation"
 }
 
 platform_install_machine_account_renewal() {
@@ -4076,11 +4404,6 @@ render_workstation_sudoers() {
 # Members of $DR_WORKSTATION_ADMINS_GROUP are workstation administrators.
 %$admins_group ALL=(ALL:ALL) ALL
 
-# KIT.sh owns the root cache copy/cleanup. Preserve only the invoking user's
-# FILE credential-cache selector for the narrow KIT launcher command. SUDO_UID
-# and SUDO_USER are supplied by sudo itself; no broad environment override is used.
-Defaults!/usr/local/sbin/dr-launch-kit env_keep += "KRB5CCNAME"
-
 # Every authenticated DR domain user may mount the standard Tool Server.
 # SSSD is configured with use_fully_qualified_names=False, so the AD group is
 # exposed as the short group name "domain users". The escaped space is required.
@@ -4099,6 +4422,9 @@ render_kit_launcher_sudoers() {
     user="$(sudoers_escape_identifier "$user")"
     cat << EOF
 # Managed by DR Domain Join
+# KIT.sh owns the root cache copy/cleanup. Preserve only the invoking user's
+# FILE credential-cache selector for the narrow KIT launcher command.
+# SUDO_UID and SUDO_USER are supplied by sudo itself.
 Defaults!/usr/local/sbin/dr-launch-kit env_keep += "KRB5CCNAME"
 $user ALL=(root) NOPASSWD: /usr/local/sbin/dr-launch-kit
 EOF
@@ -4120,6 +4446,17 @@ stage_generated_configurations() {
         render_arch_tools_mount_helper "$stage_cruid" > "$stage_dir/mount-kit-tools"
         render_arch_machine_account_renewal_service > "$stage_dir/dr-domain-machine-password-renew.service"
         render_arch_machine_account_renewal_timer > "$stage_dir/dr-domain-machine-password-renew.timer"
+        if platform_validate_drip_search_roots; then
+            local drip_entry drip_mount drip_automount
+            while IFS= read -r drip_entry; do
+                [ -n "$drip_entry" ] || continue
+                drip_mount="$(drip_mount_unit_name "$drip_entry")"
+                drip_automount="$(drip_automount_unit_name "$drip_entry")"
+                render_arch_drip_mount_unit "$drip_entry" > "$stage_dir/$drip_mount"
+                render_arch_drip_automount_unit "$drip_entry" > "$stage_dir/$drip_automount"
+            done < <(platform_drip_search_entries)
+            render_drip_search_mount_helper > "$stage_dir/dr-drip-search"
+        fi
     else
         render_autofs_master_maps > "$stage_dir/auto.master"
         render_autofs_cifs_map > "$stage_dir/auto.net.cifs"
@@ -4420,11 +4757,20 @@ render_kit_cache_validator() {
 validate_kit_invoking_cache() {
     local cache_spec="${KRB5CCNAME:-}"
     local cache_path=""
+    local expected_prefix=""
+    local cache_suffix=""
     local owner=""
     local mode=""
     local mode_value=0
     local principal=""
     local principal_realm=""
+    local initial_signature=""
+    local final_signature=""
+
+    KIT_VALIDATED_CACHE_PATH=""
+    KIT_VALIDATED_CACHE_OWNER=""
+    KIT_VALIDATED_CACHE_MODE=""
+    KIT_VALIDATED_PRINCIPAL=""
 
     case "${SUDO_UID:-}" in
         ''|0|*[!0-9]*)
@@ -4441,6 +4787,29 @@ validate_kit_invoking_cache() {
             ;;
     esac
 
+    expected_prefix="/tmp/krb5cc_${SUDO_UID}"
+    case "$cache_path" in
+        "$expected_prefix") ;;
+        "$expected_prefix"_*)
+            cache_suffix="${cache_path#${expected_prefix}_}"
+            printf '%s\n' "$cache_suffix" | LC_ALL=C grep -Eq '^[A-Za-z0-9_-]+$' || {
+                echo "KIT launch rejected an unsafe cache suffix." >&2
+                return 1
+            }
+            ;;
+        *)
+            echo "KIT launch requires the invoking user's /tmp FILE cache path." >&2
+            return 1
+            ;;
+    esac
+
+    case "$cache_path" in
+        *[$'\t\r\n ']*|*\\*|*..*|*[!A-Za-z0-9_./-]*)
+            echo "KIT launch rejected an unsafe Kerberos cache path." >&2
+            return 1
+            ;;
+    esac
+
     if [ -z "$cache_path" ] || [ "$cache_path" = "/tmp/krb5cc_0" ]; then
         echo "KIT launch rejected an empty or root-owned Kerberos cache path." >&2
         return 1
@@ -4450,6 +4819,11 @@ validate_kit_invoking_cache() {
         return 1
     fi
 
+    initial_signature="$(stat -c '%d:%i:%F:%u:%a' -- "$cache_path" 2>/dev/null || true)"
+    [ -n "$initial_signature" ] || {
+        echo "KIT launch could not stat the Kerberos cache." >&2
+        return 1
+    }
     owner="$(stat -c '%u' -- "$cache_path" 2>/dev/null || true)"
     if [ "$owner" != "$SUDO_UID" ]; then
         echo "KIT launch rejected a Kerberos cache not owned by SUDO_UID." >&2
@@ -4473,18 +4847,73 @@ validate_kit_invoking_cache() {
         echo "KIT launch requires klist to validate the invoking user's ticket." >&2
         return 1
     }
-    klist -s -c "$cache_path" 2>/dev/null || {
+    LC_ALL=C klist -s -c "$cache_path" 2>/dev/null || {
         echo "KIT launch requires a usable Kerberos credential cache." >&2
         return 1
     }
 
-    principal="$(klist -c "$cache_path" 2>/dev/null | awk -F': ' '/Default principal:/ {print $2; exit}')"
+    principal="$(LC_ALL=C klist -c "$cache_path" 2>/dev/null | LC_ALL=C awk -F': ' '/Default principal:/ {print $2; exit}')"
     principal_realm="${principal##*@}"
     if [ -z "$principal" ] || [ "${principal_realm^^}" != "DR.KODR.LOCAL" ]; then
         echo "KIT launch requires a ticket principal in DR.KODR.LOCAL." >&2
         return 1
     fi
+
+    if [ ! -f "$cache_path" ] || [ -L "$cache_path" ]; then
+        echo "KIT launch detected a changed Kerberos cache path." >&2
+        return 1
+    fi
+    final_signature="$(stat -c '%d:%i:%F:%u:%a' -- "$cache_path" 2>/dev/null || true)"
+    if [ -z "$final_signature" ] || [ "$initial_signature" != "$final_signature" ]; then
+        echo "KIT launch detected a Kerberos cache changed during validation." >&2
+        return 1
+    fi
+
+    KIT_VALIDATED_CACHE_PATH="$cache_path"
+    KIT_VALIDATED_CACHE_OWNER="$owner"
+    KIT_VALIDATED_CACHE_MODE="$mode"
+    KIT_VALIDATED_PRINCIPAL="$principal"
 }
+
+sanitize_kit_evidence() {
+    LC_ALL=C printf '%s' "${1:-}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_'
+}
+EOF
+}
+
+render_kit_credential_self_test() {
+    cat << 'EOF'
+if [ "${1:-}" = "--credential-self-test" ]; then
+    [ "$(id -u)" -eq 0 ] || {
+        echo "validation=FAIL"
+        echo "reason=root-helper-required"
+        exit 1
+    }
+    evidence_user="$(sanitize_kit_evidence "${SUDO_USER:-unknown}")"
+    evidence_uid="$(sanitize_kit_evidence "${SUDO_UID:-unset}")"
+    evidence_cache="<unavailable>"
+    case "${KRB5CCNAME:-}" in
+        FILE:*) evidence_cache="$(sanitize_kit_evidence "$(basename -- "${KRB5CCNAME#FILE:}" 2>/dev/null || true)")" ;;
+    esac
+    if validate_kit_invoking_cache >/dev/null 2>&1; then
+        printf 'invoking_user=%s\n' "$evidence_user"
+        printf 'invoking_uid=%s\n' "$evidence_uid"
+        printf 'cache_basename=%s\n' "$(sanitize_kit_evidence "$(basename -- "$KIT_VALIDATED_CACHE_PATH")")"
+        printf 'owner_uid=%s\n' "$(sanitize_kit_evidence "$KIT_VALIDATED_CACHE_OWNER")"
+        printf 'numeric_mode=%s\n' "$(sanitize_kit_evidence "$KIT_VALIDATED_CACHE_MODE")"
+        printf 'validated_principal=%s\n' "$(sanitize_kit_evidence "$KIT_VALIDATED_PRINCIPAL")"
+        echo "validation=PASS"
+        exit 0
+    fi
+    printf 'invoking_user=%s\n' "$evidence_user"
+    printf 'invoking_uid=%s\n' "$evidence_uid"
+    printf 'cache_basename=%s\n' "$evidence_cache"
+    echo 'owner_uid=<unavailable>'
+    echo 'numeric_mode=<unavailable>'
+    echo 'validated_principal=<unavailable>'
+    echo 'validation=FAIL'
+    exit 1
+fi
 EOF
 }
 
@@ -4492,6 +4921,7 @@ EOF
 # ── Post-mount provisioning helper ───────────────────────────────────────────
 install_post_mount_provision_helper() {
     print_info "Installing post-mount provisioning helper for KIT installer and workstation branding..."
+    install_live_validation_helper
 
     # Install/repair the canonical root KIT launch helper now, not only after
     # post-mount provisioning runs. The desktop shortcut and sudoers rule both
@@ -4500,8 +4930,12 @@ install_post_mount_provision_helper() {
     local kit_runtime_dir
     local escaped_kit_runtime_dir
     local kit_cache_validator
+    local kit_credential_self_test
+    local drip_launcher_support
     kit_runtime_dir="$(dirname "$KIT_INSTALLER_PATH")"
     kit_cache_validator="$(render_kit_cache_validator)"
+    kit_credential_self_test="$(render_kit_credential_self_test)"
+    drip_launcher_support="$(render_drip_launcher_support)"
 
     # Generate this helper with quoted heredoc segments so runtime variables
     # such as $LOG, $KIT_DIR, ${1:-}, and $? are preserved until launch time,
@@ -4517,6 +4951,7 @@ KIT_SCRIPT="./KIT.sh"
 
 EOF
     printf '%s\n' "$kit_cache_validator"
+    printf '%s\n' "$kit_credential_self_test"
     cat << 'EOF'
 
 mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
@@ -4555,6 +4990,9 @@ if [ ! -f "$KIT_DIR/$KIT_SCRIPT" ]; then
 fi
 
 validate_kit_invoking_cache
+EOF
+    printf '%s\n' "$drip_launcher_support"
+    cat << 'EOF'
 
 cd "$KIT_DIR" || exit 1
 
@@ -4614,6 +5052,7 @@ LOG="/var/log/dr-launch-kit.log"
 KIT_DIR="__KIT_RUNTIME_DIR__"
 KIT_SCRIPT="./KIT.sh"
 $kit_cache_validator
+$kit_credential_self_test
 
 mkdir -p "\$(dirname "\$LOG")" 2>/dev/null || true
 touch "\$LOG" 2>/dev/null || true
@@ -4651,6 +5090,7 @@ if [ ! -f "\$KIT_DIR/KIT.sh" ]; then
 fi
 
 validate_kit_invoking_cache
+$drip_launcher_support
 
 cd "\$KIT_DIR" || exit 1
 
@@ -5295,7 +5735,7 @@ render_autofs_cifs_map() {
     cat << 'EOF'
 #!/bin/bash
 key="$1"
-[ -n "$key" ] || exit 1
+[ -z "$key" ] && exit 1
 mapfile="/etc/autofs.d/$key"
 mkdir -p /etc/autofs.d
 if [ ! -f "$mapfile" ]; then
@@ -5369,48 +5809,509 @@ WantedBy=multi-user.target
 EOF
 }
 
+drip_mount_unit_name() {
+    local entry="${1:-}"
+    command -v systemd-escape >/dev/null 2>&1 || return 1
+    systemd-escape --path --suffix=mount "/smb/$entry"
+}
+
+drip_automount_unit_name() {
+    local entry="${1:-}"
+    command -v systemd-escape >/dev/null 2>&1 || return 1
+    systemd-escape --path --suffix=automount "/smb/$entry"
+}
+
+render_arch_drip_mount_unit() {
+    local entry="${1:-}"
+    local server share
+    validate_drip_search_root_entry "$entry" || return 1
+    server="${entry%%/*}"
+    share="${entry#*/}"
+    cat << EOF
+[Unit]
+Description=Configured DRIP search CIFS mount //$server/$share
+
+[Mount]
+What=//$server/$share
+Where=/smb/$server/$share
+Type=cifs
+Options=_netdev,nofail,sec=krb5,cruid=0,vers=3.0
+TimeoutSec=30s
+EOF
+}
+
+render_arch_drip_automount_unit() {
+    local entry="${1:-}"
+    validate_drip_search_root_entry "$entry" || return 1
+    cat << EOF
+[Unit]
+Description=On-demand configured DRIP search automount /smb/$entry
+
+[Automount]
+Where=/smb/$entry
+TimeoutIdleSec=300s
+EOF
+}
+
+render_drip_search_mount_helper() {
+    cat << EOF
+#!/bin/bash
+set -euo pipefail
+
+MANIFEST="${DR_DRIP_MANIFEST}"
+UNIT_DIR="${DR_DRIP_UNIT_DIR}"
+
+require_root() {
+    [ "\$(id -u)" -eq 0 ] || { echo "This DRIP search helper requires root." >&2; exit 1; }
+}
+
+read_manifest() {
+    [ -r "\$MANIFEST" ] || return 0
+    while IFS=$'\\t' read -r entry mount_unit automount_unit; do
+        [ -n "\$entry" ] || continue
+        printf '%s\\t%s\\t%s\\n' "\$entry" "\$mount_unit" "\$automount_unit"
+    done < "\$MANIFEST"
+}
+
+start_roots() {
+    require_root
+    local entry mount_unit automount_unit
+    while IFS=$'\\t' read -r entry mount_unit automount_unit; do
+        [ -n "\$entry" ] || continue
+        if ! systemctl start "\$automount_unit" || ! systemctl is-active --quiet "\$automount_unit"; then
+            echo "DRIP search start failed for \$automount_unit; attempting safe cleanup." >&2
+            cleanup_roots || true
+            return 1
+        fi
+    done < <(read_manifest)
+}
+
+cleanup_roots() {
+    require_root
+    local -a entries=() mounts=() automounts=()
+    local entry mount_unit automount_unit i failed=0
+    while IFS=$'\\t' read -r entry mount_unit automount_unit; do
+        [ -n "\$entry" ] || continue
+        entries+=("\$entry")
+        mounts+=("\$mount_unit")
+        automounts+=("\$automount_unit")
+    done < <(read_manifest)
+
+    # Stop automounts first so no new target-path trigger can occur.
+    for ((i=\${#automounts[@]}-1; i>=0; i--)); do
+        if ! systemctl stop "\${automounts[i]}"; then
+            echo "BUSY: could not stop DRIP automount \${automounts[i]}; preserving diagnostics." >&2
+            failed=1
+        fi
+    done
+    for ((i=\${#mounts[@]}-1; i>=0; i--)); do
+        if ! systemctl stop "\${mounts[i]}"; then
+            echo "BUSY: could not stop DRIP mount \${mounts[i]}; preserving diagnostics." >&2
+            failed=1
+        fi
+    done
+    return "\$failed"
+}
+
+status_roots() {
+    require_root
+    local entry mount_unit automount_unit
+    while IFS=$'\\t' read -r entry mount_unit automount_unit; do
+        [ -n "\$entry" ] || continue
+        printf 'entry=%s mount=%s automount=%s active=' "\$entry" "\$mount_unit" "\$automount_unit"
+        if systemctl is-active --quiet "\$automount_unit"; then echo yes; else echo no; fi
+    done < <(read_manifest)
+}
+
+case "\${1:---status}" in
+    start) start_roots ;;
+    cleanup) cleanup_roots ;;
+    status) status_roots ;;
+    --dry-run)
+        while IFS=$'\\t' read -r entry mount_unit automount_unit; do
+            [ -n "\$entry" ] || continue
+            echo "WOULD START/STOP \$automount_unit and \$mount_unit for /smb/\$entry"
+        done < <(read_manifest)
+        ;;
+    *) echo "Usage: dr-drip-search {start|cleanup|status|--dry-run}" >&2; exit 2 ;;
+esac
+EOF
+}
+
+render_drip_launcher_support() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+    cat << 'EOF'
+DRIP_SEARCH_STARTED=0
+drip_search_cleanup() {
+    if [ "$DRIP_SEARCH_STARTED" -eq 1 ] && [ -x /usr/local/sbin/dr-drip-search ]; then
+        if ! /usr/local/sbin/dr-drip-search cleanup; then
+            echo "WARNING: configured DRIP search cleanup was incomplete; inspect systemd state and the manifest." >&2
+        fi
+    fi
+}
+trap 'kit_status=$?; drip_search_cleanup; exit "$kit_status"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [ -x /usr/local/sbin/dr-drip-search ]; then
+    DRIP_SEARCH_STARTED=1
+    if ! /usr/local/sbin/dr-drip-search start; then
+        echo "Configured DRIP search automounts could not be started; KIT launch is blocked." >&2
+        exit 1
+    fi
+fi
+EOF
+}
+
+platform_install_drip_search() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+    platform_validate_drip_search_roots || {
+        print_error "Configured Arch DRIP search roots are invalid"
+        return 1
+    }
+
+    local manifest_tmp entry mount_unit automount_unit mount_tmp automount_tmp
+    local manifest_dir staging_dir
+    manifest_dir="$(dirname "$DR_DRIP_MANIFEST")"
+    mkdir -p /smb "$manifest_dir" "$DR_DRIP_UNIT_DIR"
+    manifest_tmp="$(mktemp "$manifest_dir/.drip-units.manifest.XXXXXX")"
+    staging_dir="$(mktemp -d "$DR_DRIP_UNIT_DIR/.drip-units.XXXXXX")"
+    chmod 600 "$manifest_tmp"
+    chown root:root "$manifest_tmp" 2>/dev/null || true
+
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        mount_unit="$(drip_mount_unit_name "$entry")" || return 1
+        automount_unit="$(drip_automount_unit_name "$entry")" || return 1
+        mount_tmp="$staging_dir/$mount_unit"
+        automount_tmp="$staging_dir/$automount_unit"
+        render_arch_drip_mount_unit "$entry" > "$mount_tmp" || return 1
+        render_arch_drip_automount_unit "$entry" > "$automount_tmp" || return 1
+        chmod 644 "$mount_tmp" "$automount_tmp"
+        chown root:root "$mount_tmp" "$automount_tmp" 2>/dev/null || true
+        systemd-analyze verify "$mount_tmp" "$automount_tmp" || return 1
+        backup_config_file "$DR_DRIP_UNIT_DIR/$mount_unit"
+        backup_config_file "$DR_DRIP_UNIT_DIR/$automount_unit"
+        mv -f -- "$mount_tmp" "$DR_DRIP_UNIT_DIR/$mount_unit"
+        mv -f -- "$automount_tmp" "$DR_DRIP_UNIT_DIR/$automount_unit"
+        printf '%s\t%s\t%s\n' "$entry" "$mount_unit" "$automount_unit" >> "$manifest_tmp"
+    done < <(platform_drip_search_entries)
+
+    mv -f -- "$manifest_tmp" "$DR_DRIP_MANIFEST"
+    rm -rf -- "$staging_dir"
+    chmod 600 "$DR_DRIP_MANIFEST"
+    chown root:root "$DR_DRIP_MANIFEST" 2>/dev/null || true
+    backup_config_file /usr/local/sbin/dr-drip-search
+    render_drip_search_mount_helper > /usr/local/sbin/dr-drip-search
+    chmod 755 /usr/local/sbin/dr-drip-search
+    chown root:root /usr/local/sbin/dr-drip-search
+    systemctl daemon-reload
+    print_info "Installed configured Arch DRIP search units without enabling them at boot"
+}
+
+platform_verify_drip_search() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+    [ -r "$DR_DRIP_MANIFEST" ] || return 1
+    local entry mount_unit automount_unit
+    while IFS=$'\t' read -r entry mount_unit automount_unit; do
+        [ -n "$entry" ] || continue
+        [ "$(drip_mount_unit_name "$entry")" = "$mount_unit" ] || return 1
+        [ "$(drip_automount_unit_name "$entry")" = "$automount_unit" ] || return 1
+        systemd-analyze verify "$DR_DRIP_UNIT_DIR/$mount_unit" "$DR_DRIP_UNIT_DIR/$automount_unit" >/dev/null 2>&1 || return 1
+        if systemctl is-enabled --quiet "$automount_unit" 2>/dev/null; then
+            print_error "DRIP search automount must not be enabled globally: $automount_unit"
+            return 1
+        fi
+    done < "$DR_DRIP_MANIFEST"
+}
+
+platform_remove_drip_search() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+    local entry mount_unit automount_unit
+    if [ -r "$DR_DRIP_MANIFEST" ]; then
+        while IFS=$'\t' read -r entry mount_unit automount_unit; do
+            [ -n "$entry" ] || continue
+            systemctl stop "$automount_unit" >/dev/null 2>&1 || true
+            systemctl stop "$mount_unit" >/dev/null 2>&1 || true
+            rm -f -- "$DR_DRIP_UNIT_DIR/$mount_unit" "$DR_DRIP_UNIT_DIR/$automount_unit"
+        done < "$DR_DRIP_MANIFEST"
+    fi
+    rm -f -- "$DR_DRIP_MANIFEST" /usr/local/sbin/dr-drip-search
+    systemctl daemon-reload
+}
+
 render_arch_tools_rebind_helper() {
-    local mount_unit automount_unit
+    local mount_unit automount_unit server
     mount_unit="$(tools_mount_unit_name)" || return 1
     automount_unit="$(tools_automount_unit_name)" || return 1
+    server="$TOOLS_SERVER"
     cat << EOF
 #!/bin/bash
 set -euo pipefail
 
 MOUNT_UNIT="$mount_unit"
 AUTOMOUNT_UNIT="$automount_unit"
-UNIT_PATH="/etc/systemd/system/\$MOUNT_UNIT"
+UNIT_DIR="\${DR_REBIND_UNIT_DIR:-/etc/systemd/system}"
+UNIT_PATH="\$UNIT_DIR/\$MOUNT_UNIT"
+STATE_FILE="\${DR_REBIND_STATE_FILE:-$STATE_FILE}"
+LOCK_DIR="\${DR_REBIND_LOCK_DIR:-/run/dr-tools-rebind.lock}"
+STAGE_ROOT="\${DR_REBIND_STAGE_ROOT:-\$UNIT_DIR/.dr-tools-rebind}"
+FAIL_STAGE="\${DR_REBIND_FAIL_STAGE:-}"
+TRANSACTION_ACTIVE=0
+COMMITTED=0
+ORIGINAL_UNIT=""
+ORIGINAL_STATE=""
+ORIGINAL_STATE_EXISTS=0
+ORIGINAL_MOUNT_ACTIVE="inactive"
+ORIGINAL_MOUNT_ENABLED="disabled"
+ORIGINAL_AUTOMOUNT_ACTIVE="inactive"
+ORIGINAL_AUTOMOUNT_ENABLED="disabled"
+STAGED_UNIT=""
 
-if [ "\$(id -u)" -ne 0 ]; then
-    echo "Tool Server credential-owner changes require a local administrator." >&2
-    echo "Run: sudo /usr/local/sbin/dr-tools-rebind \${1:-<domain-user-uid>}" >&2
-    exit 1
-fi
+failpoint() {
+    if [ "\$FAIL_STAGE" = "\$1" ]; then
+        echo "Injected rebind failure at \$1" >&2
+        return 1
+    fi
+}
+
+unit_active_state() {
+    systemctl is-active "\$1" 2>/dev/null || echo inactive
+}
+
+unit_enabled_state() {
+    systemctl is-enabled "\$1" 2>/dev/null || echo disabled
+}
+
+restore_enabled_state() {
+    local unit="\$1" state="\$2"
+    case "\$state" in
+        enabled|enabled-runtime|linked|linked-runtime) systemctl enable "\$unit" >/dev/null 2>&1 || true ;;
+        masked) systemctl mask "\$unit" >/dev/null 2>&1 || true ;;
+        *) systemctl disable "\$unit" >/dev/null 2>&1 || true ;;
+    esac
+}
+
+restore_active_state() {
+    local unit="\$1" state="\$2"
+    if [ "\$state" = active ]; then
+        systemctl start "\$unit" >/dev/null 2>&1 || true
+    else
+        systemctl stop "\$unit" >/dev/null 2>&1 || true
+    fi
+}
+
+restore_original_state() {
+    local restored_state="\$STATE_FILE.restore.\$\$"
+    if [ -n "\$ORIGINAL_UNIT" ] && [ -f "\$ORIGINAL_UNIT" ]; then
+        cp -- "\$ORIGINAL_UNIT" "\$UNIT_PATH"
+        chmod 644 "\$UNIT_PATH"
+    fi
+    if [ "\$ORIGINAL_STATE_EXISTS" -eq 1 ] && [ -f "\$ORIGINAL_STATE" ]; then
+        mkdir -p "\$(dirname -- "\$STATE_FILE")"
+        cp -- "\$ORIGINAL_STATE" "\$restored_state"
+        chmod 600 "\$restored_state"
+        chown root:root "\$restored_state" 2>/dev/null || true
+        mv -f -- "\$restored_state" "\$STATE_FILE"
+    elif [ "\$ORIGINAL_STATE_EXISTS" -eq 0 ]; then
+        rm -f -- "\$STATE_FILE"
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    restore_enabled_state "\$MOUNT_UNIT" "\$ORIGINAL_MOUNT_ENABLED"
+    restore_enabled_state "\$AUTOMOUNT_UNIT" "\$ORIGINAL_AUTOMOUNT_ENABLED"
+    restore_active_state "\$MOUNT_UNIT" "\$ORIGINAL_MOUNT_ACTIVE"
+    restore_active_state "\$AUTOMOUNT_UNIT" "\$ORIGINAL_AUTOMOUNT_ACTIVE"
+}
+
+finish() {
+    local rc=\$?
+    if [ "\$TRANSACTION_ACTIVE" -eq 1 ] && [ "\$COMMITTED" -eq 0 ]; then
+        echo "Rebind failed; restoring the original unit, UID state, and service state." >&2
+        restore_original_state || true
+    fi
+    rm -rf -- "\$STAGE_ROOT" "\$ORIGINAL_UNIT" "\$ORIGINAL_STATE"
+    rmdir "\$LOCK_DIR" 2>/dev/null || true
+    exit "\$rc"
+}
+
+require_root() {
+    if [ "\$(id -u)" -ne 0 ]; then
+        echo "Tool Server credential-owner changes require a local administrator." >&2
+        echo "Run: sudo /usr/local/sbin/dr-tools-rebind \${1:-<domain-user-uid>}" >&2
+        exit 1
+    fi
+}
+
+read_persisted_cruid() {
+    [ -r "\$STATE_FILE" ] || return 0
+    awk -F= '/^DR_TOOLS_MOUNT_CRUID=/ {gsub(/^[\" ]|[\" ]$/, "", \$2); print \$2; exit}' "\$STATE_FILE"
+}
+
+atomic_update_cruid() {
+    local tmp="\$STATE_FILE.tmp.\$\$"
+    mkdir -p "\$(dirname -- "\$STATE_FILE")"
+    if [ -f "\$STATE_FILE" ]; then
+        awk -v value="\$NEW_CRUID" '
+            BEGIN { updated = 0 }
+            /^DR_TOOLS_MOUNT_CRUID=/ {
+                if (!updated) { print "DR_TOOLS_MOUNT_CRUID=\"" value "\""; updated = 1 }
+                next
+            }
+            { print }
+            END { if (!updated) print "DR_TOOLS_MOUNT_CRUID=\"" value "\"" }
+        ' "\$STATE_FILE" > "\$tmp"
+    else
+        printf 'DR_TOOLS_MOUNT_CRUID="%s"\n' "\$NEW_CRUID" > "\$tmp"
+    fi
+    chmod 600 "\$tmp"
+    chown root:root "\$tmp" 2>/dev/null || true
+    mv -f -- "\$tmp" "\$STATE_FILE"
+    [ "\$(stat -c '%u:%a' -- "\$STATE_FILE")" = "0:600" ]
+}
+
+validate_target_uid() {
+    case "\$NEW_CRUID" in
+        ''|0|*[!0-9]*) echo "Usage: dr-tools-rebind [--dry-run|--status] <non-root-domain-user-uid>" >&2; return 1 ;;
+    esac
+    local passwd_line resolved_uid
+    passwd_line="\$(getent passwd "\$NEW_CRUID" 2>/dev/null || true)"
+    resolved_uid="\${passwd_line%%:*}"
+    [ -n "\$passwd_line" ] && [ "\$resolved_uid" = "\$NEW_CRUID" ] || {
+        echo "UID \$NEW_CRUID did not resolve to an exact local/SSSD passwd UID." >&2
+        return 1
+    }
+    [ "\$(id -u "\$NEW_CRUID" 2>/dev/null || true)" = "\$NEW_CRUID" ] || {
+        echo "NSS could not confirm UID \$NEW_CRUID exactly." >&2
+        return 1
+    }
+}
+
+refuse_if_busy() {
+    local pattern
+    for pattern in \
+        '(^|/)KIT([[:space:]]|$)' \
+        '(^|/)KIT\\.sh([[:space:]]|$)' \
+        '(^|/)dr-launch-kit([[:space:]]|$)' \
+        '(^|/)dr-post-mount-provision([[:space:]]|$)'; do
+        if pgrep -f "\$pattern" >/dev/null 2>&1; then
+            echo "A protected KIT/provisioning process is active; rebind refused." >&2
+            return 1
+        fi
+    done
+    if mountpoint -q /mnt/p 2>/dev/null; then
+        echo "/mnt/p is mounted; rebind refused because KIT activation owns that lifecycle." >&2
+        return 1
+    fi
+}
+
+show_status() {
+    require_root
+    printf 'mount_unit=%s active=%s enabled=%s\n' "\$MOUNT_UNIT" "\$(unit_active_state "\$MOUNT_UNIT")" "\$(unit_enabled_state "\$MOUNT_UNIT")"
+    printf 'automount_unit=%s active=%s enabled=%s\n' "\$AUTOMOUNT_UNIT" "\$(unit_active_state "\$AUTOMOUNT_UNIT")" "\$(unit_enabled_state "\$AUTOMOUNT_UNIT")"
+    printf 'unit_cruid='
+    sed -n 's/^[[:space:]]*Options=.*\\(^\\|,\\)cruid=\\([0-9][0-9]*\\)\\(,\\|$\\).*$/\\2/p' "\$UNIT_PATH" | head -n 1
+    printf 'persisted_cruid=%s\n' "\$(read_persisted_cruid)"
+}
+
+require_root "\${1:-}"
+case "\${1:-}" in
+    --status)
+        show_status
+        exit 0
+        ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    *) DRY_RUN=0 ;;
+esac
 
 NEW_CRUID="\${1:-}"
-case "\$NEW_CRUID" in
-    ''|0|*[!0-9]*) echo "Usage: dr-tools-rebind <non-root-domain-user-uid>" >&2; exit 2 ;;
-esac
-getent passwd "\$NEW_CRUID" >/dev/null 2>&1 || {
-    echo "UID \$NEW_CRUID is not a local/SSSD-resolvable account." >&2
-    exit 1
-}
+validate_target_uid || exit 1
 [ -f "\$UNIT_PATH" ] || { echo "Tool Server mount unit not found: \$UNIT_PATH" >&2; exit 1; }
+command -v systemd-analyze >/dev/null 2>&1 || { echo "systemd-analyze is required." >&2; exit 1; }
 
-BACKUP="\$UNIT_PATH.rebind.bak.\$(date +%Y%m%d%H%M%S)"
-cp -a -- "\$UNIT_PATH" "\$BACKUP"
-systemctl stop "\$AUTOMOUNT_UNIT" "\$MOUNT_UNIT"
-sed -E -i "s/(cruid=)[0-9]+/\\1\$NEW_CRUID/" "\$UNIT_PATH"
-systemctl daemon-reload
-if ! systemctl enable "\$AUTOMOUNT_UNIT" >/dev/null || ! systemctl start "\$AUTOMOUNT_UNIT"; then
-    cp -a -- "\$BACKUP" "\$UNIT_PATH"
-    systemctl daemon-reload
-    systemctl enable "\$AUTOMOUNT_UNIT" >/dev/null 2>&1 || true
-    echo "Rebind failed; restored \$BACKUP" >&2
-    exit 1
+if [ "\$DRY_RUN" -eq 1 ]; then
+    mkdir -p "\$STAGE_ROOT"
+    STAGED_UNIT="\$STAGE_ROOT/\$MOUNT_UNIT"
+    cat > "\$STAGED_UNIT" << UNIT
+[Unit]
+Description=DR Tool Server CIFS mount
+Wants=network-online.target
+After=network-online.target
+
+[Mount]
+What=//$server/Tools
+Where=/mnt/x
+Type=cifs
+Options=_netdev,nofail,sec=krb5,cruid=\$NEW_CRUID,vers=3.0
+TimeoutSec=30s
+UNIT
+    systemd-analyze verify "\$STAGED_UNIT"
+    grep -Eq '^Options=.*(^|,)cruid=\$NEW_CRUID(,|$)' "\$STAGED_UNIT"
+    echo "WOULD CHANGE \$UNIT_PATH cruid=\$NEW_CRUID"
+    exit 0
 fi
-echo "Tool Server automount rebound to Kerberos credential owner UID \$NEW_CRUID."
-echo "Previous unit saved at \$BACKUP."
+
+mkdir "\$LOCK_DIR" 2>/dev/null || { echo "Another Tool Server rebind is active." >&2; exit 1; }
+TRANSACTION_ACTIVE=1
+ORIGINAL_UNIT="\$(mktemp)"
+cp -- "\$UNIT_PATH" "\$ORIGINAL_UNIT"
+if [ -f "\$STATE_FILE" ]; then
+    ORIGINAL_STATE_EXISTS=1
+    ORIGINAL_STATE="\$(mktemp)"
+    cp -- "\$STATE_FILE" "\$ORIGINAL_STATE"
+fi
+ORIGINAL_MOUNT_ACTIVE="\$(unit_active_state "\$MOUNT_UNIT")"
+ORIGINAL_MOUNT_ENABLED="\$(unit_enabled_state "\$MOUNT_UNIT")"
+ORIGINAL_AUTOMOUNT_ACTIVE="\$(unit_active_state "\$AUTOMOUNT_UNIT")"
+ORIGINAL_AUTOMOUNT_ENABLED="\$(unit_enabled_state "\$AUTOMOUNT_UNIT")"
+trap finish EXIT HUP INT TERM
+
+refuse_if_busy
+failpoint automount-stop
+systemctl stop "\$AUTOMOUNT_UNIT"
+failpoint mount-stop
+systemctl stop "\$MOUNT_UNIT"
+
+mkdir -p "\$STAGE_ROOT"
+STAGED_UNIT="\$STAGE_ROOT/\$MOUNT_UNIT"
+rm -f -- "\$STAGED_UNIT"
+failpoint render
+cat > "\$STAGED_UNIT" << UNIT
+[Unit]
+Description=DR Tool Server CIFS mount
+Wants=network-online.target
+After=network-online.target
+
+[Mount]
+What=//$server/Tools
+Where=/mnt/x
+Type=cifs
+Options=_netdev,nofail,sec=krb5,cruid=\$NEW_CRUID,vers=3.0
+TimeoutSec=30s
+UNIT
+chmod 644 "\$STAGED_UNIT"
+chown root:root "\$STAGED_UNIT" 2>/dev/null || true
+failpoint verify
+systemd-analyze verify "\$STAGED_UNIT"
+grep -Eq '^Options=.*(^|,)cruid=\$NEW_CRUID(,|$)' "\$STAGED_UNIT"
+
+failpoint replace
+mv -f -- "\$STAGED_UNIT" "\$UNIT_PATH"
+failpoint daemon-reload
+systemctl daemon-reload
+
+restore_enabled_state "\$MOUNT_UNIT" "\$ORIGINAL_MOUNT_ENABLED"
+failpoint automount-enable
+restore_enabled_state "\$AUTOMOUNT_UNIT" "\$ORIGINAL_AUTOMOUNT_ENABLED"
+failpoint automount-start
+restore_active_state "\$MOUNT_UNIT" "\$ORIGINAL_MOUNT_ACTIVE"
+restore_active_state "\$AUTOMOUNT_UNIT" "\$ORIGINAL_AUTOMOUNT_ACTIVE"
+
+grep -Eq '^Options=.*(^|,)cruid=\$NEW_CRUID(,|$)' "\$UNIT_PATH"
+failpoint state-update
+atomic_update_cruid
+COMMITTED=1
+echo "Tool Server automount rebound transactionally to Kerberos credential owner UID \$NEW_CRUID."
 EOF
 }
 
@@ -5495,6 +6396,9 @@ platform_install_tools_mount() {
     systemd-analyze verify "/etc/systemd/system/$mount_unit" "/etc/systemd/system/$automount_unit"
     systemctl daemon-reload
     systemctl enable "$automount_unit" >/dev/null
+    if [ -f "$STATE_FILE" ]; then
+        save_state "${STAGE:-POSTJOIN_AWAITING_LIVE_VALIDATION}"
+    fi
     print_info "Installed on-demand systemd CIFS units: $mount_unit, $automount_unit"
 }
 
@@ -5622,7 +6526,15 @@ configure_autofs_cifs() {
     print_info "Configuring CIFS access for DRIP and KIT tools..."
 
     if [ "$PLATFORM_FAMILY" = "arch" ]; then
-        platform_install_tools_mount
+        platform_install_tools_mount || return 1
+        if platform_validate_drip_search_roots; then
+            platform_install_drip_search || return 1
+        elif [ "$DRIP_REQUIRED" = true ]; then
+            print_error "Configured Arch DRIP search roots are invalid; core completion is blocked"
+            return 1
+        else
+            print_warning "Skipping invalid optional Arch DRIP search roots because DRIP_REQUIRED=false"
+        fi
     else
     # DRIP image paths still use dynamic autofs maps:
     #   /smb/<server>/<share>/...
@@ -6358,8 +7270,8 @@ verify_join() {
     print_info "Verifying domain join..."
 
     if ! platform_drip_requirement_satisfied; then
-        print_error "Completion is blocked because Arch does not implement the required dynamic DRIP paths"
-        print_error "Use a Debian-family adapter for DRIP, or explicitly set DRIP_REQUIRED=false for a KIT-only candidate"
+        print_error "Completion is blocked because configured Arch DRIP roots are not available"
+        print_error "Arch claims only configured /smb roots; arbitrary dynamic /smb and /net paths remain unsupported"
         return 1
     fi
 
@@ -6392,6 +7304,11 @@ verify_join() {
             print_error "sssctl is unavailable after the Arch sssd package checkpoint"
             return 1
         fi
+        platform_verify_drip_search || {
+            print_error "Configured Arch DRIP systemd units are missing, invalid, or globally enabled"
+            return 1
+        }
+        print_info "Configured Arch DRIP search units validated; live KIT/DRIP lifecycle remains unverified"
     fi
 
     print_info "Testing short name resolution..."
@@ -6688,9 +7605,12 @@ main() {
 
     if verify_join; then
         echo ""
-        save_state "POSTJOIN_COMPLETE"
+        platform_initialize_machine_account_renewal_state
+        save_state "POSTJOIN_AWAITING_LIVE_VALIDATION"
         rm -f /etc/motd 2>/dev/null || true
-        print_info "Domain join completed successfully!"
+        print_info "Static domain provisioning completed; live validation is still required."
+        print_info "State: POSTJOIN_AWAITING_LIVE_VALIDATION"
+        print_info "Record validated phases with: sudo /usr/local/sbin/dr-domain-join-live-validate --record STATE"
         echo ""
         echo "  Log in as a domain user with:"
         echo "    username@$DOMAIN"
