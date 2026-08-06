@@ -86,6 +86,21 @@ test_renderers() {
         fail "unsafe sudoers username is rejected"
     fi
     pass "unsafe sudoers username is rejected"
+
+    output="$(DR_JOIN_STATE_DIR="$TMP_DIR/arch-render" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; TOOLS_SERVER=dr-ep1-tools; render_arch_smb_conf")"
+    assert_contains "$output" "kerberos method = secrets only" "Samba 4.21 keytab method"
+    assert_contains "$output" "sync machine password to keytab = /etc/krb5.keytab" "Samba declarative keytab rule"
+    assert_contains "$output" "idmap config * : range = 100000-199999" "Samba testparm idmap range"
+
+    unit_dir="$TMP_DIR/systemd-units"
+    mkdir -p "$unit_dir"
+    DR_JOIN_STATE_DIR="$TMP_DIR/arch-units" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; TOOLS_SERVER=dr-ep1-tools; render_arch_tools_mount_unit /mnt/x dr-ep1-tools > '$unit_dir/mnt-x.mount'; render_arch_tools_automount_unit /mnt/x > '$unit_dir/mnt-x.automount'"
+    assert_contains "$(sed -n '1,120p' "$unit_dir/mnt-x.mount")" "Options=_netdev,nofail,sec=krb5,multiuser,vers=3.0" "systemd CIFS mount safety options"
+    assert_contains "$(sed -n '1,120p' "$unit_dir/mnt-x.mount")" "TimeoutSec=30s" "systemd CIFS mount timeout"
+    assert_contains "$(sed -n '1,120p' "$unit_dir/mnt-x.automount")" "TimeoutIdleSec=300s" "systemd automount idle timeout"
+    command -v systemd-analyze >/dev/null 2>&1 || fail "systemd-analyze is required for unit validation"
+    systemd-analyze verify "$unit_dir/mnt-x.mount" "$unit_dir/mnt-x.automount" >/dev/null 2>&1 || fail "generated systemd units validate"
+    pass "generated systemd mount and automount units validate"
 }
 
 test_state_and_guard() {
@@ -121,9 +136,41 @@ test_modes() {
 test_missing_capability() {
     local output
     output="$(DR_JOIN_STATE_DIR="$TMP_DIR/missing" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_capability_status realmd")"
-    assert_contains "$output" "BLOCKED|realmd|no configured-repository mapping" "missing Arch realmd capability"
+    assert_contains "$output" "WARNING|realmd|unavailable but no longer required" "Arch realmd is not required"
     output="$(DR_JOIN_STATE_DIR="$TMP_DIR/missing2" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_capability_status autofs")"
-    assert_contains "$output" "BLOCKED|autofs|no configured-repository mapping" "missing Arch autofs capability"
+    assert_contains "$output" "WARNING|autofs|unavailable but no longer required" "Arch autofs is not required"
+    output="$(DR_JOIN_STATE_DIR="$TMP_DIR/missing3" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_capability_status adcli")"
+    assert_contains "$output" "WARNING|adcli|unavailable but no longer required" "Arch adcli is not required"
+    output="$(DR_JOIN_STATE_DIR="$TMP_DIR/missing4" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_capability_status smbclient")"
+    assert_contains "$output" "smbclient" "Arch Samba client package mapping"
+}
+
+test_arch_backend_and_break_glass() {
+    local plan current_user output
+    plan="$(DR_JOIN_STATE_DIR="$TMP_DIR/arch-plan" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_domain_join_plan")"
+    assert_contains "$plan" "net ads join --use-kerberos=required" "Arch Samba join command"
+    assert_contains "$plan" "net ads keytab create" "Arch Samba keytab command"
+    if printf '%s\n' "$plan" | grep -Eq 'realm join|adcli testjoin|autofs'; then
+        fail "Arch backend plan contains a removed dependency"
+    fi
+    pass "Arch backend plan excludes realmd/adcli/autofs"
+
+    current_user="$(id -un)"
+    output="$(DR_LOCAL_ADMIN_USER="$current_user" DR_JOIN_STATE_DIR="$TMP_DIR/break-glass" bash -c "source '$SCRIPT'; platform_admin_group >/dev/null; platform_break_glass_is_local")"
+    assert_eq "" "$output" "configurable break-glass account resolves as local"
+    output="$(DR_LOCAL_ADMIN_USER="$current_user" DR_JOIN_STATE_DIR="$TMP_DIR/break-glass-report" bash -c "source '$SCRIPT'; PLATFORM_ADMIN_GROUP=wheel; PREFLIGHT_BLOCKERS=0; platform_validate_break_glass wheel || true")"
+    assert_contains "$output" "Break-glass account: $current_user" "break-glass account is displayed"
+    assert_contains "$output" "Password status: operator verification required" "break-glass password is never tested automatically"
+}
+
+test_missing_commands_and_packages() {
+    local output
+    output="$(DR_JOIN_STATE_DIR="$TMP_DIR/unavailable-package" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_is_package_installed(){ return 1; }; platform_is_package_available(){ return 1; }; platform_capability_status sssd")"
+    assert_contains "$output" "BLOCKED|sssd|sssd unavailable in configured repositories" "unavailable Arch AD package is a blocker"
+    if PATH="$TMP_DIR/empty-path" DR_JOIN_STATE_DIR="$TMP_DIR/missing-command" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_domain_testjoin" >/dev/null 2>&1; then
+        fail "missing Samba command is rejected safely"
+    fi
+    pass "missing Samba command is rejected safely"
 }
 
 test_detection
@@ -132,4 +179,6 @@ test_renderers
 test_state_and_guard
 test_modes
 test_missing_capability
+test_arch_backend_and_break_glass
+test_missing_commands_and_packages
 printf 'Completed %d tests\n' "$pass_count"
