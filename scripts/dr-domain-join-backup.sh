@@ -51,7 +51,13 @@ files=(
     /etc/systemd/system/dr-domain-machine-password-renew.timer
     /usr/local/sbin/dr-domain-machine-password-renew
     /usr/local/sbin/dr-tools-rebind
+    /usr/local/sbin/dr-drip-search
+    /usr/local/sbin/dr-domain-join-live-validate
     /var/lib/dr-domain-join/state
+    /var/lib/dr-domain-join/drip-units.manifest
+    /var/lib/dr-domain-join/machine-password-last-success
+    /var/lib/dr-domain-join/machine-password-keytab-repair-needed
+    /var/lib/dr-domain-join/live-validation
 )
 
 if [ "$mode" = "--dry-run" ]; then
@@ -102,6 +108,22 @@ for file in "${files[@]}"; do
     cp -a -- "$file" "$backup_dir/files/$relative"
     printf 'backed_up=%s\n' "$file" >> "$backup_dir/manifest"
 done
+
+manifest="/var/lib/dr-domain-join/drip-units.manifest"
+if [ -r "$manifest" ]; then
+    tab="$(printf '\t')"
+    while IFS="$tab" read -r entry mount_unit automount_unit; do
+        [ -n "$mount_unit" ] || continue
+        for unit in "$mount_unit" "$automount_unit"; do
+            file="/etc/systemd/system/$unit"
+            [ -e "$file" ] || continue
+            relative="$(printf '%s' "$file" | sed 's#^/##')"
+            mkdir -p "$backup_dir/files/$(dirname "$relative")"
+            cp -a -- "$file" "$backup_dir/files/$relative"
+            printf 'backed_up=%s\n' "$file" >> "$backup_dir/manifest"
+        done
+    done < "$manifest"
+fi
 
 chmod -R go-rwx "$backup_dir"
 echo "PASS Created root-readable backup: $backup_dir"

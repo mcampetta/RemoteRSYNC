@@ -23,10 +23,10 @@ autofs implementation. Arch/CachyOS uses:
 - Native Arch PAM files (`system-auth`/`system-login`) with `pam_sss` and the
   installed `pam_mkhomedir` module.
 - Native systemd `.mount` and `.automount` units for `/mnt/x`.
-- Explicit Arch DRIP limitation: the adapter does not claim dynamic
-  `/smb/<server>/<share>/...` or `/net/<server>/<share>/...` semantics. The
-  default `DRIP_REQUIRED=true` setting blocks completion on Arch; only an
-  explicitly approved KIT-only candidate may set `DRIP_REQUIRED=false`.
+- Configured-root Arch DRIP support: persisted DR_DRIP_SEARCH_ROOTS entries
+  generate exact /smb/<server>/<share> systemd mount/automount pairs with
+  cruid=0. Arbitrary dynamic /smb and all /net semantics remain unsupported;
+  /mnt/p remains exclusively owned by native KIT.
 - KDE-aware optional desktop integration. Desktop customization failures do
   not fail core provisioning.
 
@@ -63,10 +63,19 @@ The Arch installer requests only the core/join/mount packages. It never runs
 `pacman -Syu` as incidental setup. `openldap` remains optional diagnostics; an
 Arch join does not use LDAP computer-object allocation.
 
-Arch DRIP is intentionally not implemented by the fixed `/mnt/x` mount. Paths
-such as `/smb/dr-ep-drip04/ImageFolders/test` and
-`/net/dr-ep-drip04/ImageFolders/test` are blocked because they require dynamic
-server/share mounts. Debian retains the existing dynamic autofs maps.
+Arch DRIP is configured-root support, not arbitrary autofs replacement:
+
+    DR_DRIP_SEARCH_ROOTS="dr-ep-drip04/Images"
+
+This creates /smb/dr-ep-drip04/Images -> //dr-ep-drip04/Images on demand.
+Multiple server/share roots are supported, strictly validated, named with
+systemd-escape --path, verified with systemd-analyze verify, and listed in
+the root-owned manifest. /smb/dr-ep-drip04/Images/test is supported after
+live validation; /smb/dr-ep-drip04/ImageFolders/test and
+/net/dr-ep-drip04/ImageFolders/test remain blocked unless separately
+configured under the exact /smb root contract. The Arch launcher starts only
+configured automounts for a KIT run and safely stops them afterward. Native
+KIT alone creates and removes /mnt/p.
 
 ## Samba 4.24 join and keytab strategy
 
@@ -95,14 +104,23 @@ secret and synchronizes the host/SPN entries without relying on legacy
 `net ads keytab add` behavior. The keytab is root-owned and mode 600.
 
 Machine-account renewal has one Arch authority: the generated
-`dr-domain-machine-password-renew.timer`. SSSD's default 30-day renewal is
-disabled with `ad_maximum_machine_account_password_age = 0` because Arch's
-SSSD documentation supports `realm`/`adcli` renewal helpers, neither of which
-is available in the configured repositories. The timer runs
-`net ads changetrustpw -P`, then `net ads keytab create`, validates the keytab,
-and runs `net ads testjoin` again. `ad_update_samba_machine_account_password`
-is explicitly false; it is not used as a substitute for a missing renewal
-helper.
+dr-domain-machine-password-renew.timer. It runs daily with Persistent=true
+and a randomized delay, but a root-owned timestamp prevents rotation until
+25 days have elapsed. Reboot does not itself rotate the password. SSSD's
+default 30-day renewal is disabled with ad_maximum_machine_account_password_age
+= 0 because Arch's SSSD realm/adcli renewal helper is unavailable.
+ad_update_samba_machine_account_password is explicitly false.
+
+The normal sequence applies the 25-day age gate first, then checks synchronized
+time, AD DNS SRV and controller reachability, testparm, keytab access, free
+space, the renewal lock, and sssctl when present; then it runs net ads testjoin, net ads changetrustpw -P,
+bounded retries of net ads keytab create, klist/keytab principal validation,
+net ads testjoin, a safe SSSD refresh, and an atomic success timestamp. If
+password rotation succeeds but keytab regeneration fails, a persistent repair
+marker and diagnostic copy of the old keytab are retained. The old keytab is
+not a rollback of the AD password. The normal timer services the marker, and
+the explicit --repair-keytab mode rebuilds from the current Samba secret
+without rotating the password again.
 
 After DNS, time, hostname, Kerberos, and package checkpoints pass, the human
 domain administrator runs the generated helper. Its sequence is:
@@ -242,13 +260,43 @@ the automount and run:
 sudo /usr/local/sbin/dr-tools-rebind <new-domain-user-uid>
 ```
 
-The helper backs up the mount unit before changing `cruid`, reloads systemd,
-and restores the unit if reactivation fails. The backup/rollback scripts now
-include `/usr/local/sbin/dr-tools-rebind`. This is an explicit rebind workflow,
-not dynamic DRIP support; Arch DRIP remains blocked.
+The helper is transactional: it locks, refuses active KIT or `/mnt/p` use,
+records unit bytes and active/enabled state, stops the automount before the
+mount, stages and verifies a complete replacement, atomically installs it,
+updates the root-owned UID state, and restores both unit bytes and state on
+any failure. It has `--dry-run` and `--status` modes and bounded failure
+injection fixtures. No lazy or force unmount is used.
 
 Debian keeps the existing dynamic `/smb` and `/net` autofs maps, including
 `sec=krb5,cruid=${UID},vers=3.0`, and the existing autofs service behavior.
+
+The launcher also exposes a non-launching credential check through the same
+command-scoped sudo path:
+
+    sudo -n /usr/local/sbin/dr-launch-kit --credential-self-test
+
+It validates the exact cache basename contract, owner UID, mode, principal,
+FILE type, ticket validity, and cache identity before and after parsing. It
+prints only sanitized evidence and never creates or touches /tmp/krb5cc_0.
+The existing --sudo-self-test and --access-self-test remain convenience
+checks, not proof that KRB5CCNAME survived sudo.
+
+## Configured-root Arch DRIP lifecycle
+
+The Arch DRIP adapter owns only configured search roots. It generates a
+root-owned manifest and exact pairs named with systemd-escape --path, such as
+the mount and automount units for /smb/dr-ep-drip04/Images.
+
+The launcher validates the invoking FILE cache, starts only those automount
+units without touching their target paths, launches the unchanged KIT.sh, and
+stops automounts before mounts on exit. Busy cleanup is reported and retained
+for diagnosis. The adapter never creates, removes, or inspects /mnt/p, and
+never creates, copies, renames, or removes /tmp/krb5cc_0.
+
+Configured-root support does not reproduce arbitrary autofs behavior. A path
+outside a configured /smb/server/share root and every /net path are
+unsupported on Arch. Native KIT remains solely responsible for activation,
+the /mnt/p mount, deactivation, and the root-cache lifecycle.
 
 ## Break-glass account
 
@@ -304,21 +352,22 @@ wget -qO- https://raw.githubusercontent.com/mcampetta/RemoteRSYNC/feature/cachyo
 
 Current host results after this revision:
 
-- `--platform-report`: exit 0. CachyOS is detected as Arch; realmd, adcli,
-  autofs, and winbind are reported unavailable but not required.
-- `--preflight`: exit 1. With `DR_LOCAL_ADMIN_USER=martin`, current blockers
-  are the deliberate Arch DRIP limitation, unsynchronized time, failed
-  current-resolver AD SRV/domain discovery. Missing `sssctl` and `ldapsearch`
-  are warnings pending their optional/post-install package checks. With the
-  production default `drone`, the absent break-glass account is an additional
-  blocker.
-- `DR_LOCAL_ADMIN_USER=martin --preflight`: exit 1. The account is reported
-  as local and in `wheel`; password verification remains manual. DRIP, time,
-  DNS, and domain discovery remain blockers.
-- `--dry-run`: exit 1 and prints the Arch Samba/systemd ordered plan, the
-  `cruid` ownership model, and the machine-renewal timer. It explicitly
-  reports no reboot, logout, display-manager restart, security disablement, or
-  `pacman -Syu`.
+- --platform-report: exit 0. CachyOS is detected as Arch; realmd, adcli,
+  autofs, and winbind are reported unavailable but not required. Configured
+  /smb root support is reported separately from arbitrary dynamic paths.
+- --preflight: exit 1. With DR_LOCAL_ADMIN_USER=martin, current blockers are
+  the unsynchronized clock and failed current-resolver AD SRV/domain
+  discovery. Configured DRIP syntax passes; live DRIP/KIT validation remains
+  pending. Missing sssctl and ldapsearch are warnings pending package
+  validation. With production default drone, the absent break-glass account
+  is an additional blocker.
+- DR_LOCAL_ADMIN_USER=martin --preflight: the account is reported as local
+  and in wheel; password verification remains manual. Time, DNS, and domain
+  discovery remain blockers.
+- --dry-run: exit 1 and prints the Arch Samba/systemd ordered plan, configured
+  /smb roots, cruid ownership model, and machine-renewal timer. It explicitly
+  reports no reboot, logout, display-manager restart, security disablement,
+  or pacman -Syu.
 
 ## Package-install checkpoint — not approved or executed
 
@@ -359,9 +408,10 @@ sudo ./scripts/dr-domain-join-rollback.sh --dry-run /var/lib/dr-domain-join/back
 ```
 
 The backup is root-readable and includes existing network/DNS/hostname/service
-state, relevant configuration, the Arch `mnt-x.mount`/`mnt-x.automount` units,
-and the Arch machine-renewal service/timer when present. It does not copy
-domain passwords or put secrets in Git. No Btrfs
+state, relevant configuration, the Arch mnt-x.mount/mnt-x.automount units,
+configured DRIP units from the root-owned manifest, the DRIP helper, live
+validation markers, and the Arch machine-renewal service/timer when present.
+It does not copy domain passwords or put secrets in Git. No Btrfs
 snapshot was created; Snapper has a root configuration and a separate,
 operator-approved snapshot decision is still required.
 
@@ -397,15 +447,16 @@ out. Domain membership rollback remains the human-approved Samba leave path.
 8. Test domain login and home creation from a separate TTY/secondary session;
    test the local break-glass and existing personal account with network
    disconnected or SSSD unavailable before closing recovery access.
-9. On Arch, confirm the deliberate DRIP blocker for both representative
+9. On Arch, validate the configured root `/smb/dr-ep-drip04/Images`, confirm
    `/smb/dr-ep-drip04/ImageFolders/test` and
-   `/net/dr-ep-drip04/ImageFolders/test` paths. Validate the staged root KIT
-   access sequence above, Kerberos CIFS access, automount recovery,
-   `dr-workstation`, desktop behavior, and reboot persistence. Defer KIT until
-   these phases pass and receive separate approval.
-10. Rerun the candidate normally and verify `POSTJOIN_COMPLETE` exits without
-    office prompts, pacman, DNS/hostname/time/PAM/SSSD changes, service
-    restarts, or Samba join operations.
+   `/net/dr-ep-drip04/ImageFolders/test` remain outside the claimed scope,
+   then perform the full root KIT cache lifecycle, cifs ticket, activation
+   `/mnt/p`, bounded-read, cleanup, and reboot tests. Record each phase with
+   `dr-domain-join-live-validate --record STATE`.
+10. Do not record `POSTJOIN_COMPLETE` until every required live marker exists.
+    Rerun the candidate only after completion and verify the guard exits
+    without office prompts, pacman, DNS/hostname/time/PAM/SSSD changes,
+    service restarts, or Samba join operations.
 
 ## Ubuntu/Debian regression checklist
 
@@ -421,18 +472,18 @@ out. Domain membership rollback remains the human-approved Samba leave path.
 
 ## Status and known limitations
 
-Static and read-only validation is passing: the fixture suite reports 113
-tests, including the cache validator, command-scoped sudoers, Arch rebind,
-Samba renewal policy, Debian autofs, and Ubuntu KIT compatibility contract.
+Static and read-only validation is passing: the fixture suite reports 189
+tests, including configured-root DRIP units, cache-path/TOCTOU validation,
+command-scoped sudoers, transactional Arch rebind coverage, Samba renewal
+repair policy, completion gating, Debian autofs, and Ubuntu KIT compatibility.
 ShellCheck remains unrun because the host does not have `shellcheck` installed;
 installing it is intentionally outside this no-live-change phase. The real
 package install, Samba join, SSSD/PAM activation, local fallback login, domain
 login/home creation, sudo, Kerberos CIFS mount, automount recovery after
-reboot, KIT, and completed-state rerun have not been validated on CachyOS. In
-particular, the `sec=krb5,cruid=...` systemd mount behavior, root KIT cache
-lifecycle, machine-password renewal, and the actual Tool Server must be tested
-with real SSSD credential caches. Arch DRIP remains explicitly unsupported
-until dynamic `/smb`/`/net` access and the full KIT root-cache lifecycle are
-implemented and tested.
+reboot, KIT, configured-root DRIP, and completed-state rerun have not been
+validated on CachyOS. In particular, the sec=krb5,cruid=... systemd mount
+behavior, root KIT cache lifecycle, machine-password renewal, configured
+/smb root lifecycle, and the actual Tool Server must be tested with real SSSD
+credential caches. Arch does not claim arbitrary dynamic /smb or /net behavior.
 
 Do not advertise or merge this branch as complete until those live tests pass.

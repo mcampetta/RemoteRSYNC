@@ -49,7 +49,13 @@ restore_files=(
     etc/systemd/system/dr-domain-machine-password-renew.timer
     usr/local/sbin/dr-domain-machine-password-renew
     usr/local/sbin/dr-tools-rebind
+    usr/local/sbin/dr-drip-search
+    usr/local/sbin/dr-domain-join-live-validate
     var/lib/dr-domain-join/state
+    var/lib/dr-domain-join/drip-units.manifest
+    var/lib/dr-domain-join/machine-password-last-success
+    var/lib/dr-domain-join/machine-password-keytab-repair-needed
+    var/lib/dr-domain-join/live-validation
 )
 
 if [ "$mode" = "--dry-run" ]; then
@@ -77,6 +83,18 @@ for unit in mnt-x.automount mnt-x.mount dr-domain-machine-password-renew.timer d
     fi
 done
 
+drip_manifest="/var/lib/dr-domain-join/drip-units.manifest"
+if [ -r "$drip_manifest" ]; then
+    tab="$(printf '\t')"
+    while IFS="$tab" read -r entry mount_unit automount_unit; do
+        [ -n "$mount_unit" ] || continue
+        systemctl stop "$automount_unit" >/dev/null 2>&1 || true
+        systemctl stop "$mount_unit" >/dev/null 2>&1 || true
+        rm -f -- "/etc/systemd/system/$mount_unit" "/etc/systemd/system/$automount_unit"
+    done < "$drip_manifest"
+    rm -f -- "$drip_manifest" /usr/local/sbin/dr-drip-search
+fi
+
 for relative in "${restore_files[@]}"; do
     source_path="$backup_dir/files/$relative"
     target_path="/$relative"
@@ -90,6 +108,8 @@ for relative in "${restore_files[@]}"; do
         cp -a -- "$source_path" "$target_path"
     fi
 done
+
+systemctl daemon-reload >/dev/null 2>&1 || true
 
 # If an Arch candidate unit did not exist in the backup, it was created by the
 # candidate and must be removed during this explicit rollback.

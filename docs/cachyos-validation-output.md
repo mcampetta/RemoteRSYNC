@@ -18,6 +18,9 @@ WARNING realmd: unavailable but no longer required on arch
 WARNING adcli: unavailable but no longer required on arch
 WARNING autofs: unavailable but no longer required on arch
 WARNING winbind: unavailable but no longer required on arch
+DRIP support: configured-root Arch systemd automounts (/smb only)
+DRIP search roots: dr-ep-drip04/Images
+DRIP scope: arbitrary dynamic /smb and /net paths are unsupported
 ```
 
 Installed join/mount prerequisites include `krb5`, `samba`, `smbclient`,
@@ -78,7 +81,9 @@ Exit status 1 because preflight blockers remain. The Arch plan includes:
 
 ```text
 WOULD CHANGE /etc/systemd/system/mnt-x.mount and /etc/systemd/system/mnt-x.automount
-WOULD ENABLE/RESTART services: chronyd, sssd, sshd, mnt-x.automount
+WOULD CHANGE configured /smb roots: dr-ep-drip04/Images
+WOULD START configured DRIP automounts only for the KIT launch; no global enablement
+WOULD ENABLE/RESTART services: chronyd, sssd, sshd, mnt-x.automount, dr-domain-machine-password-renew.timer
 WOULD JOIN with Samba: kinit (interactive), net ads join --use-kerberos=required, net ads testjoin, net ads keytab create
 WOULD NOT reboot, log out, restart a display manager, disable security controls, or run pacman -Syu
 BLOCKED Dry-run plan is not executable until preflight blockers are resolved
@@ -89,7 +94,7 @@ BLOCKED Dry-run plan is not executable until preflight blockers are resolved
 ```text
 bash -n domain-join-latest.sh tests/test_domain_join.sh scripts/dr-domain-join-backup.sh scripts/dr-domain-join-rollback.sh: PASS
 git diff --check: PASS
-fixture regression suite: 49 tests passed
+fixture regression suite: 189 tests passed
 systemd-analyze verify generated mount/automount units: PASS
 testparm generated Arch smb.conf: PASS (no live file written)
 visudo generated sudoers: PASS
