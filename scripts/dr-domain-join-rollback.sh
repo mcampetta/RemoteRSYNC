@@ -45,6 +45,9 @@ restore_files=(
     etc/NetworkManager
     etc/systemd/system/mnt-x.mount
     etc/systemd/system/mnt-x.automount
+    etc/systemd/system/dr-domain-machine-password-renew.service
+    etc/systemd/system/dr-domain-machine-password-renew.timer
+    usr/local/sbin/dr-domain-machine-password-renew
     var/lib/dr-domain-join/state
 )
 
@@ -55,6 +58,7 @@ if [ "$mode" = "--dry-run" ]; then
     done
     echo "WOULD VALIDATE sudoers before any service action"
     echo "WOULD DISABLE/STOP candidate mnt-x.automount and mnt-x.mount units"
+    echo "WOULD DISABLE/STOP dr-domain-machine-password-renew.timer"
     echo "WOULD NOT leave the realm, delete /etc/krb5.keytab, remove users, remove drone, reboot, or log out"
     if [ "$restart_services" = true ]; then
         echo "WOULD RESTART only explicitly requested services after restore"
@@ -66,7 +70,7 @@ fi
 echo "Applying configuration rollback from: $backup_dir"
 echo "This restores files but does not leave the domain or remove local accounts."
 
-for unit in mnt-x.automount mnt-x.mount; do
+for unit in mnt-x.automount mnt-x.mount dr-domain-machine-password-renew.timer dr-domain-machine-password-renew.service; do
     if systemctl list-unit-files --no-legend "$unit" 2>/dev/null | grep -q .; then
         systemctl disable --now "$unit" >/dev/null 2>&1 || true
     fi
@@ -89,6 +93,15 @@ done
 # If an Arch candidate unit did not exist in the backup, it was created by the
 # candidate and must be removed during this explicit rollback.
 for relative in etc/systemd/system/mnt-x.mount etc/systemd/system/mnt-x.automount; do
+    if [ ! -e "$backup_dir/files/$relative" ] && [ -e "/$relative" ]; then
+        rm -f -- "/$relative"
+    fi
+done
+
+for relative in \
+    etc/systemd/system/dr-domain-machine-password-renew.service \
+    etc/systemd/system/dr-domain-machine-password-renew.timer \
+    usr/local/sbin/dr-domain-machine-password-renew; do
     if [ ! -e "$backup_dir/files/$relative" ] && [ -e "/$relative" ]; then
         rm -f -- "/$relative"
     fi

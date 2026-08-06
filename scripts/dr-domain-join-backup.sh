@@ -47,6 +47,9 @@ files=(
     /etc/NetworkManager
     /etc/systemd/system/mnt-x.mount
     /etc/systemd/system/mnt-x.automount
+    /etc/systemd/system/dr-domain-machine-password-renew.service
+    /etc/systemd/system/dr-domain-machine-password-renew.timer
+    /usr/local/sbin/dr-domain-machine-password-renew
     /var/lib/dr-domain-join/state
 )
 
@@ -57,7 +60,7 @@ if [ "$mode" = "--dry-run" ]; then
         echo "WOULD BACK UP $file when present"
     done
     echo "WOULD RECORD Btrfs/Snapper capability without creating a snapshot"
-    echo "WOULD BACK UP Arch systemd Tool Server mount units when present"
+    echo "WOULD BACK UP Arch systemd Tool Server mount and machine-renewal units when present"
     exit 0
 fi
 

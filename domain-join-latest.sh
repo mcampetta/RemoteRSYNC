@@ -85,6 +85,17 @@ CONFIG_FILE="/etc/domain-join.conf"
 DR_WORKSTATION_USERS_GROUP="dr-workstation-users"
 DR_WORKSTATION_ADMINS_GROUP="dr-workstation-admins"
 DR_LOCAL_ADMIN_USER="${DR_LOCAL_ADMIN_USER:-drone}"
+# The production workflow depends on KIT/IOLib dynamic DRIP paths.  Arch's
+# fixed /mnt/x systemd mount does not provide /smb/<server>/<share> or
+# /net/<server>/<share>; keep that requirement explicit rather than silently
+# claiming compatibility.  A candidate may opt into KIT-only validation with
+# DRIP_REQUIRED=false, but completion remains blocked when it is true.
+DRIP_REQUIRED="${DRIP_REQUIRED:-true}"
+# A systemd .mount unit is generated before a user accesses /mnt/x, so it
+# needs the UID of the domain user's Kerberos cache at generation time.  The
+# normal path derives this from DOMAIN_SUDO_USER; an explicit UID is useful for
+# a staged candidate run and is safe to store because it is not a credential.
+DR_TOOLS_MOUNT_CRUID="${DR_TOOLS_MOUNT_CRUID:-}"
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 
@@ -299,6 +310,40 @@ platform_capability_required() {
             return 0
             ;;
     esac
+}
+
+# DRIP is a path contract, not merely a CIFS capability.  KIT/IOLib expects
+# autofs-style dynamic server/share resolution beneath both prefixes.  The
+# Arch adapter currently implements only the fixed Tool Server path /mnt/x.
+platform_drip_supported() {
+    [ "$PLATFORM_FAMILY" = "debian" ]
+}
+
+platform_drip_path_supported() {
+    local path="${1:-}"
+    case "$path" in
+        /smb/*|/net/*) platform_drip_supported ;;
+        *) return 1 ;;
+    esac
+}
+
+platform_drip_requirement_satisfied() {
+    [ "$DRIP_REQUIRED" != true ] || platform_drip_supported
+}
+
+platform_validate_drip_requirement() {
+    if platform_drip_supported; then
+        preflight_pass "DRIP dynamic paths are provided by the Debian autofs adapter"
+        return 0
+    fi
+
+    if [ "$DRIP_REQUIRED" = true ]; then
+        preflight_blocked "Arch DRIP is unsupported: /smb/<server>/<share>/ and /net/<server>/<share>/ require dynamic mounts"
+        return 1
+    fi
+
+    preflight_warning "Arch DRIP is unsupported; /smb/<server>/<share>/ and /net/<server>/<share>/ are not generated (DRIP_REQUIRED=false)"
+    return 0
 }
 
 platform_detect_desktop() {
@@ -679,6 +724,12 @@ platform_report() {
     echo "  Time provider:       $(platform_time_provider active)"
     echo "  Time enabled:        $(platform_time_provider enabled)"
     echo "  Desktop adapter:     $(platform_desktop_integration)"
+    if platform_drip_supported; then
+        echo "  DRIP support:        supported via dynamic Debian autofs (/smb and /net)"
+    else
+        echo "  DRIP support:        UNSUPPORTED on Arch (fixed /mnt/x does not provide /smb or /net)"
+    fi
+    echo "  DRIP required:       $DRIP_REQUIRED"
     echo ""
     echo "Capability/package mapping"
     for capability in "${PLATFORM_CAPABILITIES[@]}"; do
@@ -806,6 +857,7 @@ platform_preflight() {
 
     [ "$PLATFORM_SUPPORTED" = true ] || preflight_blocked "platform is not supported by this candidate"
     [ "$PLATFORM_REPORT_BLOCKERS" -eq 0 ] || preflight_blocked "$PLATFORM_REPORT_BLOCKERS required package capabilities are unavailable or unmapped"
+    platform_validate_drip_requirement || true
 
     if nmcli general status >/dev/null 2>&1; then
         preflight_pass "NetworkManager is queryable"
@@ -947,9 +999,15 @@ platform_dry_run() {
     echo "  WOULD CHANGE time configuration using the platform time-service adapter"
     echo "  WOULD CHANGE /etc/krb5.conf, /etc/sssd/sssd.conf, native PAM files, /etc/sudoers.d/*, /etc/samba/smb.conf, /etc/nsswitch.conf"
     if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        echo "  DRIP support: UNSUPPORTED for /smb/<server>/<share>/ and /net/<server>/<share>/"
+        if [ "$DRIP_REQUIRED" = true ]; then
+            echo "  WOULD BLOCK completion: set DRIP_REQUIRED=false only for an explicitly approved KIT-only candidate"
+        fi
         echo "  WOULD CHANGE /etc/systemd/system/mnt-x.mount and /etc/systemd/system/mnt-x.automount"
+        echo "  WOULD USE CIFS ownership: sec=krb5,cruid=<logged-in-domain-user-uid>,vers=3.0"
+        echo "  WOULD CHANGE /etc/systemd/system/dr-domain-machine-password-renew.{service,timer} and /usr/local/sbin/dr-domain-machine-password-renew"
         echo "  WOULD CHANGE /usr/local/bin/*, /usr/local/sbin/*, desktop integration files"
-        echo "  WOULD ENABLE/RESTART services: $(platform_service_name time-sync), sssd, $(platform_service_name ssh-server), mnt-x.automount"
+        echo "  WOULD ENABLE/RESTART services: $(platform_service_name time-sync), sssd, $(platform_service_name ssh-server), mnt-x.automount, dr-domain-machine-password-renew.timer"
         echo "  WOULD JOIN with Samba: kinit (interactive), net ads join --use-kerberos=required, net ads testjoin, net ads keytab create"
     else
         echo "  WOULD CHANGE /etc/auto.master.d/*, /etc/auto.net.cifs, /usr/local/bin/*, /usr/local/sbin/*, desktop integration files"
@@ -1307,6 +1365,7 @@ OFFICE_CODE="${OFFICE_CODE:-}"
 DOMAIN="${DOMAIN:-}"
 TARGET_HOSTNAME="${DOMAIN_TARGET_HOSTNAME:-}"
 DOMAIN_SUDO_USER="${DOMAIN_SUDO_USER:-}"
+DR_TOOLS_MOUNT_CRUID="${DR_TOOLS_MOUNT_CRUID:-}"
 HOSTNAME_CHANGED="${HOSTNAME_CHANGED:-0}"
 EOF
     chmod 600 "$STATE_FILE"
@@ -1320,6 +1379,7 @@ load_state() {
 
     [ -n "${OFFICE_CODE:-}" ] && OFFICE_CODE="$OFFICE_CODE"
     [ -n "${DOMAIN_SUDO_USER:-}" ] && DOMAIN_SUDO_USER="$DOMAIN_SUDO_USER"
+    [ -n "${DR_TOOLS_MOUNT_CRUID:-}" ] && DR_TOOLS_MOUNT_CRUID="$DR_TOOLS_MOUNT_CRUID"
     [ -n "${TARGET_HOSTNAME:-}" ] && DOMAIN_TARGET_HOSTNAME="$TARGET_HOSTNAME"
     return 0
 }
@@ -3716,6 +3776,140 @@ set_sssd_global_option() {
     fi
 }
 
+# Arch does not have the realmd renewal helper used by SSSD's default
+# ad_machine_account_password_renewal_opts (realm).  The authoritative Arch
+# path is the root-owned Samba helper/timer below, which updates secrets.tdb
+# and then explicitly rebuilds /etc/krb5.keytab before re-running testjoin.
+platform_machine_account_renewal_policy() {
+    case "$PLATFORM_FAMILY" in
+        arch)
+            cat << 'EOF'
+Arch machine-account renewal policy:
+  authority: dr-domain-machine-password-renew.service/timer
+  interval: 25 days plus a randomized delay, before SSSD's 30-day default
+  SSSD renewal: disabled with ad_maximum_machine_account_password_age=0
+  ad_update_samba_machine_account_password: false (SSSD realm/adcli helper unavailable)
+  sequence: net ads testjoin -> net ads changetrustpw -P -> net ads keytab create -> klist -k -> net ads testjoin
+  synchronization: Samba secrets.tdb is updated by changetrustpw; keytab is rebuilt from the resulting Samba secret
+EOF
+            ;;
+        debian)
+            echo "Debian machine-account renewal policy: preserve existing realmd/adcli/SSSD behavior"
+            ;;
+        *)
+            echo "No machine-account renewal policy for platform family '$PLATFORM_FAMILY'"
+            return 1
+            ;;
+    esac
+}
+
+render_arch_machine_account_renewal_helper() {
+    cat << 'EOF'
+#!/bin/bash
+set -euo pipefail
+
+KEYTAB="/etc/krb5.keytab"
+LOCK_DIR="/run/dr-domain-machine-password-renew.lock"
+
+cleanup() {
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo "Machine-account renewal is already running; exiting." >&2
+    exit 0
+fi
+
+net ads testjoin >/dev/null
+net ads changetrustpw -P
+# Samba 4.21+ creates the keytab according to the declarative
+# 'sync machine password to keytab' rule. Rebuild it after every password
+# change so secrets.tdb and /etc/krb5.keytab cannot drift apart.
+net ads keytab create
+klist -k "$KEYTAB" >/dev/null
+grep -qi 'DR.KODR.LOCAL' <(klist -k "$KEYTAB")
+net ads testjoin >/dev/null
+EOF
+}
+
+render_arch_machine_account_renewal_service() {
+    cat << 'EOF'
+[Unit]
+Description=Renew the Samba AD machine account password and rebuild the Kerberos keytab
+After=network-online.target sssd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/dr-domain-machine-password-renew
+EOF
+}
+
+render_arch_machine_account_renewal_timer() {
+    cat << 'EOF'
+[Unit]
+Description=Periodic Samba AD machine-account renewal
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=25d
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+platform_machine_account_renewal_service_name() {
+    echo "dr-domain-machine-password-renew.service"
+}
+
+platform_machine_account_renewal_timer_name() {
+    echo "dr-domain-machine-password-renew.timer"
+}
+
+platform_install_machine_account_renewal() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+
+    local helper="/usr/local/sbin/dr-domain-machine-password-renew"
+    local service="/etc/systemd/system/$(platform_machine_account_renewal_service_name)"
+    local timer="/etc/systemd/system/$(platform_machine_account_renewal_timer_name)"
+    backup_config_file "$helper"
+    backup_config_file "$service"
+    backup_config_file "$timer"
+    render_arch_machine_account_renewal_helper > "$helper"
+    render_arch_machine_account_renewal_service > "$service"
+    render_arch_machine_account_renewal_timer > "$timer"
+    chmod 755 "$helper"
+    chmod 644 "$service" "$timer"
+    chown root:root "$helper" "$service" "$timer"
+    systemd-analyze verify "$service" "$timer"
+    systemctl daemon-reload
+    systemctl enable "$(platform_machine_account_renewal_timer_name)" >/dev/null
+    print_info "Installed authoritative Samba machine-account renewal timer"
+}
+
+platform_verify_machine_account_renewal() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+    local service="/etc/systemd/system/$(platform_machine_account_renewal_service_name)"
+    local timer="/etc/systemd/system/$(platform_machine_account_renewal_timer_name)"
+    [ -x /usr/local/sbin/dr-domain-machine-password-renew ] || return 1
+    [ -f "$service" ] && [ -f "$timer" ] || return 1
+    systemd-analyze verify "$service" "$timer" >/dev/null 2>&1 || return 1
+    systemctl is-enabled --quiet "$(platform_machine_account_renewal_timer_name)" 2>/dev/null
+}
+
+platform_remove_machine_account_renewal() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+    systemctl disable --now "$(platform_machine_account_renewal_timer_name)" >/dev/null 2>&1 || true
+    rm -f /usr/local/sbin/dr-domain-machine-password-renew \
+        "/etc/systemd/system/$(platform_machine_account_renewal_service_name)" \
+        "/etc/systemd/system/$(platform_machine_account_renewal_timer_name)"
+    systemctl daemon-reload
+}
+
 render_sssd_config() {
     cat << EOF
 [sssd]
@@ -3736,6 +3930,15 @@ ldap_id_mapping = True
 cache_credentials = True
 fallback_homedir = /home/%u
 EOF
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        cat << 'EOF'
+# Arch uses the Samba renewal timer because the SSSD default realm/adcli
+# renewal helper is unavailable. Keeping this disabled avoids two competing
+# password-renewal authorities.
+ad_maximum_machine_account_password_age = 0
+ad_update_samba_machine_account_password = false
+EOF
+    fi
 }
 
 configure_sssd_settings() {
@@ -3891,8 +4094,12 @@ stage_generated_configurations() {
     render_krb5_config > "$stage_dir/krb5.conf"
     render_sssd_config > "$stage_dir/sssd.conf"
     if [ "$PLATFORM_FAMILY" = "arch" ]; then
-        render_arch_tools_mount_unit "/mnt/x" "$TOOLS_SERVER" > "$stage_dir/mnt-x.mount"
+        local stage_cruid="${DR_TOOLS_MOUNT_CRUID:-}"
+        render_arch_tools_mount_unit "/mnt/x" "$TOOLS_SERVER" "$stage_cruid" > "$stage_dir/mnt-x.mount"
         render_arch_tools_automount_unit "/mnt/x" > "$stage_dir/mnt-x.automount"
+        render_arch_tools_mount_helper "$stage_cruid" > "$stage_dir/mount-kit-tools"
+        render_arch_machine_account_renewal_service > "$stage_dir/dr-domain-machine-password-renew.service"
+        render_arch_machine_account_renewal_timer > "$stage_dir/dr-domain-machine-password-renew.timer"
     else
         render_autofs_master_maps > "$stage_dir/auto.master"
         render_autofs_cifs_map > "$stage_dir/auto.net.cifs"
@@ -4107,6 +4314,15 @@ verify() {
         failed=1
     fi
 
+    if [ -f /etc/systemd/system/dr-domain-machine-password-renew.timer ]; then
+        if systemctl is-enabled --quiet dr-domain-machine-password-renew.timer 2>/dev/null; then
+            echo "[OK] Arch Samba machine-account renewal timer is enabled"
+        else
+            echo "[FAIL] Arch Samba machine-account renewal timer is not enabled"
+            failed=1
+        fi
+    fi
+
     if visudo -cf /etc/sudoers.d/zz-dr_workstation_users >/dev/null 2>&1; then
         echo "[OK] Workstation sudo policy is valid"
     else
@@ -4292,6 +4508,15 @@ if [ "\${1:-}" = "--sudo-self-test" ]; then
     exit 0
 fi
 
+if [ "\${1:-}" = "--access-self-test" ]; then
+    [ "\$(id -u)" -eq 0 ] || { echo "--access-self-test must run as root" >&2; exit 1; }
+    [ -r "\$KIT_DIR/KIT.sh" ] || { echo "KIT.sh is not readable: \$KIT_DIR/KIT.sh" >&2; exit 1; }
+    while IFS= read -r -d '' runtime_file; do
+        [ -r "\$runtime_file" ] || { echo "KIT runtime file is not readable: \$runtime_file" >&2; exit 1; }
+    done < <(find "\$KIT_DIR" -type f -print0)
+    exit 0
+fi
+
 if [ ! -d "\$KIT_DIR" ]; then
     echo "KIT directory not found: \$KIT_DIR" | tee -a "\$LOG" >&2
     echo "Verify Tool Server is mounted at /mnt/x, then try again." >&2
@@ -4327,8 +4552,10 @@ if [ "\${1:-}" = "--sudo-self-test" ]; then
     exit 0
 fi
 
-if [ "\${1:-}" = "--start-only" ]; then
-    systemctl start "\$AUTOMOUNT_UNIT"
+if [ "\${1:-}" = "--access-self-test" ]; then
+    [ "\$(id -u)" -eq 0 ] || { echo "--access-self-test must run as root" >&2; exit 1; }
+    [ -r "\$KIT_INSTALLER_PATH" ] || { echo "KIT installer is not readable: \$KIT_INSTALLER_PATH" >&2; exit 1; }
+    [ -r "\$(dirname "\$KIT_INSTALLER_PATH")/KIT.sh" ] || { echo "KIT.sh is not readable" >&2; exit 1; }
     exit 0
 fi
 
@@ -4968,9 +5195,30 @@ tools_automount_unit_name() {
     systemd-escape --path --suffix=automount "${1:-/mnt/x}"
 }
 
+tools_mount_cruid() {
+    local uid="${DR_TOOLS_MOUNT_CRUID:-}"
+    if [ -z "$uid" ] && [ -n "${DOMAIN_SUDO_USER:-}" ]; then
+        uid="$(id -u "$DOMAIN_SUDO_USER" 2>/dev/null || true)"
+    fi
+    if [ -z "$uid" ] && [ -n "${SUDO_UID:-}" ] && [ "${SUDO_UID}" != 0 ]; then
+        uid="$SUDO_UID"
+    fi
+    case "$uid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    printf '%s\n' "$uid"
+}
+
 render_arch_tools_mount_unit() {
     local mount_point="${1:-/mnt/x}"
     local server="${2:-$TOOLS_SERVER}"
+    local cruid="${3:-${DR_TOOLS_MOUNT_CRUID:-}}"
+    case "$cruid" in
+        ''|*[!0-9]*)
+            print_error "Arch Tool Server unit requires the logged-in domain user's numeric UID as cruid" >&2
+            return 1
+            ;;
+    esac
     cat << EOF
 [Unit]
 Description=DR Tool Server CIFS mount
@@ -4981,7 +5229,7 @@ After=network-online.target
 What=//$server/Tools
 Where=$mount_point
 Type=cifs
-Options=_netdev,nofail,sec=krb5,multiuser,vers=3.0
+Options=_netdev,nofail,sec=krb5,cruid=$cruid,vers=3.0
 TimeoutSec=30s
 EOF
 }
@@ -5056,7 +5304,13 @@ platform_install_tools_mount() {
         return 0
     fi
 
-    local mount_unit automount_unit
+    local mount_unit automount_unit cruid
+    cruid="$(tools_mount_cruid)" || {
+        print_error "Cannot configure Arch Tool Server mount without a verified logged-in domain-user UID"
+        print_error "Set DR_TOOLS_MOUNT_CRUID to that UID or select DOMAIN_SUDO_USER before the modifying checkpoint"
+        return 1
+    }
+    DR_TOOLS_MOUNT_CRUID="$cruid"
     mount_unit="$(tools_mount_unit_name)" || {
         print_error "systemd-escape is required to name the Tool Server mount unit"
         return 1
@@ -5065,7 +5319,7 @@ platform_install_tools_mount() {
     mkdir -p /mnt/x
     backup_config_file "/etc/systemd/system/$mount_unit"
     backup_config_file "/etc/systemd/system/$automount_unit"
-    render_arch_tools_mount_unit "/mnt/x" "$TOOLS_SERVER" > "/etc/systemd/system/$mount_unit"
+    render_arch_tools_mount_unit "/mnt/x" "$TOOLS_SERVER" "$cruid" > "/etc/systemd/system/$mount_unit"
     render_arch_tools_automount_unit "/mnt/x" > "/etc/systemd/system/$automount_unit"
     chmod 644 "/etc/systemd/system/$mount_unit" "/etc/systemd/system/$automount_unit"
     systemd-analyze verify "/etc/systemd/system/$mount_unit" "/etc/systemd/system/$automount_unit"
@@ -5074,16 +5328,44 @@ platform_install_tools_mount() {
     print_info "Installed on-demand systemd CIFS units: $mount_unit, $automount_unit"
 }
 
-install_arch_tools_mount_helper() {
-    cat > /usr/local/bin/mount-kit-tools << EOF
+render_arch_tools_mount_helper() {
+    local configured_cruid="${1:-${DR_TOOLS_MOUNT_CRUID:-}}"
+    local automount_unit
+    automount_unit="$(tools_automount_unit_name)" || return 1
+    case "$configured_cruid" in
+        ''|*[!0-9]*)
+            print_error "Arch Tool Server helper requires a configured domain-user UID as cruid" >&2
+            return 1
+            ;;
+    esac
+    cat << EOF
 #!/bin/bash
 set -euo pipefail
 
 MOUNT_POINT="/mnt/x"
-AUTOMOUNT_UNIT="$(tools_automount_unit_name)"
+AUTOMOUNT_UNIT="$automount_unit"
+CONFIGURED_CRUID="$configured_cruid"
 
 if [ "\${1:-}" = "--sudo-self-test" ]; then
     exit 0
+fi
+
+if [ "\${1:-}" = "--access-self-test" ]; then
+    [ "\$(id -u)" -eq 0 ] || { echo "--access-self-test must run as root" >&2; exit 1; }
+    timeout 30s ls -la "\$MOUNT_POINT" >/dev/null
+    exit 0
+fi
+
+CRUID="\$CONFIGURED_CRUID"
+if [ "\${1:-}" = "--cruid" ]; then
+    CRUID="\${2:-}"
+fi
+case "\$CRUID" in
+    ''|*[!0-9]*) echo "Invalid Kerberos credential-cache UID" >&2; exit 1 ;;
+esac
+if [ "\$CRUID" != "\$CONFIGURED_CRUID" ]; then
+    echo "This mount unit is bound to domain-user UID \$CONFIGURED_CRUID; refusing a different credential owner" >&2
+    exit 1
 fi
 
 if [ "\$(id -u)" -ne 0 ]; then
@@ -5093,7 +5375,8 @@ if [ "\$(id -u)" -ne 0 ]; then
         echo "Run: su - $DR_LOCAL_ADMIN_USER; sudo dr-workstation add-user \$CURRENT_USER; exit" >&2
         exit 1
     fi
-    sudo -n /usr/local/bin/mount-kit-tools --start-only
+    USER_UID="\$(id -u)"
+    sudo -n /usr/local/bin/mount-kit-tools --cruid "\$USER_UID"
     if ! timeout 30s ls -la "\$MOUNT_POINT" >/dev/null 2>&1; then
         echo "Tool Server access failed. Ensure the logged-in user has a valid Kerberos ticket." >&2
         exit 1
@@ -5103,6 +5386,10 @@ if [ "\$(id -u)" -ne 0 ]; then
 fi
 
 mkdir -p "\$MOUNT_POINT"
+if ! KRB5CCNAME="FILE:/tmp/krb5cc_\$CRUID" klist -s 2>/dev/null && ! klist -s 2>/dev/null; then
+    echo "No valid Kerberos ticket found for configured domain-user UID \$CRUID" >&2
+    exit 1
+fi
 systemctl start "\$AUTOMOUNT_UNIT"
 if mountpoint -q "\$MOUNT_POINT"; then
     exit 0
@@ -5114,6 +5401,27 @@ if ! timeout 30s ls -la "\$MOUNT_POINT" >/dev/null 2>&1; then
 fi
 mountpoint -q "\$MOUNT_POINT"
 EOF
+}
+
+render_kit_root_access_test_plan() {
+    local domain_user="${1:-DOMAIN_USER}"
+    cat << EOF
+KIT Kerberos ownership test plan (staged; not executed by preflight):
+  1. Domain user ticket/list: klist -s; ls -la /mnt/x
+  2. Root-through-sudo list/execute: sudo -n /usr/local/bin/mount-kit-tools --cruid "\$(id -u $domain_user)"; sudo -n /usr/local/sbin/dr-launch-kit --access-self-test
+  3. Root post-mount read: sudo -n /usr/local/sbin/dr-post-mount-provision --access-self-test
+  4. Root KIT/runtime read: sudo -n /usr/local/sbin/dr-launch-kit --access-self-test
+  Mount must show sec=krb5,cruid=<logged-in-domain-user-uid>,vers=3.0; a normal-user ls alone is insufficient.
+EOF
+}
+
+install_arch_tools_mount_helper() {
+    local cruid
+    cruid="$(tools_mount_cruid)" || {
+        print_error "Cannot install Arch Tool Server helper without a verified domain-user UID"
+        return 1
+    }
+    render_arch_tools_mount_helper "$cruid" > /usr/local/bin/mount-kit-tools
     chmod 755 /usr/local/bin/mount-kit-tools
     chown root:root /usr/local/bin/mount-kit-tools
 }
@@ -5674,6 +5982,7 @@ configure_samba() {
             print_error "Generated Arch Samba configuration failed testparm"
             return 1
         fi
+        platform_install_machine_account_renewal
         print_info "Installed Samba ADS configuration with documented 4.21+ keytab synchronization"
         return 0
     fi
@@ -5856,6 +6165,12 @@ check_display_manager() {
 verify_join() {
     print_info "Verifying domain join..."
 
+    if ! platform_drip_requirement_satisfied; then
+        print_error "Completion is blocked because Arch does not implement the required dynamic DRIP paths"
+        print_error "Use a Debian-family adapter for DRIP, or explicitly set DRIP_REQUIRED=false for a KIT-only candidate"
+        return 1
+    fi
+
     if ! platform_domain_is_joined; then
         print_error "Domain join verification failed — machine does not appear to be joined"
         return 1
@@ -5864,6 +6179,10 @@ verify_join() {
 
     if [ "$PLATFORM_FAMILY" = "arch" ]; then
         platform_validate_machine_keytab || return 1
+        platform_verify_machine_account_renewal || {
+            print_error "Arch machine-account renewal timer/helper is missing or invalid"
+            return 1
+        }
     fi
 
     if ! systemctl is-active --quiet sssd 2>/dev/null; then
@@ -5872,6 +6191,16 @@ verify_join() {
         return 1
     fi
     print_info "SSSD is running"
+
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        if command -v sssctl >/dev/null 2>&1; then
+            sssctl config-check
+            print_info "SSSD configuration validated with sssctl"
+        else
+            print_error "sssctl is unavailable after the Arch sssd package checkpoint"
+            return 1
+        fi
+    fi
 
     print_info "Testing short name resolution..."
     if nslookup "$(echo "$DOMAIN" | cut -d. -f1)-tools" > /dev/null 2>&1; then
