@@ -1089,7 +1089,12 @@ platform_dry_run() {
         echo "  WOULD INSTALL /usr/local/sbin/dr-tools-rebind for explicit selected-user remounts; shared multi-user /mnt/x is not claimed"
         echo "  WOULD CHANGE /etc/systemd/system/dr-domain-machine-password-renew.{service,timer} and /usr/local/sbin/dr-domain-machine-password-renew"
         echo "  WOULD CHANGE /usr/local/bin/*, /usr/local/sbin/*, desktop integration files"
-        echo "  WOULD ENABLE/RESTART services: $(platform_service_name time-sync), sssd, $(platform_service_name ssh-server), mnt-x.automount, dr-domain-machine-password-renew.timer"
+        if platform_time_provider_satisfies; then
+            echo "  WOULD VALIDATE existing time provider: $(platform_time_provider active); no chrony install or provider switch"
+        else
+            echo "  WOULD ENABLE/RESTART time provider: $(platform_service_name time-sync)"
+        fi
+        echo "  WOULD ENABLE/RESTART services: sssd, $(platform_service_name ssh-server), mnt-x.automount, dr-domain-machine-password-renew.timer"
         echo "  WOULD JOIN with Samba: kinit (interactive), net ads join --use-kerberos=required, net ads testjoin, net ads keytab create"
     else
         echo "  WOULD CHANGE /etc/auto.master.d/*, /etc/auto.net.cifs, /usr/local/bin/*, /usr/local/sbin/*, desktop integration files"

@@ -49,7 +49,7 @@ The current configured repositories report these Arch mappings:
 | Arch join backend | Samba client/net utility | `smbclient`, installed and supplied by the Samba package set |
 | Tool Server mounting | CIFS helper | `cifs-utils`, installed |
 | DNS/discovery | resolver tools | `bind`, installed |
-| Time provider option | chrony | `chrony`, available, not installed |
+| Time provider fallback | chrony | `chrony` available; active/enabled `systemd-timesyncd` satisfies the capability on this host |
 | SSH handoff | OpenSSH | `openssh`, installed |
 | Diagnostics only | `sssctl` | `/usr/bin/sssctl` is in the official `sssd` file list; live install validation remains pending |
 | Diagnostics only | `ldapsearch` | `/usr/bin/ldapsearch` is in the official `openldap` file list; live install validation remains pending |

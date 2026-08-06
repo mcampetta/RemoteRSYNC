@@ -18,6 +18,7 @@ WARNING realmd: unavailable but no longer required on arch
 WARNING adcli: unavailable but no longer required on arch
 WARNING autofs: unavailable but no longer required on arch
 WARNING winbind: unavailable but no longer required on arch
+PASS time-sync: existing supported provider is active or enabled
 DRIP support: configured-root Arch systemd automounts (/smb only)
 DRIP search roots: dr-ep-drip04/Images
 DRIP scope: arbitrary dynamic /smb and /net paths are unsupported
@@ -25,8 +26,9 @@ DRIP scope: arbitrary dynamic /smb and /net paths are unsupported
 
 Installed join/mount prerequisites include `krb5`, `samba`, `smbclient`,
 `cifs-utils`, `bind`, `pam`, `sudo`, NetworkManager, OpenSSH, and `xdg-utils`.
-`sssd` and `chrony` are available but not installed. `openldap` is available
-but optional diagnostics. The configured Samba version is 4.24.5.
+`sssd` and the chrony fallback are available but not installed; active
+`systemd-timesyncd` satisfies the time-provider capability. `openldap` is
+available but optional diagnostics. The configured Samba version is 4.24.5.
 
 ## Time diagnostics
 
@@ -83,7 +85,8 @@ Exit status 1 because preflight blockers remain. The Arch plan includes:
 WOULD CHANGE /etc/systemd/system/mnt-x.mount and /etc/systemd/system/mnt-x.automount
 WOULD CHANGE configured /smb roots: dr-ep-drip04/Images
 WOULD START configured DRIP automounts only for the KIT launch; no global enablement
-WOULD ENABLE/RESTART services: chronyd, sssd, sshd, mnt-x.automount, dr-domain-machine-password-renew.timer
+WOULD VALIDATE existing time provider: systemd-timesyncd; no chrony install or provider switch
+WOULD ENABLE/RESTART services: sssd, sshd, mnt-x.automount, dr-domain-machine-password-renew.timer
 WOULD JOIN with Samba: kinit (interactive), net ads join --use-kerberos=required, net ads testjoin, net ads keytab create
 WOULD NOT reboot, log out, restart a display manager, disable security controls, or run pacman -Syu
 BLOCKED Dry-run plan is not executable until preflight blockers are resolved
