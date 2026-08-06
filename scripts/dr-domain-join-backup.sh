@@ -45,6 +45,8 @@ files=(
     /etc/sudoers.d
     /etc/pam.d
     /etc/NetworkManager
+    /etc/systemd/system/mnt-x.mount
+    /etc/systemd/system/mnt-x.automount
     /var/lib/dr-domain-join/state
 )
 
@@ -55,6 +57,7 @@ if [ "$mode" = "--dry-run" ]; then
         echo "WOULD BACK UP $file when present"
     done
     echo "WOULD RECORD Btrfs/Snapper capability without creating a snapshot"
+    echo "WOULD BACK UP Arch systemd Tool Server mount units when present"
     exit 0
 fi
 

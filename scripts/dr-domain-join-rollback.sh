@@ -43,6 +43,8 @@ restore_files=(
     etc/sudoers.d
     etc/pam.d
     etc/NetworkManager
+    etc/systemd/system/mnt-x.mount
+    etc/systemd/system/mnt-x.automount
     var/lib/dr-domain-join/state
 )
 
@@ -52,6 +54,7 @@ if [ "$mode" = "--dry-run" ]; then
         [ -e "$backup_dir/files/$relative" ] && echo "WOULD RESTORE /$relative"
     done
     echo "WOULD VALIDATE sudoers before any service action"
+    echo "WOULD DISABLE/STOP candidate mnt-x.automount and mnt-x.mount units"
     echo "WOULD NOT leave the realm, delete /etc/krb5.keytab, remove users, remove drone, reboot, or log out"
     if [ "$restart_services" = true ]; then
         echo "WOULD RESTART only explicitly requested services after restore"
@@ -62,6 +65,12 @@ fi
 [ "$(id -u)" -eq 0 ] || { echo "--apply requires root" >&2; exit 1; }
 echo "Applying configuration rollback from: $backup_dir"
 echo "This restores files but does not leave the domain or remove local accounts."
+
+for unit in mnt-x.automount mnt-x.mount; do
+    if systemctl list-unit-files --no-legend "$unit" 2>/dev/null | grep -q .; then
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    fi
+done
 
 for relative in "${restore_files[@]}"; do
     source_path="$backup_dir/files/$relative"
@@ -74,6 +83,14 @@ for relative in "${restore_files[@]}"; do
     else
         mkdir -p "$(dirname "$target_path")"
         cp -a -- "$source_path" "$target_path"
+    fi
+done
+
+# If an Arch candidate unit did not exist in the backup, it was created by the
+# candidate and must be removed during this explicit rollback.
+for relative in etc/systemd/system/mnt-x.mount etc/systemd/system/mnt-x.automount; do
+    if [ ! -e "$backup_dir/files/$relative" ] && [ -e "/$relative" ]; then
+        rm -f -- "/$relative"
     fi
 done
 

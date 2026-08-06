@@ -43,7 +43,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.2.0-cachyos-candidate"
+SCRIPT_VERSION="1.3.0-cachyos-samba-systemd-candidate"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="${DR_JOIN_STATE_DIR:-/var/lib/dr-domain-join}"
@@ -84,6 +84,7 @@ TOOLS_SERVER=""
 CONFIG_FILE="/etc/domain-join.conf"
 DR_WORKSTATION_USERS_GROUP="dr-workstation-users"
 DR_WORKSTATION_ADMINS_GROUP="dr-workstation-admins"
+DR_LOCAL_ADMIN_USER="${DR_LOCAL_ADMIN_USER:-drone}"
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 
@@ -216,9 +217,9 @@ show_completed_workstation_message() {
         echo ""
         echo "  To grant this account workstation administrator access, run:"
         echo ""
-        echo "    su - drone"
+        echo "    su - $DR_LOCAL_ADMIN_USER"
         echo ""
-        echo "  Enter the local drone account password, then run:"
+        echo "  Enter the local $DR_LOCAL_ADMIN_USER account password, then run:"
         echo ""
         echo "    sudo dr-workstation add-user $current_user"
         echo ""
@@ -272,9 +273,33 @@ completed_workstation_rerun_guard() {
 # receive a clear unsupported result later, but has no implementation here.
 
 PLATFORM_CAPABILITIES=(
-    realmd sssd sssd-tools adcli kerberos samba cifs autofs time-sync
+    realmd sssd sssd-tools adcli kerberos samba smbclient cifs autofs time-sync
     networkmanager dns ldap sudo pam home-directory ssh-server winbind desktop-helper
 )
+
+platform_capability_class() {
+    case "$1" in
+        sssd|kerberos|pam|home-directory|sudo|time-sync) echo "core AD login" ;;
+        samba|smbclient) echo "Arch join backend" ;;
+        sssd-tools) echo "diagnostics only" ;;
+        cifs) echo "Tool Server mounting" ;;
+        realmd|adcli|autofs|ldap|dns|networkmanager|time-sync|ssh-server|winbind) echo "diagnostics/platform support" ;;
+        desktop-helper) echo "optional desktop integration" ;;
+        *) echo "shared capability" ;;
+    esac
+}
+
+platform_capability_required() {
+    local capability="$1"
+    case "$PLATFORM_FAMILY:$capability" in
+        arch:realmd|arch:adcli|arch:autofs|arch:winbind|arch:ldap|arch:sssd-tools|arch:desktop-helper)
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
 
 platform_detect_desktop() {
     local desktop="${XDG_CURRENT_DESKTOP:-}"
@@ -398,6 +423,7 @@ platform_package_name() {
         debian:adcli) echo "adcli" ;;
         debian:kerberos) echo "krb5-user" ;;
         debian:samba) echo "samba-common-bin" ;;
+        debian:smbclient) echo "smbclient" ;;
         debian:cifs) echo "cifs-utils" ;;
         debian:autofs) echo "autofs" ;;
         debian:time-sync) echo "chrony" ;;
@@ -422,6 +448,7 @@ platform_package_name() {
         arch:adcli) ;;
         arch:kerberos) echo "krb5" ;;
         arch:samba) echo "samba" ;;
+        arch:smbclient) echo "smbclient" ;;
         arch:cifs) echo "cifs-utils" ;;
         arch:autofs) ;;
         arch:time-sync) echo "chrony" ;;
@@ -433,7 +460,9 @@ platform_package_name() {
         arch:home-directory) echo "pam" ;;
         arch:ssh-server) echo "openssh" ;;
         arch:desktop-helper) echo "xdg-utils" ;;
-        arch:winbind) echo "samba" ;;
+        # The Arch backend uses Samba's net utility and SSSD. Winbind is not
+        # started or enabled, so it is intentionally not a dependency.
+        arch:winbind) ;;
         *) ;;
     esac
 }
@@ -603,13 +632,25 @@ platform_capability_status() {
     local package
     package="$(platform_package_name "$capability")"
     if [ -z "$package" ]; then
-        printf 'BLOCKED|%s|no configured-repository mapping' "$capability"
+        if platform_capability_required "$capability"; then
+            printf 'BLOCKED|%s|no configured-repository mapping' "$capability"
+        else
+            printf 'WARNING|%s|unavailable but no longer required on %s' "$capability" "$PLATFORM_FAMILY"
+        fi
     elif platform_is_package_installed "$package"; then
         printf 'PASS|%s|%s installed' "$capability" "$package"
     elif platform_is_package_available "$package"; then
-        printf 'WARNING|%s|%s available but not installed' "$capability" "$package"
+        if platform_capability_required "$capability"; then
+            printf 'WARNING|%s|%s available but not installed' "$capability" "$package"
+        else
+            printf 'WARNING|%s|%s available but not installed (optional/diagnostic)' "$capability" "$package"
+        fi
     else
-        printf 'BLOCKED|%s|%s unavailable in configured repositories' "$capability" "$package"
+        if platform_capability_required "$capability"; then
+            printf 'BLOCKED|%s|%s unavailable in configured repositories' "$capability" "$package"
+        else
+            printf 'WARNING|%s|%s unavailable but no longer required' "$capability" "$package"
+        fi
     fi
 }
 
@@ -635,13 +676,14 @@ platform_report() {
     echo "  Package-manager DB:  $package_db"
     echo "  Administrator group: ${PLATFORM_ADMIN_GROUP:-unavailable}"
     echo "  Resolver:            $(if systemctl is-active --quiet systemd-resolved 2>/dev/null; then echo systemd-resolved; else echo /etc/resolv.conf; fi)"
-    echo "  Time provider:       $(if systemctl is-active --quiet chronyd 2>/dev/null; then echo chronyd; elif systemctl is-active --quiet chrony 2>/dev/null; then echo chrony; elif systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then echo systemd-timesyncd; else echo unknown; fi)"
+    echo "  Time provider:       $(platform_time_provider active)"
+    echo "  Time enabled:        $(platform_time_provider enabled)"
     echo "  Desktop adapter:     $(platform_desktop_integration)"
     echo ""
     echo "Capability/package mapping"
     for capability in "${PLATFORM_CAPABILITIES[@]}"; do
         IFS='|' read -r status name detail <<< "$(platform_capability_status "$capability")"
-        printf '  %-8s %-18s %s (%s)\n' "$status" "$name" "$detail" "$(platform_package_name "$name")"
+        printf '  %-8s %-18s %-28s %s (%s)\n' "$status" "$name" "$(platform_capability_class "$name")" "$detail" "$(platform_package_name "$name")"
         [ "$status" = "BLOCKED" ] && PLATFORM_REPORT_BLOCKERS=$((PLATFORM_REPORT_BLOCKERS + 1))
     done
     echo ""
@@ -654,12 +696,111 @@ platform_report() {
     fi
 }
 
+platform_time_provider() {
+    local mode="${1:-active}"
+    local service
+
+    if [ "$mode" = "enabled" ]; then
+        for service in chronyd chrony systemd-timesyncd; do
+            if systemctl is-enabled --quiet "$service" 2>/dev/null; then
+                echo "$service"
+                return 0
+            fi
+        done
+    else
+        for service in chronyd chrony systemd-timesyncd; do
+            if systemctl is-active --quiet "$service" 2>/dev/null; then
+                echo "$service"
+                return 0
+            fi
+        done
+    fi
+
+    echo "none"
+}
+
+platform_time_is_synchronized() {
+    local ntp_synced
+    ntp_synced="$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || true)"
+    [ "$ntp_synced" = yes ] && return 0
+    chronyc tracking 2>/dev/null | grep -qE '^Leap status[[:space:]]*:[[:space:]]*Normal'
+}
+
+platform_time_diagnostics() {
+    local active enabled synced timesync_status chrony_tracking chrony_sources
+    active="$(platform_time_provider active)"
+    enabled="$(platform_time_provider enabled)"
+    synced="$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || echo unknown)"
+    timesync_status="$(timedatectl timesync-status 2>/dev/null || true)"
+    chrony_tracking="$(chronyc tracking 2>/dev/null || true)"
+    chrony_sources="$(chronyc sources -v 2>/dev/null || true)"
+
+    echo "Time synchronization diagnostics"
+    echo "  Active provider:    $active"
+    echo "  Enabled provider:   $enabled"
+    echo "  Synchronized:       $synced"
+    if [ -n "$timesync_status" ]; then
+        echo "  systemd-timesyncd:"
+        echo "$timesync_status" | sed 's/^/    /'
+    fi
+    if [ -n "$chrony_tracking" ]; then
+        echo "  chrony tracking:"
+        echo "$chrony_tracking" | sed 's/^/    /'
+    fi
+    if [ -n "$chrony_sources" ]; then
+        echo "  chrony sources:"
+        echo "$chrony_sources" | sed 's/^/    /'
+    fi
+
+    if platform_time_is_synchronized; then
+        echo "  Source availability: synchronized source reported"
+        echo "  Kerberos impact:     PASS"
+        echo "  Proposed correction: none"
+    else
+        echo "  Source availability: no synchronized source is currently reported"
+        echo "  Kerberos impact:     BLOCKED — clock skew can invalidate Kerberos"
+        echo "  Proposed correction: operator-approved repair of the active provider"
+        echo "                       after checking UDP/123 reachability and approved AD NTP sources"
+        echo "                       (no provider switch or NTP change is performed automatically)"
+    fi
+}
+
+platform_break_glass_is_local() {
+    awk -F: -v user="$DR_LOCAL_ADMIN_USER" '$1 == user { found=1 } END { exit(found ? 0 : 1) }' /etc/passwd 2>/dev/null
+}
+
+platform_validate_break_glass() {
+    local admin_group="$1"
+    local groups
+
+    echo "Break-glass account: $DR_LOCAL_ADMIN_USER"
+    if platform_break_glass_is_local; then
+        echo "Source: local"
+    else
+        echo "Source: missing or not local"
+        preflight_blocked "Break-glass account $DR_LOCAL_ADMIN_USER is not a local /etc/passwd account"
+        return 1
+    fi
+    echo "Administrator group: ${admin_group:-unavailable}"
+    echo "Password status: operator verification required"
+
+    groups="$(id -nG "$DR_LOCAL_ADMIN_USER" 2>/dev/null || true)"
+    if [ -n "$admin_group" ] && printf '%s\n' "$groups" | tr ' ' '\n' | grep -Fxq "$admin_group"; then
+        preflight_pass "Break-glass account $DR_LOCAL_ADMIN_USER is in native administrator group $admin_group"
+    else
+        preflight_blocked "Break-glass account $DR_LOCAL_ADMIN_USER is not in native administrator group ${admin_group:-<unknown>}"
+        return 1
+    fi
+    preflight_warning "Verify $DR_LOCAL_ADMIN_USER has a working local password and offline root access; no password test was performed"
+    return 0
+}
+
 preflight_pass() { printf 'PASS %s\n' "$*"; }
 preflight_warning() { printf 'WARNING %s\n' "$*"; }
 preflight_blocked() { PREFLIGHT_BLOCKERS=$((PREFLIGHT_BLOCKERS + 1)); printf 'BLOCKED %s\n' "$*"; }
 
 platform_preflight() {
-    local current_host dns_output ntp_synced
+    local current_host dns_output
     PREFLIGHT_BLOCKERS=0
     platform_report
 
@@ -679,20 +820,27 @@ platform_preflight() {
         preflight_blocked "No DNS server is visible in resolver state"
     fi
 
-    if [ "${DR_JOIN_TEST_MODE:-false}" = true ]; then
-        preflight_warning "Fixture test mode: external DNS and realm probes skipped"
-    elif command -v dig >/dev/null 2>&1; then
-        if timeout 5s dig +time=2 +tries=1 +short SRV "_kerberos._tcp.$DOMAIN" 2>/dev/null | grep -q .; then
-            preflight_pass "Kerberos SRV discovery works for $DOMAIN"
+    if [ "$PLATFORM_FAMILY" = "arch" ] && command -v nmcli >/dev/null 2>&1; then
+        local active_connection dns_search
+        active_connection="$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | awk -F: '$2 != "" {print $1; exit}')"
+        dns_search="$(nmcli -g ipv4.dns-search connection show "$active_connection" 2>/dev/null || true)"
+        if printf '%s\n' "$dns_search" | tr ',' '\n' | grep -Fxq "$DOMAIN"; then
+            preflight_pass "Active NetworkManager connection advertises the AD DNS search domain"
         else
-            preflight_blocked "Kerberos SRV discovery failed for $DOMAIN"
+            preflight_warning "Active NetworkManager connection does not yet advertise $DOMAIN; normal provisioning would propose the search-domain change"
         fi
-    else
-        preflight_blocked "dig is unavailable; cannot validate Kerberos SRV discovery"
     fi
 
-    ntp_synced="$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || true)"
-    if [ "$ntp_synced" = yes ] || chronyc tracking 2>/dev/null | grep -qE '^Leap status[[:space:]]*:[[:space:]]*Normal'; then
+    if [ "${DR_JOIN_TEST_MODE:-false}" = true ]; then
+        preflight_warning "Fixture test mode: external DNS and realm probes skipped"
+    elif platform_dns_srv_records "_kerberos._tcp.$DOMAIN" | grep -q .; then
+            preflight_pass "Kerberos SRV discovery works for $DOMAIN"
+    else
+        preflight_blocked "Kerberos SRV discovery failed for $DOMAIN"
+    fi
+
+    platform_time_diagnostics
+    if platform_time_is_synchronized; then
         preflight_pass "System clock is synchronized"
     else
         preflight_blocked "System clock is not synchronized; no time repair will be attempted"
@@ -706,18 +854,20 @@ platform_preflight() {
     fi
 
     if [ "${DR_JOIN_TEST_MODE:-false}" = true ]; then
-        preflight_warning "Fixture test mode: realm discovery skipped"
-    elif command -v realm >/dev/null 2>&1; then
-        if realm discover "$DOMAIN" >/dev/null 2>&1; then
-            preflight_pass "Realm discovery works for $DOMAIN"
-        else
-            preflight_blocked "Realm discovery failed for $DOMAIN"
-        fi
+        preflight_warning "Fixture test mode: domain discovery skipped"
+    elif platform_domain_discover; then
+        preflight_pass "Arch Samba or Debian realm discovery works for $DOMAIN"
     else
-        preflight_blocked "realm command is unavailable; realm discovery cannot run"
+        preflight_blocked "Domain discovery failed for $DOMAIN"
     fi
 
-    for command_name in realm adcli kinit smbclient mount.cifs automount visudo; do
+    local required_commands=(kinit smbclient mount.cifs visudo host)
+    if [ "$PLATFORM_FAMILY" = "debian" ]; then
+        required_commands+=(realm adcli automount)
+    else
+        required_commands+=(net testparm systemd-escape systemd-analyze)
+    fi
+    for command_name in "${required_commands[@]}"; do
         if command -v "$command_name" >/dev/null 2>&1; then
             preflight_pass "Required command available: $command_name"
         else
@@ -727,7 +877,9 @@ platform_preflight() {
 
     for command_name in ldapsearch sssctl; do
         if command -v "$command_name" >/dev/null 2>&1; then
-            preflight_pass "Required diagnostic command available: $command_name"
+            preflight_pass "Diagnostic/post-install command available: $command_name"
+        elif [ "$PLATFORM_FAMILY" = "arch" ] && { [ "$command_name" = ldapsearch ] || [ "$command_name" = sssctl ]; }; then
+            preflight_warning "$command_name is pending an available package and is not required for the Arch join command"
         else
             preflight_blocked "Required diagnostic command unavailable: $command_name"
         fi
@@ -746,11 +898,14 @@ platform_preflight() {
     else
         preflight_warning "No persistent state file exists yet: $STATE_FILE"
     fi
-    if getent passwd drone >/dev/null 2>&1; then
-        preflight_pass "Local break-glass account drone is present"
+
+    if platform_domain_is_joined; then
+        preflight_pass "Existing domain membership is present and machine-account probing completed"
     else
-        preflight_blocked "Local break-glass account drone is not present; no account will be created automatically"
+        preflight_pass "No existing domain membership detected; first-stage join path applies"
     fi
+    platform_admin_group >/dev/null
+    platform_validate_break_glass "$PLATFORM_ADMIN_GROUP" || true
 
     if [ "$(df -Pk / | awk 'NR==2 {print $4}')" -ge 5242880 ] 2>/dev/null; then
         preflight_pass "At least 5 GiB is available on /"
@@ -767,6 +922,11 @@ platform_preflight() {
         preflight_pass "State/backup parent directory exists: $STATE_DIR"
     else
         preflight_warning "State/backup parent directory does not exist yet: $STATE_DIR"
+    fi
+    if [ -d "$STATE_DIR/backups" ]; then
+        preflight_pass "Expected backup location exists: $STATE_DIR/backups"
+    else
+        preflight_warning "Expected backup location does not exist yet: $STATE_DIR/backups"
     fi
 
     if [ "$PREFLIGHT_BLOCKERS" -eq 0 ]; then
@@ -786,9 +946,16 @@ platform_dry_run() {
     echo "  WOULD CHANGE NetworkManager search domains; DNS servers remain DHCP/VPN unless explicit override is configured"
     echo "  WOULD CHANGE time configuration using the platform time-service adapter"
     echo "  WOULD CHANGE /etc/krb5.conf, /etc/sssd/sssd.conf, native PAM files, /etc/sudoers.d/*, /etc/samba/smb.conf, /etc/nsswitch.conf"
-    echo "  WOULD CHANGE /etc/auto.master.d/*, /etc/auto.net.cifs, /usr/local/bin/*, /usr/local/sbin/*, desktop integration files"
-    echo "  WOULD ENABLE/RESTART services: $(platform_service_name time-sync), sssd, winbind, autofs, $(platform_service_name ssh-server)"
-    echo "  WOULD JOIN realm: $DOMAIN only at the human credential checkpoint"
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        echo "  WOULD CHANGE /etc/systemd/system/mnt-x.mount and /etc/systemd/system/mnt-x.automount"
+        echo "  WOULD CHANGE /usr/local/bin/*, /usr/local/sbin/*, desktop integration files"
+        echo "  WOULD ENABLE/RESTART services: $(platform_service_name time-sync), sssd, $(platform_service_name ssh-server), mnt-x.automount"
+        echo "  WOULD JOIN with Samba: kinit (interactive), net ads join --use-kerberos=required, net ads testjoin, net ads keytab create"
+    else
+        echo "  WOULD CHANGE /etc/auto.master.d/*, /etc/auto.net.cifs, /usr/local/bin/*, /usr/local/sbin/*, desktop integration files"
+        echo "  WOULD ENABLE/RESTART services: $(platform_service_name time-sync), sssd, winbind, autofs, $(platform_service_name ssh-server)"
+        echo "  WOULD JOIN realm: $DOMAIN only at the human credential checkpoint"
+    fi
     echo "  WOULD NOT reboot, log out, restart a display manager, disable security controls, or run pacman -Syu"
     if [ "$PREFLIGHT_BLOCKERS" -gt 0 ] || [ "$PLATFORM_REPORT_BLOCKERS" -gt 0 ]; then
         echo "BLOCKED Dry-run plan is not executable until preflight blockers are resolved"
@@ -1233,7 +1400,7 @@ ensure_local_pam_survives_sssd_failure() {
 }
 
 disable_sssd_if_not_joined() {
-    if ! realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+    if ! platform_domain_is_joined; then
         if systemctl list-unit-files 2>/dev/null | grep -q '^sssd\.service'; then
             print_warning "Machine is not joined; disabling/stopping SSSD to protect local graphical login"
             systemctl disable --now sssd >/dev/null 2>&1 || true
@@ -1357,7 +1524,7 @@ machine_has_domain_identity() {
     # Treat either a configured realm or a populated machine keytab as domain
     # identity. This protects already-joined machines from silent hostname
     # changes that would invalidate the AD computer account/SPNs.
-    if command -v realm >/dev/null 2>&1 && realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+    if platform_domain_is_joined; then
         return 0
     fi
 
@@ -1560,18 +1727,13 @@ validate_or_fix_hostname() {
 
 
 validate_existing_join() {
-    if ! realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+    if ! platform_domain_is_joined; then
         return 1
     fi
 
     print_info "Existing domain membership detected; validating machine account..."
 
-    if ! command -v adcli >/dev/null 2>&1; then
-        print_warning "adcli is not available yet; skipping machine-account validation"
-        return 0
-    fi
-
-    if adcli testjoin -D "$DOMAIN" >/dev/null 2>&1; then
+    if platform_domain_testjoin; then
         print_info "Machine account validation succeeded"
         return 0
     fi
@@ -1603,9 +1765,354 @@ validate_existing_join() {
     return 1
 }
 
+platform_domain_discover() {
+    case "$PLATFORM_FAMILY" in
+        debian)
+            command -v realm >/dev/null 2>&1 && realm discover --verbose "$DOMAIN" >/dev/null 2>&1
+            ;;
+        arch)
+            local kerberos_records ldap_records
+            kerberos_records="$(platform_dns_srv_records "_kerberos._tcp.$DOMAIN")"
+            ldap_records="$(platform_dns_srv_records "_ldap._tcp.$DOMAIN")"
+            [ -n "$kerberos_records" ] && [ -n "$ldap_records" ] || return 1
+            printf '%s\n' "$kerberos_records" "$ldap_records"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+platform_dns_srv_records() {
+    local record="$1"
+    if command -v dig >/dev/null 2>&1; then
+        timeout 5s dig +time=2 +tries=1 +short SRV "$record" 2>/dev/null \
+            | awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /\.$/'
+    elif command -v host >/dev/null 2>&1; then
+        timeout 5s host -t SRV "$record" 2>/dev/null \
+            | awk '/has SRV record/ {print}'
+    fi
+}
+
+platform_domain_testjoin() {
+    case "$PLATFORM_FAMILY" in
+        debian)
+            adcli testjoin -D "$DOMAIN" >/dev/null 2>&1
+            ;;
+        arch)
+            command -v net >/dev/null 2>&1 || return 1
+            net ads testjoin >/dev/null 2>&1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+platform_domain_is_joined() {
+    case "$PLATFORM_FAMILY" in
+        debian)
+            realm list 2>/dev/null | grep -q "configured: kerberos-member"
+            ;;
+        arch)
+            [ -s /etc/krb5.keytab ] && platform_domain_testjoin
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+platform_domain_leave() {
+    case "$PLATFORM_FAMILY" in
+        debian)
+            realm leave "$DOMAIN"
+            ;;
+        arch)
+            print_warning "Arch leave requires an existing Kerberos administrator ticket."
+            net ads leave --use-kerberos=required
+            ;;
+        *)
+            print_error "No domain-leave adapter exists for platform family '$PLATFORM_FAMILY'"
+            return 1
+            ;;
+    esac
+}
+
+render_arch_smb_conf() {
+    cat << EOF
+[global]
+    workgroup = $WORKGROUP
+    realm = $REALM
+    security = ADS
+    client ipc signing = required
+    client min protocol = SMB2
+    idmap config * : backend = tdb
+    idmap config * : range = 100000-199999
+
+    # Samba 4.21+ removed net ads keytab add/delete.  The machine password is
+    # synchronized by the documented declarative keytab rule, then materialized
+    # with: net ads keytab create.
+    kerberos method = secrets only
+    sync machine password to keytab = /etc/krb5.keytab:spn_prefixes=host:account_name:sync_spns:sync_kvno:machine_password
+EOF
+}
+
+platform_generate_machine_keytab() {
+    case "$PLATFORM_FAMILY" in
+        debian)
+            print_info "Debian backend delegates keytab creation to realmd/adcli"
+            ;;
+        arch)
+            command -v net >/dev/null 2>&1 || {
+                print_error "Samba net utility is unavailable; cannot generate machine keytab"
+                return 1
+            }
+            print_info "Generating /etc/krb5.keytab with Samba 4.21+ keytab synchronization"
+            backup_config_file /etc/krb5.keytab
+            net ads keytab create
+            platform_validate_machine_keytab
+            ;;
+        *)
+            print_error "No machine-keytab adapter exists for platform family '$PLATFORM_FAMILY'"
+            return 1
+            ;;
+    esac
+}
+
+platform_validate_machine_keytab() {
+    [ -s /etc/krb5.keytab ] || {
+        print_error "/etc/krb5.keytab is missing or empty"
+        return 1
+    }
+    command -v klist >/dev/null 2>&1 || {
+        print_error "klist is unavailable; cannot validate /etc/krb5.keytab"
+        return 1
+    }
+    if ! klist -k /etc/krb5.keytab 2>/dev/null | grep -qi "$REALM"; then
+        print_error "/etc/krb5.keytab has no $REALM principal"
+        return 1
+    fi
+    print_info "Validated /etc/krb5.keytab for $REALM"
+}
+
+platform_domain_join_plan() {
+    case "$PLATFORM_FAMILY" in
+        debian)
+            cat << 'EOF'
+realm join -v DOMAIN -U ADMIN_USER
+adcli testjoin -D DOMAIN
+EOF
+            ;;
+        arch)
+            cat << 'EOF'
+kdestroy
+kinit ADMIN_USER@REALM                 # human enters password at Kerberos prompt
+net ads join --use-kerberos=required      # creates or updates the AD computer account
+net ads testjoin                         # validates local machine membership
+net ads keytab create                    # materializes /etc/krb5.keytab from smb.conf
+klist -k /etc/krb5.keytab
+EOF
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+platform_domain_join() {
+    local admin_user="${1:-}"
+    local kerberos_principal
+
+    case "$PLATFORM_FAMILY" in
+        debian)
+            realm join -v "$DOMAIN" -U "$admin_user"
+            ;;
+        arch)
+            if [ -z "$admin_user" ]; then
+                read -r -p "Domain admin username: " admin_user
+            fi
+            case "$admin_user" in
+                *@*) kerberos_principal="$admin_user" ;;
+                *) kerberos_principal="${admin_user}@${REALM}" ;;
+            esac
+            [ -n "$admin_user" ] || {
+                print_error "Domain admin username is required"
+                return 1
+            }
+            kdestroy >/dev/null 2>&1 || true
+            print_info "Obtaining a Kerberos ticket for $kerberos_principal; the password is entered directly into kinit"
+            kinit "$kerberos_principal" || return 1
+            net ads join --use-kerberos=required || return 1
+            platform_domain_testjoin || return 1
+            platform_generate_machine_keytab || return 1
+            platform_validate_machine_keytab
+            ;;
+        *)
+            print_error "No domain-join adapter exists for platform family '$PLATFORM_FAMILY'"
+            return 1
+            ;;
+    esac
+}
+
+install_arch_domain_admin_join_helper() {
+    local helper="/usr/local/sbin/dr-domain-admin-join"
+    local motd="/etc/update-motd.d/99-dr-domain-join"
+    local profiled="/etc/profile.d/dr-domain-join.sh"
+
+    mkdir -p /usr/local/sbin /etc/update-motd.d /etc/profile.d
+    backup_config_file "$helper"
+    backup_config_file "$motd"
+    backup_config_file "$profiled"
+
+    cat > "$helper" << EOF
+#!/bin/bash
+set -euo pipefail
+
+DOMAIN="$DOMAIN"
+REALM="$REALM"
+OFFICE_CODE="${OFFICE_CODE:-EP1}"
+SCRIPT_VERSION="$SCRIPT_VERSION"
+STATE_DIR="$STATE_DIR"
+STATE_FILE="$STATE_FILE"
+SMB_CONF="/etc/samba/smb.conf"
+KEYTAB="/etc/krb5.keytab"
+
+print_info() { echo "[INFO] \$*"; }
+print_warn() { echo "[WARN] \$*" >&2; }
+print_error() { echo "[ERROR] \$*" >&2; }
+
+save_join_state() {
+    mkdir -p "\$STATE_DIR"
+    chmod 755 "\$STATE_DIR"
+    cat > "\$STATE_FILE" << STATEEOF
+SCRIPT_VERSION="\$SCRIPT_VERSION"
+STAGE="\${1:-DOMAIN_JOIN_COMPLETE}"
+OFFICE_CODE="\$OFFICE_CODE"
+DOMAIN="\$DOMAIN"
+TARGET_HOSTNAME="\${2:-}"
+HOSTNAME_CHANGED="0"
+STATEEOF
+    chmod 600 "\$STATE_FILE"
+}
+
+cleanup_local_join_state() {
+    print_warn "Explicit rollback requested for the local Arch join state."
+    if klist -s 2>/dev/null; then
+        net ads leave --use-kerberos=required || print_warn "Samba could not remove the AD computer account; verify it with the domain administrator."
+    else
+        print_warn "No Kerberos ticket is available; the AD computer object was not changed by rollback."
+    fi
+    rm -f "\$KEYTAB"
+    rm -rf /var/lib/sss/db/* /var/lib/sss/mc/* 2>/dev/null || true
+    systemctl disable --now sssd >/dev/null 2>&1 || true
+    save_join_state "WAITING_FOR_ADMIN" "\$(hostnamectl --static 2>/dev/null || hostname)"
+    print_info "Local keytab, SSSD cache, and SSSD enablement were removed."
+}
+
+if [ "\$(id -u)" -ne 0 ]; then
+    print_error "Run this helper with sudo: sudo /usr/local/sbin/dr-domain-admin-join"
+    exit 1
+fi
+
+for required in net kinit klist hostnamectl testparm; do
+    if ! command -v "\$required" >/dev/null 2>&1; then
+        print_error "Required Arch join command not found: \$required"
+        print_error "Have the technician rerun the candidate after the approved dependency checkpoint."
+        exit 1
+    fi
+done
+
+testparm -s "\$SMB_CONF" >/dev/null
+current_host="\$(hostnamectl --static 2>/dev/null || hostname)"
+echo "Current hostname: \$current_host"
+echo "Domain:           \$DOMAIN"
+echo "Office code:      \$OFFICE_CODE"
+echo "Join backend:     Samba ADS (SSSD remains the NSS/PAM provider)"
+echo ""
+
+if [ -s "\$KEYTAB" ] && net ads testjoin >/dev/null 2>&1; then
+    print_info "Existing Samba machine membership is valid."
+    save_join_state "DOMAIN_JOIN_COMPLETE" "\$current_host"
+    exit 0
+fi
+
+echo "Enter the domain admin username that may create or update the AD computer account."
+read -r -p "Domain admin username: " admin_user
+[ -n "\$admin_user" ] || { print_error "Domain admin username is required."; exit 1; }
+case "\$admin_user" in
+    *@*) kerberos_principal="\$admin_user" ;;
+    *) kerberos_principal="\${admin_user}@\${REALM}" ;;
+esac
+
+echo ""
+print_info "Obtaining a Kerberos ticket for \$kerberos_principal."
+print_info "Enter the password directly at the kinit prompt; it is not captured by this helper."
+kdestroy >/dev/null 2>&1 || true
+kinit "\$kerberos_principal"
+
+print_info "Joining the AD domain with Samba's Kerberos ticket."
+net ads join --use-kerberos=required
+print_info "Validating the local machine membership."
+if ! net ads testjoin; then
+    print_error "Samba joined, but net ads testjoin failed."
+    read -r -p "Explicitly leave the local/domain join now? [y/N]: " cleanup
+    case "\${cleanup:-N}" in
+        y|Y|yes|YES) cleanup_local_join_state ;;
+        *) print_warn "Leaving local join material in place for administrator diagnosis." ;;
+    esac
+    exit 1
+fi
+
+print_info "Generating the system keytab using Samba's 4.21+ synchronization rule."
+net ads keytab create
+klist -k "\$KEYTAB" | grep -qi "\$REALM"
+chmod 600 "\$KEYTAB"
+save_join_state "DOMAIN_JOIN_COMPLETE" "\$current_host"
+print_info "Join is OK and \$KEYTAB is valid."
+echo ""
+echo "Rerun the candidate provisioning script locally to configure SSSD, PAM, sudo, and Tool Server mounting."
+EOF
+    chmod 755 "$helper"
+    chown root:root "$helper"
+
+    cat > "$motd" << 'EOF'
+#!/bin/sh
+if command -v net >/dev/null 2>&1 && net ads testjoin >/dev/null 2>&1; then
+    exit 0
+fi
+if [ -x /usr/local/sbin/dr-domain-admin-join ]; then
+    echo "DR Domain Join Pending: sudo /usr/local/sbin/dr-domain-admin-join"
+fi
+EOF
+    chmod 755 "$motd"
+    chown root:root "$motd"
+
+    cat > "$profiled" << 'EOF'
+#!/bin/sh
+case "$-" in *i*) ;; *) return 0 2>/dev/null || exit 0 ;; esac
+if [ -x /usr/local/sbin/dr-domain-admin-join ] && ! net ads testjoin >/dev/null 2>&1; then
+    echo "DR Domain Join Pending: sudo /usr/local/sbin/dr-domain-admin-join"
+fi
+EOF
+    chmod 644 "$profiled"
+    chown root:root "$profiled"
+
+    cat > /etc/motd << 'EOF'
+DR Domain Join Pending
+Run: sudo /usr/local/sbin/dr-domain-admin-join
+EOF
+
+    print_info "Installed Arch Samba domain-admin join helper: $helper"
+}
+
 
 
 install_domain_admin_join_helper() {
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        install_arch_domain_admin_join_helper
+        return
+    fi
     local helper="/usr/local/sbin/dr-domain-admin-join"
     local motd="/etc/update-motd.d/99-dr-domain-join"
     local profiled="/etc/profile.d/dr-domain-join.sh"
@@ -2231,9 +2738,9 @@ print_machine_status() {
     echo "=========================================="
     echo "  Hostname: $(hostnamectl --static 2>/dev/null || hostname)"
     echo "  Domain:   $DOMAIN"
-    if realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+    if platform_domain_is_joined; then
         echo "  Realm:    Joined"
-        if command -v adcli >/dev/null 2>&1 && adcli testjoin -D "$DOMAIN" >/dev/null 2>&1; then
+        if platform_domain_testjoin; then
             echo "  Machine Account: VALID"
         else
             echo "  Machine Account: NOT VALIDATED"
@@ -2374,11 +2881,10 @@ install_domain_packages() {
     if [ "$PLATFORM_FAMILY" = "arch" ]; then
         # No pacman -Syu is performed here. The configured sync databases are
         # inspected and only the mapped capabilities are installed with
-        # --needed. Missing realmd/adcli/autofs are intentional blockers until
-        # an approved repository/package source is available.
+        # --needed. Arch joins use Samba ADS and systemd automount, so realmd,
+        # adcli, and userspace autofs are deliberately not requested.
         platform_install_packages \
-            realmd sssd sssd-tools adcli kerberos samba cifs autofs time-sync \
-            dns ldap ssh-server desktop-helper || return 1
+            sssd kerberos samba smbclient cifs time-sync dns pam sudo ssh-server || return 1
         return 0
     fi
 
@@ -2949,7 +3455,10 @@ configure_fqdn() {
 verify_ad_discovery() {
     print_info "Verifying Active Directory discovery for $DOMAIN..."
 
-    if realm discover --verbose "$DOMAIN"; then
+    if [ "$PLATFORM_FAMILY" = "debian" ] && realm discover --verbose "$DOMAIN"; then
+        print_info "Active Directory discovery successful"
+        return 0
+    elif [ "$PLATFORM_FAMILY" = "arch" ] && platform_domain_discover; then
         print_info "Active Directory discovery successful"
         return 0
     fi
@@ -3018,13 +3527,22 @@ print_ssh_handoff() {
 # automatically. On Ubuntu, --stdin is supported and used directly.
 
 join_domain() {
-    if realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+    if platform_domain_is_joined; then
         print_info "Machine is already joined to $DOMAIN — skipping join"
         return 0
     fi
 
-    if ! verify_ad_discovery; then
+    if [ "$PLATFORM_FAMILY" = "debian" ]; then
+        verify_ad_discovery || exit 1
+    elif ! platform_domain_discover; then
         exit 1
+    fi
+
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        # Samba must have its 4.21+ keytab policy in place before the admin
+        # helper runs. This writes only smb.conf after the normal preflight
+        # checkpoint; the helper remains the credential boundary.
+        configure_samba
     fi
 
     echo ""
@@ -3038,7 +3556,11 @@ join_domain() {
     echo ""
     echo "    sudo /usr/local/sbin/dr-domain-admin-join"
     echo ""
-    echo "  The helper will allocate the final hostname from Active Directory, rename the workstation, join the domain, and validate with adcli testjoin."
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        echo "  The helper will obtain a Kerberos ticket interactively, join with net ads join --use-kerberos=required, validate with net ads testjoin, and create /etc/krb5.keytab with net ads keytab create."
+    else
+        echo "  The helper will allocate the final hostname from Active Directory, rename the workstation, join the domain, and validate with adcli testjoin."
+    fi
     echo ""
     echo "  Once the helper reports 'Join is OK', re-run this script to complete configuration:"
     echo ""
@@ -3143,6 +3665,10 @@ configure_pam_mkhomedir() {
 # ── Allow all domain users to log in ─────────────────────────────────────────
 
 configure_realm_permissions() {
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        print_info "Arch backend uses SSSD's access_provider=simple; no realm permit command is required"
+        return 0
+    fi
     print_info "Configuring realm login permissions..."
     realm permit --all
 }
@@ -3206,12 +3732,25 @@ ad_enable_gc = false
 krb5_renewable_lifetime = 7d
 krb5_renew_interval = 1h
 krb5_ccname_template = FILE:/tmp/krb5cc_%U
+ldap_id_mapping = True
+cache_credentials = True
+fallback_homedir = /home/%u
 EOF
 }
 
 configure_sssd_settings() {
     local sssd_conf="/etc/sssd/sssd.conf"
     print_info "Applying SSSD settings ($sssd_conf)..."
+
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        mkdir -p "$(dirname "$sssd_conf")"
+        backup_config_file "$sssd_conf"
+        render_sssd_config > "$sssd_conf"
+        chmod 600 "$sssd_conf"
+        chown root:root "$sssd_conf"
+        print_info "Generated native Arch SSSD AD-provider configuration"
+        return 0
+    fi
 
     if [ ! -f "$sssd_conf" ]; then
         print_warning "$sssd_conf not found — skipping SSSD settings (realm join may not have run)"
@@ -3351,8 +3890,13 @@ stage_generated_configurations() {
     mkdir -p "$stage_dir"
     render_krb5_config > "$stage_dir/krb5.conf"
     render_sssd_config > "$stage_dir/sssd.conf"
-    render_autofs_master_maps > "$stage_dir/auto.master"
-    render_autofs_cifs_map > "$stage_dir/auto.net.cifs"
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        render_arch_tools_mount_unit "/mnt/x" "$TOOLS_SERVER" > "$stage_dir/mnt-x.mount"
+        render_arch_tools_automount_unit "/mnt/x" > "$stage_dir/mnt-x.automount"
+    else
+        render_autofs_master_maps > "$stage_dir/auto.master"
+        render_autofs_cifs_map > "$stage_dir/auto.net.cifs"
+    fi
     render_workstation_sudoers > "$stage_dir/sudoers.d-zz-dr_workstation_users"
     render_arch_pam_sss_lines > "$stage_dir/system-auth-adapter.lines"
     chmod 600 "$stage_dir/krb5.conf" "$stage_dir/sssd.conf"
@@ -3531,10 +4075,12 @@ verify() {
     echo "Ontrack Recovery Workstation verification"
     echo ""
 
-    if realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+    if command -v net >/dev/null 2>&1 && [ -s /etc/krb5.keytab ] && net ads testjoin >/dev/null 2>&1; then
+        echo "[OK] Samba ADS membership is configured"
+    elif command -v realm >/dev/null 2>&1 && realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
         echo "[OK] Realm membership is configured"
     else
-        echo "[FAIL] Realm membership is not configured"
+        echo "[FAIL] Domain membership is not configured"
         failed=1
     fi
 
@@ -3552,7 +4098,9 @@ verify() {
         failed=1
     fi
 
-    if adcli testjoin -D "$DOMAIN" >/dev/null 2>&1; then
+    if command -v net >/dev/null 2>&1 && net ads testjoin >/dev/null 2>&1; then
+        echo "[OK] Machine account trust is valid"
+    elif command -v adcli >/dev/null 2>&1 && adcli testjoin -D "$DOMAIN" >/dev/null 2>&1; then
         echo "[OK] Machine account trust is valid"
     else
         echo "[FAIL] Machine account trust could not be validated"
@@ -3776,6 +4324,11 @@ EOF2
 }
 
 if [ "\${1:-}" = "--sudo-self-test" ]; then
+    exit 0
+fi
+
+if [ "\${1:-}" = "--start-only" ]; then
+    systemctl start "\$AUTOMOUNT_UNIT"
     exit 0
 fi
 
@@ -4314,7 +4867,7 @@ If the Tool Server is not connected, run:
 
 For workstation diagnostics, run:
   hostnamectl
-  realm list
+  net ads testjoin 2>/dev/null || realm list
   findmnt /mnt/x
 EOF2
 
@@ -4405,9 +4958,172 @@ printf -- '-fstype=autofs\tfile:%s\n' "$mapfile"
 EOF
 }
 
+tools_mount_unit_name() {
+    command -v systemd-escape >/dev/null 2>&1 || return 1
+    systemd-escape --path --suffix=mount "${1:-/mnt/x}"
+}
+
+tools_automount_unit_name() {
+    command -v systemd-escape >/dev/null 2>&1 || return 1
+    systemd-escape --path --suffix=automount "${1:-/mnt/x}"
+}
+
+render_arch_tools_mount_unit() {
+    local mount_point="${1:-/mnt/x}"
+    local server="${2:-$TOOLS_SERVER}"
+    cat << EOF
+[Unit]
+Description=DR Tool Server CIFS mount
+Wants=network-online.target
+After=network-online.target
+
+[Mount]
+What=//$server/Tools
+Where=$mount_point
+Type=cifs
+Options=_netdev,nofail,sec=krb5,multiuser,vers=3.0
+TimeoutSec=30s
+EOF
+}
+
+render_arch_tools_automount_unit() {
+    local mount_point="${1:-/mnt/x}"
+    cat << EOF
+[Unit]
+Description=On-demand DR Tool Server CIFS automount
+
+[Automount]
+Where=$mount_point
+TimeoutIdleSec=300s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+platform_verify_tools_mount() {
+    local mount_unit automount_unit
+    mount_unit="$(tools_mount_unit_name)" || return 1
+    automount_unit="$(tools_automount_unit_name)" || return 1
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        [ -f "/etc/systemd/system/$mount_unit" ] || return 1
+        [ -f "/etc/systemd/system/$automount_unit" ] || return 1
+        systemd-analyze verify "/etc/systemd/system/$mount_unit" "/etc/systemd/system/$automount_unit" >/dev/null 2>&1
+        systemctl is-enabled --quiet "$automount_unit" 2>/dev/null
+    else
+        command -v automount >/dev/null 2>&1 && systemctl is-active --quiet autofs
+    fi
+}
+
+platform_start_tools_mount() {
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        local automount_unit
+        automount_unit="$(tools_automount_unit_name)" || return 1
+        systemctl start "$automount_unit"
+        return 0
+    fi
+    systemctl start autofs
+}
+
+platform_stop_tools_mount() {
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        local mount_unit automount_unit
+        mount_unit="$(tools_mount_unit_name)" || return 1
+        automount_unit="$(tools_automount_unit_name)" || return 1
+        systemctl stop "$mount_unit" "$automount_unit"
+        return 0
+    fi
+    systemctl stop autofs
+}
+
+platform_remove_tools_mount() {
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        local mount_unit automount_unit
+        mount_unit="$(tools_mount_unit_name)" || return 1
+        automount_unit="$(tools_automount_unit_name)" || return 1
+        systemctl disable --now "$automount_unit" >/dev/null 2>&1 || true
+        systemctl stop "$mount_unit" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/$mount_unit" "/etc/systemd/system/$automount_unit"
+        systemctl daemon-reload
+        print_info "Removed Arch Tool Server systemd mount and automount units"
+        return 0
+    fi
+    systemctl disable --now autofs
+}
+
+platform_install_tools_mount() {
+    if [ "$PLATFORM_FAMILY" != "arch" ]; then
+        return 0
+    fi
+
+    local mount_unit automount_unit
+    mount_unit="$(tools_mount_unit_name)" || {
+        print_error "systemd-escape is required to name the Tool Server mount unit"
+        return 1
+    }
+    automount_unit="$(tools_automount_unit_name)" || return 1
+    mkdir -p /mnt/x
+    backup_config_file "/etc/systemd/system/$mount_unit"
+    backup_config_file "/etc/systemd/system/$automount_unit"
+    render_arch_tools_mount_unit "/mnt/x" "$TOOLS_SERVER" > "/etc/systemd/system/$mount_unit"
+    render_arch_tools_automount_unit "/mnt/x" > "/etc/systemd/system/$automount_unit"
+    chmod 644 "/etc/systemd/system/$mount_unit" "/etc/systemd/system/$automount_unit"
+    systemd-analyze verify "/etc/systemd/system/$mount_unit" "/etc/systemd/system/$automount_unit"
+    systemctl daemon-reload
+    systemctl enable "$automount_unit" >/dev/null
+    print_info "Installed on-demand systemd CIFS units: $mount_unit, $automount_unit"
+}
+
+install_arch_tools_mount_helper() {
+    cat > /usr/local/bin/mount-kit-tools << EOF
+#!/bin/bash
+set -euo pipefail
+
+MOUNT_POINT="/mnt/x"
+AUTOMOUNT_UNIT="$(tools_automount_unit_name)"
+
+if [ "\${1:-}" = "--sudo-self-test" ]; then
+    exit 0
+fi
+
+if [ "\$(id -u)" -ne 0 ]; then
+    if ! sudo -n /usr/local/bin/mount-kit-tools --sudo-self-test >/dev/null 2>&1; then
+        CURRENT_USER="\$(id -un)"
+        echo "This domain account does not have permission to mount the Tool Server." >&2
+        echo "Run: su - $DR_LOCAL_ADMIN_USER; sudo dr-workstation add-user \$CURRENT_USER; exit" >&2
+        exit 1
+    fi
+    sudo -n /usr/local/bin/mount-kit-tools --start-only
+    if ! timeout 30s ls -la "\$MOUNT_POINT" >/dev/null 2>&1; then
+        echo "Tool Server access failed. Ensure the logged-in user has a valid Kerberos ticket." >&2
+        exit 1
+    fi
+    mountpoint -q "\$MOUNT_POINT"
+    exit 0
+fi
+
+mkdir -p "\$MOUNT_POINT"
+systemctl start "\$AUTOMOUNT_UNIT"
+if mountpoint -q "\$MOUNT_POINT"; then
+    exit 0
+fi
+
+if ! timeout 30s ls -la "\$MOUNT_POINT" >/dev/null 2>&1; then
+    echo "Tool Server access failed. Ensure the logged-in user has a valid Kerberos ticket." >&2
+    exit 1
+fi
+mountpoint -q "\$MOUNT_POINT"
+EOF
+    chmod 755 /usr/local/bin/mount-kit-tools
+    chown root:root /usr/local/bin/mount-kit-tools
+}
+
 configure_autofs_cifs() {
     print_info "Configuring CIFS access for DRIP and KIT tools..."
 
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        platform_install_tools_mount
+    else
     # DRIP image paths still use dynamic autofs maps:
     #   /smb/<server>/<share>/...
     #   /net/<server>/<share>/...
@@ -4440,10 +5156,14 @@ configure_autofs_cifs() {
     render_autofs_cifs_map > /etc/auto.net.cifs
 
     chmod +x /etc/auto.net.cifs
+    fi
 
     # Fixed KIT tools mount helper. This preserves the expected path:
     #   /mnt/x -> //TOOLS_SERVER/Tools
     # but avoids depending on autofs for the fixed mount point.
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        install_arch_tools_mount_helper
+    else
     cat > /usr/local/bin/mount-kit-tools << EOF
 #!/bin/bash
 set -e
@@ -4468,7 +5188,7 @@ if [ "\$(id -u)" -ne 0 ]; then
         echo "This domain account does not have permission to mount the Tool Server." >&2
         echo "" >&2
         echo "Run the following commands:" >&2
-        echo "  su - drone" >&2
+        echo "  su - $DR_LOCAL_ADMIN_USER" >&2
         echo "  sudo dr-workstation add-user \$CURRENT_USER" >&2
         echo "  exit" >&2
         echo "" >&2
@@ -4505,9 +5225,10 @@ if ! KRB5CCNAME="FILE:/tmp/krb5cc_\$CRUID" klist -s 2>/dev/null && ! klist -s 2>
     exit 1
 fi
 
-mount -t cifs "\$SHARE" "\$MOUNT_POINT" -o sec=krb5,cruid=\$CRUID,vers=3.0
+    mount -t cifs "\$SHARE" "\$MOUNT_POINT" -o sec=krb5,cruid=\$CRUID,vers=3.0
 EOF
     chmod +x /usr/local/bin/mount-kit-tools
+    fi
 
     # User-facing wrapper. The post-join script installs a tightly scoped
     # sudoers rule that allows only /usr/local/bin/mount-kit-tools to run
@@ -4647,7 +5368,7 @@ else
     if ! sudo -n /usr/local/bin/mount-kit-tools --sudo-self-test >/dev/null 2>&1; then
         current_user="$(id -un)"
         echo "If this account is not yet authorized, run:"
-        echo "  su - drone"
+        echo "  su - $DR_LOCAL_ADMIN_USER"
         echo "  sudo dr-workstation add-user $current_user"
         echo "  exit"
         echo "Then log out and back in."
@@ -4810,27 +5531,35 @@ EOF
         fi
     fi
 
-    # Ensure 'files' is first in the automount nsswitch lookup order.
-    # realm join often sets "automount: sss", which causes autofs to query LDAP
-    # for the master map and ignore /etc/auto.master.d/ entirely.
-    local nsswitch="/etc/nsswitch.conf"
-    local automount_line
-    automount_line=$(grep '^automount:' "$nsswitch" 2>/dev/null || true)
-    if [ -z "$automount_line" ]; then
-        echo "automount: files" >> "$nsswitch"
-        print_info "Added 'automount: files' to $nsswitch"
-    elif ! echo "$automount_line" | grep -qE '^automount:\s*files'; then
-        sed -i 's/^automount:.*/automount: files sss/' "$nsswitch"
-        print_info "Reordered automount lookup in $nsswitch — files first"
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        platform_start_tools_mount
+        if platform_verify_tools_mount; then
+            print_info "Systemd Tool Server automount is enabled and unit verification passed"
+        else
+            print_warning "Systemd Tool Server unit is installed but could not be fully verified"
+        fi
     else
-        print_info "automount lookup order already correct in $nsswitch"
+        # Ensure 'files' is first in the automount nsswitch lookup order.
+        # realm join often sets "automount: sss", which causes autofs to query LDAP
+        # for the master map and ignore /etc/auto.master.d/ entirely.
+        local nsswitch="/etc/nsswitch.conf"
+        local automount_line
+        automount_line=$(grep '^automount:' "$nsswitch" 2>/dev/null || true)
+        if [ -z "$automount_line" ]; then
+            echo "automount: files" >> "$nsswitch"
+            print_info "Added 'automount: files' to $nsswitch"
+        elif ! echo "$automount_line" | grep -qE '^automount:\s*files'; then
+            sed -i 's/^automount:.*/automount: files sss/' "$nsswitch"
+            print_info "Reordered automount lookup in $nsswitch — files first"
+        else
+            print_info "automount lookup order already correct in $nsswitch"
+        fi
+
+        systemctl daemon-reload
+        systemctl enable autofs > /dev/null 2>&1
+        systemctl restart autofs
+        print_info "DRIP autofs configured — /smb/<server>/<share>/ and /net/<server>/<share>/"
     fi
-
-    systemctl daemon-reload
-    systemctl enable autofs > /dev/null 2>&1
-    systemctl restart autofs
-
-    print_info "DRIP autofs configured — /smb/<server>/<share>/ and /net/<server>/<share>/"
     print_info "KIT tools mount helper configured — run: mount-kit-tools"
     print_info "KIT tools path after helper runs: /mnt/x (${TOOLS_SERVER}/Tools)"
 
@@ -4935,6 +5664,20 @@ configure_samba() {
     local smb_conf="/etc/samba/smb.conf"
     print_info "Configuring $smb_conf..."
 
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        backup_config_file "$smb_conf"
+        mkdir -p "$(dirname "$smb_conf")"
+        render_arch_smb_conf > "$smb_conf"
+        chmod 644 "$smb_conf"
+        chown root:root "$smb_conf"
+        if ! testparm -s "$smb_conf" >/dev/null 2>&1; then
+            print_error "Generated Arch Samba configuration failed testparm"
+            return 1
+        fi
+        print_info "Installed Samba ADS configuration with documented 4.21+ keytab synchronization"
+        return 0
+    fi
+
     if [ ! -f "$smb_conf" ]; then
         mkdir -p "$(dirname "$smb_conf")"
         printf '[global]\n' > "$smb_conf"
@@ -4975,6 +5718,10 @@ configure_samba() {
 # ── Configure NetBIOS name resolution via winbind ─────────────────────────────
 
 configure_wins_resolution() {
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        print_info "Arch backend leaves NSS host resolution unchanged; winbind/WINS is not required"
+        return 0
+    fi
     local nsswitch="/etc/nsswitch.conf"
     print_info "Configuring NetBIOS name resolution..."
 
@@ -4994,6 +5741,10 @@ configure_wins_resolution() {
 # ── Enable and start winbind ──────────────────────────────────────────────────
 
 enable_winbind() {
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        print_info "Arch backend does not enable winbind; SSSD provides NSS, PAM, identity, and group resolution"
+        return 0
+    fi
     print_info "Enabling winbind service..."
     systemctl enable winbind > /dev/null 2>&1
     systemctl restart winbind
@@ -5105,11 +5856,15 @@ check_display_manager() {
 verify_join() {
     print_info "Verifying domain join..."
 
-    if ! realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+    if ! platform_domain_is_joined; then
         print_error "Domain join verification failed — machine does not appear to be joined"
         return 1
     fi
     print_info "Domain join verified: $DOMAIN"
+
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        platform_validate_machine_keytab || return 1
+    fi
 
     if ! systemctl is-active --quiet sssd 2>/dev/null; then
         print_error "SSSD is not running — domain logins will fail"
@@ -5304,8 +6059,8 @@ main() {
     print_machine_status
 
     # --- Summary ---
-    if realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
-    validate_existing_join || exit 1
+    if platform_domain_is_joined; then
+        validate_existing_join || exit 1
         echo "  This machine is already joined to $DOMAIN."
         echo "  This run will complete all remaining post-join configuration."
         echo "  You will be prompted once during the run to optionally grant"
@@ -5343,7 +6098,7 @@ main() {
     echo ""
 
     if ! platform_preflight; then
-        print_error "Read-only preflight did not pass; no hostname, DNS, package, PAM, SSSD, sudoers, autofs, or realm changes will be made."
+        print_error "Read-only preflight did not pass; no hostname, DNS, package, PAM, SSSD, sudoers, mount, or domain-membership changes will be made."
         exit 2
     fi
 
