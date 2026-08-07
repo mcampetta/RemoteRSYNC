@@ -173,6 +173,192 @@ test_renderers() {
     pass "generated machine-renewal units validate"
 }
 
+test_time_provider_and_timesyncd() {
+    local fake_bin case_dir target output provider_text
+    fake_bin="$TMP_DIR/time-fake-bin"
+    mkdir -p "$fake_bin"
+    cat > "$fake_bin/systemctl" << 'EOF'
+#!/bin/bash
+case "${1:-}" in
+    is-active)
+        [ "${TIME_ACTIVE:-none}" = "${!#}" ]
+        ;;
+    is-enabled)
+        [ "${TIME_ENABLED:-none}" = "${!#}" ]
+        ;;
+    restart)
+        printf '%s\n' "$*" >> "${TIME_SYSTEMCTL_LOG:?}"
+        exit 0
+        ;;
+    *) exit 0 ;;
+esac
+EOF
+    cat > "$fake_bin/timedatectl" << 'EOF'
+#!/bin/bash
+case "${1:-}" in
+    show)
+        [ "${TIME_SYNC_BAD:-0}" != 1 ] && printf 'yes\n' || printf 'no\n'
+        ;;
+    timesync-status)
+        [ "${TIME_SYNC_BAD:-0}" != 1 ] && printf 'Server: 10.59.4.201\nStratum: 3\n' || printf 'Server: time.google.com\n'
+        ;;
+    *) exit 0 ;;
+esac
+EOF
+    cat > "$fake_bin/systemd-analyze" << 'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "${TIME_ANALYZE_LOG:?}"
+exit 0
+EOF
+    chmod 755 "$fake_bin"/*
+
+    provider_text="$(PATH="$fake_bin:$PATH" TIME_ACTIVE=systemd-timesyncd TIME_ENABLED=systemd-timesyncd TIME_SYSTEMCTL_LOG="$TMP_DIR/time-systemctl.log" TIME_ANALYZE_LOG="$TMP_DIR/time-analyze.log" DR_JOIN_STATE_DIR="$TMP_DIR/time-provider-report" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_capability_status time-sync; printf 'selected=%s active=%s enabled=%s\\n' \"\$(platform_time_provider selected)\" \"\$(platform_time_provider active)\" \"\$(platform_time_provider enabled)\"")"
+    assert_contains "$provider_text" 'PASS|time-sync|existing selected provider is active or enabled (systemd-timesyncd)' "timesyncd is reported as the selected provider when chrony is absent"
+    assert_contains "$provider_text" 'selected=systemd-timesyncd' "timesyncd selection is explicit"
+    if printf '%s\n' "$provider_text" | grep -Fq chrony; then
+        fail "timesyncd capability reporting must not label the provider chrony"
+    fi
+    pass "timesyncd capability reporting uses the actual selected provider"
+
+    output="$(PATH="$fake_bin:$PATH" TIME_ACTIVE=chronyd TIME_ENABLED=chronyd TIME_SYSTEMCTL_LOG="$TMP_DIR/chrony-systemctl.log" TIME_ANALYZE_LOG="$TMP_DIR/chrony-analyze.log" DR_JOIN_STATE_DIR="$TMP_DIR/chrony-report" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_capability_status time-sync; platform_time_provider selected")"
+    assert_contains "$output" 'PASS|time-sync|existing selected provider is active or enabled (chronyd)' "chrony is reported when chrony is selected"
+    assert_contains "$output" 'chronyd' "chrony selected provider is visible"
+    pass "chrony capability reporting remains available"
+
+    output="$(PATH="$fake_bin:$PATH" TIME_ACTIVE=none TIME_ENABLED=none TIME_SYSTEMCTL_LOG="$TMP_DIR/no-time-systemctl.log" TIME_ANALYZE_LOG="$TMP_DIR/no-time-analyze.log" DR_JOIN_STATE_DIR="$TMP_DIR/no-time-report" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_time_provider selected")"
+    assert_eq "none" "$output" "no active or enabled time provider is reported as none"
+
+    output="$(PATH="$fake_bin:$PATH" TIME_ACTIVE=systemd-timesyncd TIME_ENABLED=systemd-timesyncd TIME_SYSTEMCTL_LOG="$TMP_DIR/both-systemctl.log" TIME_ANALYZE_LOG="$TMP_DIR/both-analyze.log" DR_JOIN_STATE_DIR="$TMP_DIR/both-report" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_time_provider selected")"
+    assert_eq "systemd-timesyncd" "$output" "timesyncd remains selected when chrony is also installed but not selected"
+
+    case_dir="$TMP_DIR/timesyncd-config"
+    target="$case_dir/90-dr-domain.conf"
+    mkdir -p "$case_dir"
+    printf '%s\n' '[Time]' 'NTP=time.cloudflare.com' 'FallbackNTP=time.google.com' > "$target"
+    : > "$case_dir/systemctl.log"
+    : > "$case_dir/analyze.log"
+    PATH="$fake_bin:$PATH" TIME_ACTIVE=systemd-timesyncd TIME_ENABLED=systemd-timesyncd \
+        TIME_SYSTEMCTL_LOG="$case_dir/systemctl.log" TIME_ANALYZE_LOG="$case_dir/analyze.log" \
+        DR_TIMESYNCD_DROPIN="$target" OFFICE_CODE=EP1 DR_TIME_SYNC_RETRIES=1 DR_TIME_SYNC_RETRY_DELAY=0 \
+        DR_JOIN_STATE_DIR="$case_dir/state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; OFFICE_CODE=EP1; platform_configure_timesyncd force" || fail "timesyncd configuration succeeds with corporate source"
+    assert_contains "$(<"$target")" 'NTP=' "timesyncd override resets the accumulated NTP list"
+    assert_contains "$(<"$target")" 'NTP=10.59.4.201 10.59.4.202' "timesyncd override supplies EP1 corporate sources"
+    assert_contains "$(<"$target")" 'FallbackNTP=' "timesyncd override resets fallback sources"
+    if grep -Fq 'time.cloudflare.com' "$target"; then
+        fail "timesyncd override must not retain vendor public NTP"
+    fi
+    assert_contains "$(<"$case_dir/systemctl.log")" 'restart systemd-timesyncd' "timesyncd configuration restarts only systemd-timesyncd"
+    assert_contains "$(<"$case_dir/analyze.log")" 'cat-config systemd/timesyncd.conf' "timesyncd merged configuration is validated"
+    [ -n "$(find "$case_dir" -maxdepth 1 -name '90-dr-domain.conf.domain-join.bak.*' -print -quit)" ] || fail "timesyncd override creates an /etc-style backup"
+    pass "Arch timesyncd override resets vendor lists, validates merged config, and backs up the drop-in"
+
+    : > "$case_dir/systemctl.log"
+    PATH="$fake_bin:$PATH" TIME_ACTIVE=systemd-timesyncd TIME_ENABLED=systemd-timesyncd \
+        TIME_SYSTEMCTL_LOG="$case_dir/systemctl.log" TIME_ANALYZE_LOG="$case_dir/analyze.log" \
+        DR_TIMESYNCD_DROPIN="$target" OFFICE_CODE=EP1 DR_TIME_SYNC_RETRIES=1 DR_TIME_SYNC_RETRY_DELAY=0 \
+        DR_JOIN_STATE_DIR="$case_dir/state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; OFFICE_CODE=EP1; platform_configure_timesyncd force" || fail "idempotent timesyncd configuration succeeds"
+    if grep -Fq 'restart systemd-timesyncd' "$case_dir/systemctl.log"; then
+        fail "idempotent timesyncd configuration must not restart the service"
+    fi
+    pass "idempotent timesyncd configuration skips unnecessary restart"
+
+    printf '%s\n' '[Time]' 'NTP=old.example' 'FallbackNTP=old.example' > "$target"
+    set +e
+    PATH="$fake_bin:$PATH" TIME_ACTIVE=systemd-timesyncd TIME_ENABLED=systemd-timesyncd TIME_SYNC_BAD=1 \
+        TIME_SYSTEMCTL_LOG="$case_dir/systemctl-failure.log" TIME_ANALYZE_LOG="$case_dir/analyze-failure.log" \
+        DR_TIMESYNCD_DROPIN="$target" OFFICE_CODE=EP1 DR_TIME_SYNC_RETRIES=1 DR_TIME_SYNC_RETRY_DELAY=0 \
+        DR_JOIN_STATE_DIR="$case_dir/state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; OFFICE_CODE=EP1; platform_configure_timesyncd force" >/dev/null 2>&1
+    local timesync_rc=$?
+    set -e
+    [ "$timesync_rc" -ne 0 ] || fail "timesyncd configuration fails closed when synchronization is not achieved"
+    assert_contains "$(<"$target")" 'NTP=old.example' "failed timesyncd configuration restores the previous drop-in"
+    pass "timesyncd synchronization failure restores the previous drop-in"
+}
+
+test_dns_preservation_and_fallback() {
+    local fake_bin case_dir output
+    fake_bin="$TMP_DIR/dns-fake-bin"
+    mkdir -p "$fake_bin"
+    cat > "$fake_bin/dig" << 'EOF'
+#!/bin/bash
+if [ "${DNS_TEST_MODE:-current}" = current ] && [[ "$*" != *@* ]]; then
+    printf '0 100 88 dc.dr.kodr.local.\n'
+elif [ "${DNS_TEST_MODE:-current}" = fallback ] && [[ "$*" == *@10.59.4.201* || "$*" == *@10.59.4.202* ]]; then
+    printf '0 100 88 dc.dr.kodr.local.\n'
+fi
+EOF
+    cat > "$fake_bin/nmcli" << 'EOF'
+#!/bin/bash
+case "$*" in
+    *"connection show --active"*) printf 'Corp:wlan0\n' ;;
+    *"-g ipv4.dns-search"*) printf '%s\n' "${NM_DNS_SEARCH:-}" ;;
+    *"-g ipv4.dns connection"*) printf '%s\n' "${NM_DNS:-}" ;;
+    *"-g ipv4.ignore-auto-dns"*) printf '%s\n' "${NM_IGNORE_AUTO_DNS:-no}" ;;
+    *"connection modify"*|*"connection up"*) printf '%s\n' "$*" >> "${DNS_NMCLI_LOG:?}" ;;
+    *"device show"*) ;;
+    *) exit 0 ;;
+esac
+EOF
+    cat > "$fake_bin/systemctl" << 'EOF'
+#!/bin/bash
+case "${1:-}" in
+    is-active) exit 1 ;;
+    restart|daemon-reload) printf '%s\n' "$*" >> "${DNS_SYSTEMCTL_LOG:?}" ;;
+    *) exit 0 ;;
+esac
+EOF
+    chmod 755 "$fake_bin"/*
+
+    case_dir="$TMP_DIR/dns-fallback"
+    : > "$case_dir.log"
+    output="$(PATH="$fake_bin:$PATH" DNS_TEST_MODE=fallback NM_DNS=192.168.0.1 NM_DNS_SEARCH= DNS_NMCLI_LOG="$case_dir.log" DNS_SYSTEMCTL_LOG="$case_dir.systemctl.log" DR_JOIN_STATE_DIR="$case_dir-state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; OFFICE_CODE=EP1; backup_config_file(){ :; }; configure_dns_servers; configure_dns_search_domains")"
+    assert_contains "$output" 'reachable office-specific fallback DNS servers' "home/router DNS failure selects the EP1 fallback policy"
+    assert_contains "$(<"$case_dir.log")" 'ipv4.ignore-auto-dns yes ipv4.dns 10.59.4.201 10.59.4.202' "fallback DNS disables DHCP DNS replacement safely"
+    assert_contains "$(<"$case_dir.log")" 'ipv4.dns-search' "fallback DNS path adds the AD search configuration"
+    pass "office-specific DNS fallback is applied only after current AD discovery fails"
+
+    case_dir="$TMP_DIR/dns-preserve"
+    : > "$case_dir.log"
+    output="$(PATH="$fake_bin:$PATH" DNS_TEST_MODE=current NM_DNS='10.59.4.201 10.59.4.202' NM_DNS_SEARCH='dr.kodr.local,corp.eddom.org' NM_IGNORE_AUTO_DNS=yes DNS_NMCLI_LOG="$case_dir.log" DNS_SYSTEMCTL_LOG="$case_dir.systemctl.log" DR_JOIN_STATE_DIR="$case_dir-state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; OFFICE_CODE=EP1; backup_config_file(){ :; }; configure_dns_servers; configure_dns_search_domains")"
+    assert_contains "$output" 'Preserving already-valid AD DNS configuration' "working explicit DNS is preserved"
+    [ ! -s "$case_dir.log" ] || fail "already-working explicit DNS must not be modified on rerun"
+    pass "already-working explicit corporate DNS and search domains remain unchanged"
+
+    case_dir="$TMP_DIR/debian-dns-regression"
+    : > "$case_dir.log"
+    output="$(PATH="$fake_bin:$PATH" DNS_TEST_MODE=current NM_DNS='10.59.4.201 10.59.4.202' NM_DNS_SEARCH='dr.kodr.local' NM_IGNORE_AUTO_DNS=yes DNS_NMCLI_LOG="$case_dir.log" DNS_SYSTEMCTL_LOG="$case_dir.systemctl.log" DR_JOIN_STATE_DIR="$case_dir-state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=debian; OFFICE_CODE=EP1; backup_config_file(){ :; }; configure_dns_servers")"
+    assert_contains "$output" 'Keeping DHCP/VPN DNS servers' "Debian keeps its existing DHCP/VPN DNS behavior"
+    [ ! -s "$case_dir.log" ] || fail "Debian DNS regression fixture must not use the Arch fallback path"
+    pass "Debian DNS behavior remains unchanged"
+}
+
+test_office_argument_workflow() {
+    local state_dir output rc
+    output="$(printf 'EP1\n' | DR_JOIN_STATE_DIR="$TMP_DIR/office-prompt" bash -c "source '$SCRIPT'; parse_args; printf 'office=%s\\n' \"\$OFFICE_CODE\"" 2>&1)"
+    assert_contains "$output" 'Enter the office code' "missing office state uses the interactive prompt"
+    assert_contains "$output" 'office=EP1' "interactive office code is accepted"
+
+    state_dir="$TMP_DIR/office-state"
+    mkdir -p "$state_dir"
+    printf '%s\n' 'OFFICE_CODE="EP1"' > "$state_dir/state"
+    output="$(DR_JOIN_STATE_DIR="$state_dir" bash -c "source '$SCRIPT'; load_state; parse_args; printf 'office=%s\\n' \"\$OFFICE_CODE\"")"
+    assert_contains "$output" 'office=EP1' "persisted office code is reused without prompting"
+    output="$(DR_JOIN_STATE_DIR="$state_dir" bash -c "source '$SCRIPT'; load_state; parse_args EP1; printf 'office=%s\\n' \"\$OFFICE_CODE\"")"
+    assert_contains "$output" 'office=EP1' "repeating the persisted office code is idempotent"
+    output="$(DR_JOIN_STATE_DIR="$state_dir" bash -c "source '$SCRIPT'; load_state; parse_args --preflight EP1; printf 'office=%s preflight=%s\\n' \"\$OFFICE_CODE\" \"\$PREFLIGHT_ONLY\"")"
+    assert_contains "$output" 'office=EP1 preflight=true' "office code after a mode flag is accepted"
+    output="$(DR_JOIN_STATE_DIR="$state_dir" bash -c "source '$SCRIPT'; load_state; parse_args EP1 --dry-run; printf 'office=%s dry=%s\\n' \"\$OFFICE_CODE\" \"\$DRY_RUN_ONLY\"")"
+    assert_contains "$output" 'office=EP1 dry=true' "office code before a mode flag is accepted"
+
+    set +e
+    output="$(DR_JOIN_STATE_DIR="$state_dir" bash -c "source '$SCRIPT'; load_state; parse_args PL1" 2>&1)"
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "conflicting positional office code is rejected"
+    assert_contains "$output" 'conflicts with persisted office code EP1' "conflicting office code requires explicit resolution"
+    pass "office-code parsing is idempotent and conflict-safe"
+}
+
 test_rebind_failure_rollback() {
     local rebind_helper fake_bin stage case_dir unit state original_unit original_state
     rebind_helper="$TMP_DIR/rebind-rollback-helper"
@@ -1166,12 +1352,18 @@ test_modes() {
     [ "$rc" -ne 0 ] || fail "dry-run propagates blockers"
     assert_contains "$output" "Ordered dry-run plan" "dry-run plan output"
     assert_contains "$output" "WOULD CHANGE" "dry-run change markers"
+
+    output="$(DR_JOIN_STATE_DIR="$TMP_DIR/dry-plan-preserve" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; PLATFORM_PACKAGE_MANAGER=pacman; OFFICE_CODE=EP1; platform_preflight(){ PREFLIGHT_BLOCKERS=0; PLATFORM_REPORT_BLOCKERS=0; }; platform_ad_dns_configuration_usable(){ return 0; }; platform_time_provider(){ case \"\$1\" in selected|active|enabled) echo systemd-timesyncd ;; esac; }; platform_timesyncd_dropin_matches(){ return 0; }; platform_timesyncd_is_ready(){ return 0; }; platform_dry_run")"
+    assert_contains "$output" 'WOULD PRESERVE already-valid AD DNS configuration' "dry-run preserves valid AD DNS"
+    assert_contains "$output" 'WOULD PRESERVE already-valid corporate systemd-timesyncd configuration' "dry-run preserves valid corporate timesyncd"
+    output="$(DR_JOIN_STATE_DIR="$TMP_DIR/dry-plan-install" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; PLATFORM_PACKAGE_MANAGER=pacman; OFFICE_CODE=EP1; platform_preflight(){ PREFLIGHT_BLOCKERS=0; PLATFORM_REPORT_BLOCKERS=0; }; platform_ad_dns_configuration_usable(){ return 1; }; platform_time_provider(){ case \"\$1\" in selected|active|enabled) echo systemd-timesyncd ;; esac; }; platform_timesyncd_dropin_matches(){ return 1; }; platform_timesyncd_is_ready(){ return 1; }; platform_dry_run")"
+    assert_contains "$output" 'WOULD INSTALL/VERIFY Arch corporate timesyncd override' "dry-run identifies the required timesyncd override"
 }
 
 test_missing_capability() {
     local output
-    output="$(DR_JOIN_STATE_DIR="$TMP_DIR/time-provider" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_time_provider(){ case \"\$1\" in active) echo systemd-timesyncd ;; enabled) echo systemd-timesyncd ;; esac; }; platform_capability_status time-sync")"
-    assert_contains "$output" "PASS|time-sync|existing supported provider" "existing Arch time provider satisfies time-sync"
+    output="$(DR_JOIN_STATE_DIR="$TMP_DIR/time-provider" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_time_provider(){ case \"\$1\" in active|enabled|selected) echo systemd-timesyncd ;; esac; }; platform_capability_status time-sync")"
+    assert_contains "$output" "PASS|time-sync|existing selected provider is active or enabled (systemd-timesyncd)" "existing Arch time provider satisfies time-sync"
     output="$(DR_JOIN_STATE_DIR="$TMP_DIR/missing" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_capability_status realmd")"
     assert_contains "$output" "WARNING|realmd|unavailable but no longer required" "Arch realmd is not required"
     output="$(DR_JOIN_STATE_DIR="$TMP_DIR/missing2" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_capability_status autofs")"
@@ -1213,6 +1405,9 @@ test_missing_commands_and_packages() {
 test_detection
 test_mappings
 test_renderers
+test_time_provider_and_timesyncd
+test_dns_preservation_and_fallback
+test_office_argument_workflow
 test_rebind_failure_rollback
 test_drip_compatibility
 test_machine_account_renewal
