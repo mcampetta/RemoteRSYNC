@@ -94,6 +94,7 @@ DRIP_REQUIRED="${DRIP_REQUIRED:-true}"
 DR_DRIP_SEARCH_ROOTS="${DR_DRIP_SEARCH_ROOTS:-dr-ep-drip04/Images}"
 DR_DRIP_MANIFEST="${DR_DRIP_MANIFEST:-/var/lib/dr-domain-join/drip-units.manifest}"
 DR_DRIP_UNIT_DIR="${DR_DRIP_UNIT_DIR:-/etc/systemd/system}"
+DR_DRIP_HELPER_PATH="${DR_DRIP_HELPER_PATH:-/usr/local/sbin/dr-drip-search}"
 # A systemd .mount unit is generated before a user accesses /mnt/x, so it
 # needs the UID of the domain user's Kerberos cache at generation time.  The
 # normal path derives this from DOMAIN_SUDO_USER; an explicit UID is useful for
@@ -5960,25 +5961,120 @@ EOF
 
 render_drip_launcher_support() {
     [ "$PLATFORM_FAMILY" = "arch" ] || return 0
-    cat << 'EOF'
+    cat << EOF
+DRIP_REQUIRED="$DRIP_REQUIRED"
+DRIP_SEARCH_HELPER="\${DRIP_SEARCH_HELPER:-$DR_DRIP_HELPER_PATH}"
+DRIP_MANIFEST="$DR_DRIP_MANIFEST"
+DRIP_UNIT_DIR="$DR_DRIP_UNIT_DIR"
+DRIP_SEARCH_ROOTS="$DR_DRIP_SEARCH_ROOTS"
 DRIP_SEARCH_STARTED=0
+
+drip_validate_root_entry() {
+    local entry="\$1" server share extra
+    case "\$entry" in
+        ''|*..*) return 1 ;;
+    esac
+    [[ "\$entry" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?/[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
+    IFS=/ read -r server share extra <<< "\$entry"
+    [ -n "\$server" ] && [ -n "\$share" ] && [ -z "\${extra:-}" ]
+}
+
+drip_configured_root() {
+    local configured
+    read -r -a configured_roots <<< "\$DRIP_SEARCH_ROOTS"
+    for configured in "\${configured_roots[@]}"; do
+        [ "\$configured" = "\$1" ] && return 0
+    done
+    return 1
+}
+
+drip_validate_root_file() {
+    local path="\$1" mode owner mode_value
+    [ -f "\$path" ] && [ ! -L "\$path" ] || return 1
+    owner="\$(stat -c '%u' -- "\$path" 2>/dev/null || true)"
+    mode="\$(stat -c '%a' -- "\$path" 2>/dev/null || true)"
+    [ "\$owner" = 0 ] || return 1
+    case "\$mode" in ''|*[!0-7]*) return 1 ;; esac
+    mode_value=\$((8#\$mode))
+    if [ "\$path" = "\$DRIP_SEARCH_HELPER" ]; then
+        [ \$((mode_value & 0111)) -ne 0 ] || return 1
+        [ \$((mode_value & 0022)) -eq 0 ] || return 1
+    else
+        [ \$((mode_value & 07177)) -eq 0 ] || return 1
+    fi
+}
+
+drip_validate_manifest() {
+    local entry mount_unit automount_unit extra expected_mount expected_automount server share
+    local count=0
+    [ -f "\$DRIP_MANIFEST" ] && [ ! -L "\$DRIP_MANIFEST" ] || return 1
+    drip_validate_root_file "\$DRIP_MANIFEST" || return 1
+    while IFS=\$'\t' read -r entry mount_unit automount_unit extra; do
+        [ -n "\$entry" ] || continue
+        [ -z "\${extra:-}" ] || return 1
+        drip_validate_root_entry "\$entry" || return 1
+        drip_configured_root "\$entry" || return 1
+        expected_mount="\$(systemd-escape --path --suffix=mount "/smb/\$entry" 2>/dev/null)" || return 1
+        expected_automount="\$(systemd-escape --path --suffix=automount "/smb/\$entry" 2>/dev/null)" || return 1
+        [ "\$mount_unit" = "\$expected_mount" ] && [ "\$automount_unit" = "\$expected_automount" ] || return 1
+        [ -f "\$DRIP_UNIT_DIR/\$mount_unit" ] && [ ! -L "\$DRIP_UNIT_DIR/\$mount_unit" ] || return 1
+        [ -f "\$DRIP_UNIT_DIR/\$automount_unit" ] && [ ! -L "\$DRIP_UNIT_DIR/\$automount_unit" ] || return 1
+        server="\${entry%%/*}"
+        share="\${entry#*/}"
+        grep -Fxq "What=//\$server/\$share" "\$DRIP_UNIT_DIR/\$mount_unit" || return 1
+        grep -Fxq "Where=/smb/\$entry" "\$DRIP_UNIT_DIR/\$mount_unit" || return 1
+        grep -Fxq 'Options=_netdev,nofail,sec=krb5,cruid=0,vers=3.0' "\$DRIP_UNIT_DIR/\$mount_unit" || return 1
+        grep -Fxq "Where=/smb/\$entry" "\$DRIP_UNIT_DIR/\$automount_unit" || return 1
+        systemd-analyze verify "\$DRIP_UNIT_DIR/\$mount_unit" "\$DRIP_UNIT_DIR/\$automount_unit" >/dev/null 2>&1 || return 1
+        count=\$((count + 1))
+    done < "\$DRIP_MANIFEST"
+    [ "\$count" -gt 0 ]
+}
+
 drip_search_cleanup() {
-    if [ "$DRIP_SEARCH_STARTED" -eq 1 ] && [ -x /usr/local/sbin/dr-drip-search ]; then
-        if ! /usr/local/sbin/dr-drip-search cleanup; then
+    if [ "\$DRIP_SEARCH_STARTED" -eq 1 ] && [ -x "\$DRIP_SEARCH_HELPER" ]; then
+        if ! "\$DRIP_SEARCH_HELPER" cleanup; then
             echo "WARNING: configured DRIP search cleanup was incomplete; inspect systemd state and the manifest." >&2
         fi
     fi
 }
-trap 'kit_status=$?; drip_search_cleanup; exit "$kit_status"' EXIT
+trap 'kit_status=\$?; drip_search_cleanup; exit "\$kit_status"' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-if [ -x /usr/local/sbin/dr-drip-search ]; then
+if [ "\$DRIP_REQUIRED" = true ]; then
+    drip_validate_root_file "\$DRIP_SEARCH_HELPER" || {
+        echo "Required DRIP search helper is missing, unsafe, or not root-owned." >&2
+        exit 1
+    }
+    drip_validate_manifest || {
+        echo "Required DRIP manifest or configured units are missing or invalid." >&2
+        exit 1
+    }
+elif [ ! -e "\$DRIP_SEARCH_HELPER" ]; then
+    echo "WARNING: DRIP_REQUIRED=false; launching KIT without configured DRIP search mounts." >&2
+else
+    drip_validate_root_file "\$DRIP_SEARCH_HELPER" || {
+        echo "DRIP helper is present but unsafe; refusing KIT-only launch." >&2
+        exit 1
+    }
+fi
+
+if [ -x "\$DRIP_SEARCH_HELPER" ]; then
     DRIP_SEARCH_STARTED=1
-    if ! /usr/local/sbin/dr-drip-search start; then
+    if ! "\$DRIP_SEARCH_HELPER" start; then
         echo "Configured DRIP search automounts could not be started; KIT launch is blocked." >&2
         exit 1
+    fi
+    if [ "\$DRIP_REQUIRED" = true ]; then
+        while IFS=\$'\t' read -r entry mount_unit automount_unit extra; do
+            [ -n "\$entry" ] || continue
+            systemctl is-active --quiet "\$automount_unit" || {
+                echo "Required DRIP automount is not active: \$automount_unit" >&2
+                exit 1
+            }
+        done < "\$DRIP_MANIFEST"
     fi
 fi
 EOF
@@ -5991,42 +6087,237 @@ platform_install_drip_search() {
         return 1
     }
 
-    local manifest_tmp entry mount_unit automount_unit mount_tmp automount_tmp
-    local manifest_dir staging_dir
+    local manifest_dir transaction_dir staging_dir unit_backup_dir
+    local manifest_stage helper_stage helper_path entry mount_unit automount_unit
+    local old_manifest_exists=0 old_helper_exists=0 fail_stage
+    local stale_mount stale_automount
+    local -a old_entries=() new_entries=() new_mounts=() new_automounts=() touched_units=()
     manifest_dir="$(dirname "$DR_DRIP_MANIFEST")"
-    mkdir -p /smb "$manifest_dir" "$DR_DRIP_UNIT_DIR"
-    manifest_tmp="$(mktemp "$manifest_dir/.drip-units.manifest.XXXXXX")"
-    staging_dir="$(mktemp -d "$DR_DRIP_UNIT_DIR/.drip-units.XXXXXX")"
-    chmod 600 "$manifest_tmp"
-    chown root:root "$manifest_tmp" 2>/dev/null || true
+    helper_path="${DR_DRIP_HELPER_PATH:-/usr/local/sbin/dr-drip-search}"
+    fail_stage="${DR_DRIP_INSTALL_FAIL_STAGE:-}"
+
+    if [ "${DR_DRIP_SKIP_MOUNT_ROOT:-false}" != true ]; then
+        mkdir -p /smb || return 1
+    fi
+    mkdir -p "$manifest_dir" "$DR_DRIP_UNIT_DIR" || return 1
+    transaction_dir="$(mktemp -d "$manifest_dir/.drip-install.XXXXXX")" || return 1
+    staging_dir="$transaction_dir/staged"
+    unit_backup_dir="$transaction_dir/unit-backups"
+    mkdir -p "$staging_dir" "$unit_backup_dir" || {
+        rm -rf -- "$transaction_dir"
+        return 1
+    }
+    manifest_stage="$staging_dir/drip-units.manifest"
+    helper_stage="$staging_dir/dr-drip-search"
+    : > "$manifest_stage"
+    chmod 600 "$manifest_stage"
+    chown root:root "$manifest_stage" 2>/dev/null || true
+
+    drip_install_add_unit() {
+        local candidate="$1" existing
+        for existing in "${touched_units[@]}"; do
+            [ "$existing" = "$candidate" ] && return 0
+        done
+        touched_units+=("$candidate")
+    }
+
+    drip_install_new_entry() {
+        local candidate="$1" existing
+        for existing in "${new_entries[@]}"; do
+            [ "$existing" = "$candidate" ] && return 0
+        done
+        return 1
+    }
+
+    drip_install_rollback() {
+        local unit target
+        for unit in "${touched_units[@]}"; do
+            target="$DR_DRIP_UNIT_DIR/$unit"
+            if [ -e "$unit_backup_dir/$unit" ] || [ -L "$unit_backup_dir/$unit" ]; then
+                rm -f -- "$target"
+                cp -a -- "$unit_backup_dir/$unit" "$target"
+            else
+                rm -f -- "$target"
+            fi
+        done
+        if [ "$old_manifest_exists" -eq 1 ]; then
+            rm -f -- "$DR_DRIP_MANIFEST"
+            cp -a -- "$transaction_dir/previous.manifest" "$DR_DRIP_MANIFEST"
+        else
+            rm -f -- "$DR_DRIP_MANIFEST"
+        fi
+        if [ "$old_helper_exists" -eq 1 ]; then
+            rm -f -- "$helper_path"
+            cp -a -- "$transaction_dir/previous.helper" "$helper_path"
+        else
+            rm -f -- "$helper_path"
+        fi
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        rm -rf -- "$transaction_dir"
+    }
+
+    if [ -e "$DR_DRIP_MANIFEST" ] || [ -L "$DR_DRIP_MANIFEST" ]; then
+        old_manifest_exists=1
+        cp -a -- "$DR_DRIP_MANIFEST" "$transaction_dir/previous.manifest" || {
+            rm -rf -- "$transaction_dir"
+            return 1
+        }
+        while IFS=$'\t' read -r entry mount_unit automount_unit extra; do
+            [ -n "$entry" ] || continue
+            [ -z "${extra:-}" ] || {
+                drip_install_rollback
+                return 1
+            }
+            [ "$(drip_mount_unit_name "$entry")" = "$mount_unit" ] || {
+                drip_install_rollback
+                return 1
+            }
+            [ "$(drip_automount_unit_name "$entry")" = "$automount_unit" ] || {
+                drip_install_rollback
+                return 1
+            }
+            old_entries+=("$entry")
+        done < "$DR_DRIP_MANIFEST"
+    fi
+
+    if [ -e "$helper_path" ] || [ -L "$helper_path" ]; then
+        old_helper_exists=1
+        cp -a -- "$helper_path" "$transaction_dir/previous.helper" || {
+            drip_install_rollback
+            return 1
+        }
+    fi
 
     while IFS= read -r entry; do
         [ -n "$entry" ] || continue
-        mount_unit="$(drip_mount_unit_name "$entry")" || return 1
-        automount_unit="$(drip_automount_unit_name "$entry")" || return 1
-        mount_tmp="$staging_dir/$mount_unit"
-        automount_tmp="$staging_dir/$automount_unit"
-        render_arch_drip_mount_unit "$entry" > "$mount_tmp" || return 1
-        render_arch_drip_automount_unit "$entry" > "$automount_tmp" || return 1
-        chmod 644 "$mount_tmp" "$automount_tmp"
-        chown root:root "$mount_tmp" "$automount_tmp" 2>/dev/null || true
-        systemd-analyze verify "$mount_tmp" "$automount_tmp" || return 1
-        backup_config_file "$DR_DRIP_UNIT_DIR/$mount_unit"
-        backup_config_file "$DR_DRIP_UNIT_DIR/$automount_unit"
-        mv -f -- "$mount_tmp" "$DR_DRIP_UNIT_DIR/$mount_unit"
-        mv -f -- "$automount_tmp" "$DR_DRIP_UNIT_DIR/$automount_unit"
-        printf '%s\t%s\t%s\n' "$entry" "$mount_unit" "$automount_unit" >> "$manifest_tmp"
+        mount_unit="$(drip_mount_unit_name "$entry")" || {
+            drip_install_rollback
+            return 1
+        }
+        automount_unit="$(drip_automount_unit_name "$entry")" || {
+            drip_install_rollback
+            return 1
+        }
+        new_entries+=("$entry")
+        new_mounts+=("$mount_unit")
+        new_automounts+=("$automount_unit")
+        drip_install_add_unit "$mount_unit"
+        drip_install_add_unit "$automount_unit"
     done < <(platform_drip_search_entries)
+    for entry in "${old_entries[@]}"; do
+        drip_install_add_unit "$(drip_mount_unit_name "$entry")"
+        drip_install_add_unit "$(drip_automount_unit_name "$entry")"
+    done
 
-    mv -f -- "$manifest_tmp" "$DR_DRIP_MANIFEST"
-    rm -rf -- "$staging_dir"
+    for unit in "${touched_units[@]}"; do
+        if [ -e "$DR_DRIP_UNIT_DIR/$unit" ] || [ -L "$DR_DRIP_UNIT_DIR/$unit" ]; then
+            cp -a -- "$DR_DRIP_UNIT_DIR/$unit" "$unit_backup_dir/$unit" || {
+                drip_install_rollback
+                return 1
+            }
+        fi
+    done
+
+    for entry in "${new_entries[@]}"; do
+        mount_unit="$(drip_mount_unit_name "$entry")"
+        automount_unit="$(drip_automount_unit_name "$entry")"
+        if [ "$fail_stage" = render ]; then
+            print_error "Injected DRIP installation failure at render"
+            drip_install_rollback
+            return 1
+        fi
+        render_arch_drip_mount_unit "$entry" > "$staging_dir/$mount_unit" || {
+            drip_install_rollback
+            return 1
+        }
+        render_arch_drip_automount_unit "$entry" > "$staging_dir/$automount_unit" || {
+            drip_install_rollback
+            return 1
+        }
+        chmod 644 "$staging_dir/$mount_unit" "$staging_dir/$automount_unit"
+        chown root:root "$staging_dir/$mount_unit" "$staging_dir/$automount_unit" 2>/dev/null || true
+        if [ "$fail_stage" = verify ] || ! systemd-analyze verify "$staging_dir/$mount_unit" "$staging_dir/$automount_unit"; then
+            print_error "Configured DRIP systemd unit verification failed"
+            drip_install_rollback
+            return 1
+        fi
+        printf '%s\t%s\t%s\n' "$entry" "$mount_unit" "$automount_unit" >> "$manifest_stage"
+    done
+
+    render_drip_search_mount_helper > "$helper_stage" || {
+        drip_install_rollback
+        return 1
+    }
+    chmod 755 "$helper_stage"
+    chown root:root "$helper_stage" 2>/dev/null || true
+
+    for entry in "${old_entries[@]}"; do
+        drip_install_new_entry "$entry" && continue
+        stale_mount="$(drip_mount_unit_name "$entry")"
+        stale_automount="$(drip_automount_unit_name "$entry")"
+        if systemctl is-active --quiet "$stale_mount" 2>/dev/null || \
+           { command -v mountpoint >/dev/null 2>&1 && mountpoint -q "/smb/$entry"; }; then
+            print_error "Stale DRIP mount is active or busy; preserving it: /smb/$entry"
+            drip_install_rollback
+            return 1
+        fi
+        if systemctl is-active --quiet "$stale_automount" 2>/dev/null; then
+            print_error "Stale DRIP automount is active; preserving it: $stale_automount"
+            drip_install_rollback
+            return 1
+        fi
+    done
+
+    if [ "$fail_stage" = unit-install ]; then
+        print_error "Injected DRIP installation failure at unit-install"
+        drip_install_rollback
+        return 1
+    fi
+    for mount_unit in "${new_mounts[@]}"; do
+        backup_config_file "$DR_DRIP_UNIT_DIR/$mount_unit"
+        mv -f -- "$staging_dir/$mount_unit" "$DR_DRIP_UNIT_DIR/$mount_unit" || {
+            drip_install_rollback
+            return 1
+        }
+    done
+    for automount_unit in "${new_automounts[@]}"; do
+        backup_config_file "$DR_DRIP_UNIT_DIR/$automount_unit"
+        mv -f -- "$staging_dir/$automount_unit" "$DR_DRIP_UNIT_DIR/$automount_unit" || {
+            drip_install_rollback
+            return 1
+        }
+    done
+    for entry in "${old_entries[@]}"; do
+        drip_install_new_entry "$entry" && continue
+        rm -f -- "$DR_DRIP_UNIT_DIR/$(drip_mount_unit_name "$entry")" \
+            "$DR_DRIP_UNIT_DIR/$(drip_automount_unit_name "$entry")" || {
+            drip_install_rollback
+            return 1
+        }
+    done
+
+    backup_config_file "$helper_path"
+    mv -f -- "$helper_stage" "$helper_path" || {
+        drip_install_rollback
+        return 1
+    }
+    if [ "$fail_stage" = manifest ]; then
+        print_error "Injected DRIP installation failure at manifest"
+        drip_install_rollback
+        return 1
+    fi
+    mv -f -- "$manifest_stage" "$DR_DRIP_MANIFEST" || {
+        drip_install_rollback
+        return 1
+    }
     chmod 600 "$DR_DRIP_MANIFEST"
     chown root:root "$DR_DRIP_MANIFEST" 2>/dev/null || true
-    backup_config_file /usr/local/sbin/dr-drip-search
-    render_drip_search_mount_helper > /usr/local/sbin/dr-drip-search
-    chmod 755 /usr/local/sbin/dr-drip-search
-    chown root:root /usr/local/sbin/dr-drip-search
-    systemctl daemon-reload
+    if [ "$fail_stage" = daemon-reload ] || ! systemctl daemon-reload; then
+        print_error "DRIP systemd daemon reload failed"
+        drip_install_rollback
+        return 1
+    fi
+    rm -rf -- "$transaction_dir"
     print_info "Installed configured Arch DRIP search units without enabling them at boot"
 }
 
@@ -6165,7 +6456,7 @@ require_root() {
 
 read_persisted_cruid() {
     [ -r "\$STATE_FILE" ] || return 0
-    awk -F= '/^DR_TOOLS_MOUNT_CRUID=/ {gsub(/^[\" ]|[\" ]$/, "", \$2); print \$2; exit}' "\$STATE_FILE"
+    awk -F= '/^DR_TOOLS_MOUNT_CRUID=/ {gsub(/^[" ]|[" ]$/, "", \$2); print \$2; exit}' "\$STATE_FILE"
 }
 
 atomic_update_cruid() {
@@ -6190,19 +6481,69 @@ atomic_update_cruid() {
     [ "\$(stat -c '%u:%a' -- "\$STATE_FILE")" = "0:600" ]
 }
 
+verify_unit_cruid() {
+    local unit_file="\$1"
+    local expected="\${2:-}"
+    local line options token value
+    local -a values=()
+
+    [ -r "\$unit_file" ] || return 1
+    while IFS= read -r line; do
+        case "\$line" in
+            Options=*)
+                options="\${line#Options=}"
+                IFS=, read -r -a tokens <<< "\$options"
+                for token in "\${tokens[@]}"; do
+                    case "\$token" in
+                        cruid=*) values+=("\${token#cruid=}") ;;
+                    esac
+                done
+                ;;
+        esac
+    done < "\$unit_file"
+
+    [ "\${#values[@]}" -eq 1 ] || return 1
+    value="\${values[0]}"
+    [[ "\$value" =~ ^[0-9]+$ ]] || return 1
+    if [ -n "\$expected" ]; then
+        [[ "\$expected" =~ ^[0-9]+$ ]] || return 1
+        [ "\$((10#\$value))" -eq "\$((10#\$expected))" ] || return 1
+    fi
+    printf '%s\n' "\$((10#\$value))"
+}
+
 validate_target_uid() {
     case "\$NEW_CRUID" in
         ''|0|*[!0-9]*) echo "Usage: dr-tools-rebind [--dry-run|--status] <non-root-domain-user-uid>" >&2; return 1 ;;
     esac
-    local passwd_line resolved_uid
-    passwd_line="\$(getent passwd "\$NEW_CRUID" 2>/dev/null || true)"
-    resolved_uid="\${passwd_line%%:*}"
-    [ -n "\$passwd_line" ] && [ "\$resolved_uid" = "\$NEW_CRUID" ] || {
-        echo "UID \$NEW_CRUID did not resolve to an exact local/SSSD passwd UID." >&2
+    local passwd_line resolved_username resolved_uid
+    local -a passwd_records passwd_fields
+    mapfile -t passwd_records < <(getent passwd "\$NEW_CRUID" 2>/dev/null || true)
+    [ "\${#passwd_records[@]}" -eq 1 ] || {
+        echo "UID \$NEW_CRUID did not resolve to exactly one passwd record." >&2
         return 1
     }
-    [ "\$(id -u "\$NEW_CRUID" 2>/dev/null || true)" = "\$NEW_CRUID" ] || {
-        echo "NSS could not confirm UID \$NEW_CRUID exactly." >&2
+    passwd_line="\${passwd_records[0]}"
+    IFS=: read -r -a passwd_fields <<< "\$passwd_line"
+    [ "\${#passwd_fields[@]}" -eq 7 ] || {
+        echo "UID \$NEW_CRUID returned a malformed passwd record." >&2
+        return 1
+    }
+    resolved_username="\${passwd_fields[0]}"
+    resolved_uid="\${passwd_fields[2]}"
+    [ -n "\$resolved_username" ] && [ -n "\$resolved_uid" ] || {
+        echo "UID \$NEW_CRUID returned an incomplete passwd record." >&2
+        return 1
+    }
+    case "\$resolved_uid" in
+        ''|*[!0-9]*) echo "UID \$NEW_CRUID returned a nonnumeric passwd UID." >&2; return 1 ;;
+    esac
+    [ "\$resolved_uid" = "\$NEW_CRUID" ] || {
+        echo "NSS passwd UID \$resolved_uid does not match requested UID \$NEW_CRUID." >&2
+        return 1
+    }
+    [ "\$(id -u "\$resolved_username" 2>/dev/null || true)" = "\$NEW_CRUID" ] || {
+        echo "NSS could not confirm username \$resolved_username as UID \$NEW_CRUID." >&2
         return 1
     }
 }
@@ -6226,11 +6567,16 @@ refuse_if_busy() {
 }
 
 show_status() {
+    local unit_cruid persisted_cruid
     require_root
     printf 'mount_unit=%s active=%s enabled=%s\n' "\$MOUNT_UNIT" "\$(unit_active_state "\$MOUNT_UNIT")" "\$(unit_enabled_state "\$MOUNT_UNIT")"
     printf 'automount_unit=%s active=%s enabled=%s\n' "\$AUTOMOUNT_UNIT" "\$(unit_active_state "\$AUTOMOUNT_UNIT")" "\$(unit_enabled_state "\$AUTOMOUNT_UNIT")"
-    printf 'unit_cruid='
-    sed -n 's/^[[:space:]]*Options=.*\\(^\\|,\\)cruid=\\([0-9][0-9]*\\)\\(,\\|$\\).*$/\\2/p' "\$UNIT_PATH" | head -n 1
+    persisted_cruid="\$(read_persisted_cruid)"
+    unit_cruid="\$(verify_unit_cruid "\$UNIT_PATH" "\$persisted_cruid")" || {
+        echo "unit_cruid=invalid" >&2
+        return 1
+    }
+    printf 'unit_cruid=%s\n' "\$unit_cruid"
     printf 'persisted_cruid=%s\n' "\$(read_persisted_cruid)"
 }
 
@@ -6266,7 +6612,7 @@ Options=_netdev,nofail,sec=krb5,cruid=\$NEW_CRUID,vers=3.0
 TimeoutSec=30s
 UNIT
     systemd-analyze verify "\$STAGED_UNIT"
-    grep -Eq '^Options=.*(^|,)cruid=\$NEW_CRUID(,|$)' "\$STAGED_UNIT"
+    verify_unit_cruid "\$STAGED_UNIT" "\$NEW_CRUID" >/dev/null
     echo "WOULD CHANGE \$UNIT_PATH cruid=\$NEW_CRUID"
     exit 0
 fi
@@ -6313,7 +6659,7 @@ chmod 644 "\$STAGED_UNIT"
 chown root:root "\$STAGED_UNIT" 2>/dev/null || true
 failpoint verify
 systemd-analyze verify "\$STAGED_UNIT"
-grep -Eq '^Options=.*(^|,)cruid=\$NEW_CRUID(,|$)' "\$STAGED_UNIT"
+verify_unit_cruid "\$STAGED_UNIT" "\$NEW_CRUID" >/dev/null
 
 failpoint replace
 mv -f -- "\$STAGED_UNIT" "\$UNIT_PATH"
@@ -6327,7 +6673,7 @@ failpoint automount-start
 restore_active_state "\$MOUNT_UNIT" "\$ORIGINAL_MOUNT_ACTIVE"
 restore_active_state "\$AUTOMOUNT_UNIT" "\$ORIGINAL_AUTOMOUNT_ACTIVE"
 
-grep -Eq '^Options=.*(^|,)cruid=\$NEW_CRUID(,|$)' "\$UNIT_PATH"
+verify_unit_cruid "\$UNIT_PATH" "\$NEW_CRUID" >/dev/null
 failpoint state-update
 atomic_update_cruid
 COMMITTED=1
