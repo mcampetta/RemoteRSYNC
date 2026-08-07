@@ -359,6 +359,220 @@ test_office_argument_workflow() {
     pass "office-code parsing is idempotent and conflict-safe"
 }
 
+test_hostname_collision_and_recovery() {
+    local fake_bin helper case_dir output rc case_name occupied race_host
+    fake_bin="$TMP_DIR/hostname-fake-bin"
+    mkdir -p "$fake_bin"
+    cat > "$fake_bin/hostnamectl" << 'EOF'
+#!/bin/bash
+case "${1:-}" in
+    --static) printf '%s\n' "${FAKE_HOSTNAME:?}" ;;
+    set-hostname) printf '%s\n' "$*" >> "${HOSTNAMECTL_LOG:?}" ;;
+    *) exit 0 ;;
+esac
+EOF
+    cat > "$fake_bin/id" << 'EOF'
+#!/bin/bash
+if [ "${1:-}" = -u ]; then printf '0\n'; else /usr/bin/id "$@"; fi
+EOF
+    cat > "$fake_bin/dig" << 'EOF'
+#!/bin/bash
+printf '0 100 389 dc.dr.kodr.local.\n'
+EOF
+    cat > "$fake_bin/ldapsearch" << 'EOF'
+#!/bin/bash
+candidate=""
+for arg in "$@"; do
+    if [[ "$arg" == *sAMAccountName=* ]]; then
+        candidate="${arg#*sAMAccountName=}"
+        candidate="${candidate%%)*}"
+        candidate="${candidate%\$}"
+    fi
+done
+counter_file="${LDAP_COUNTER_DIR:?}/$candidate"
+count=0
+if [ -f "$counter_file" ]; then count="$(<"$counter_file")"; fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$counter_file"
+if [[ " ${AD_OCCUPIED:-} " == *" $candidate "* ]] || { [ "$candidate" = "${RACE_HOST:-}" ] && [ "$count" -ge 2 ]; }; then
+    printf 'dn: CN=%s,OU=Computers,DC=dr,DC=kodr,DC=local\nsAMAccountName: %s$\ndNSHostName: %s.dr.kodr.local\ndescription: Existing fixture object\nwhenCreated: 20260706160422.0Z\n' "$candidate" "$candidate" "${candidate,,}"
+fi
+EOF
+    cat > "$fake_bin/kinit" << 'EOF'
+#!/bin/bash
+exit 0
+EOF
+    cat > "$fake_bin/kdestroy" << 'EOF'
+#!/bin/bash
+exit 0
+EOF
+    cat > "$fake_bin/klist" << 'EOF'
+#!/bin/bash
+if [ "${1:-}" = -k ]; then
+    printf '  1 host/%s@DR.KODR.LOCAL\n' "${FAKE_HOSTNAME:?}"
+    exit 0
+fi
+exit 1
+EOF
+    cat > "$fake_bin/testparm" << 'EOF'
+#!/bin/bash
+exit 0
+EOF
+    cat > "$fake_bin/net" << 'EOF'
+#!/bin/bash
+if [[ "$*" == *"ads join"* ]]; then
+    printf '%s\n' "$*" >> "${NET_JOIN_LOG:?}"
+    exit 0
+fi
+if [[ "$*" == *"ads testjoin"* ]]; then exit 1; fi
+exit 0
+EOF
+    chmod 755 "$fake_bin"/*
+
+    helper="$TMP_DIR/dr-domain-admin-join"
+    DR_JOIN_STATE_DIR="$TMP_DIR/admin-render" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; OFFICE_CODE=EP1; render_arch_domain_admin_join_helper" > "$helper"
+    chmod 755 "$helper"
+    bash -n "$helper" || fail "generated Arch admin helper syntax"
+
+    for case_name in contiguous sparse; do
+        case_dir="$TMP_DIR/hostname-$case_name"
+        mkdir -p "$case_dir/counters"
+        printf '127.0.1.1 ep-cr-kit-01\n' > "$case_dir/hosts"
+        : > "$case_dir/smb.conf"
+        : > "$case_dir/join.log"
+        if [ "$case_name" = contiguous ]; then
+            occupied='EP-CR-KIT-01 EP-CR-KIT-02 EP-CR-KIT-03 EP-CR-KIT-04'
+            race_host='EP-CR-KIT-05'
+        else
+            occupied='EP-CR-KIT-01 EP-CR-KIT-02 EP-CR-KIT-04'
+            race_host='EP-CR-KIT-03'
+        fi
+        set +e
+        output="$(printf 'admin\n' | PATH="$fake_bin:$PATH" FAKE_HOSTNAME=ep-cr-kit-01 HOSTNAMECTL_LOG="$case_dir/hostname.log" NET_JOIN_LOG="$case_dir/join.log" LDAP_COUNTER_DIR="$case_dir/counters" AD_OCCUPIED="$occupied" RACE_HOST="$race_host" DR_ADMIN_STATE_DIR="$case_dir/state" DR_ADMIN_HOSTS_FILE="$case_dir/hosts" DR_ADMIN_SMB_CONF="$case_dir/smb.conf" DR_ADMIN_KEYTAB="$case_dir/krb5.keytab" DR_ADMIN_SECRETS_TDB="$case_dir/secrets.tdb" "$helper" 2>&1)"
+        rc=$?
+        set -e
+        [ "$rc" -ne 0 ] || fail "$case_name hostname race must block the join"
+        [ ! -s "$case_dir/join.log" ] || fail "$case_name collision gate must prevent net ads join"
+        assert_contains "$output" "${race_host,,}" "$case_name allocator identifies the next AD candidate"
+        assert_contains "$output" 'No domain join was attempted' "$case_name final collision gate blocks safely"
+        pass "$case_name sparse/contiguous AD allocation race is fail-closed"
+    done
+
+    case_dir="$TMP_DIR/stale-state"
+    mkdir -p "$case_dir"
+    printf '%s\n' \
+        'SCRIPT_VERSION="1.1.0"' \
+        'STAGE="DOMAIN_JOIN_COMPLETE"' \
+        'OFFICE_CODE="EP1"' \
+        'DOMAIN="dr.kodr.local"' \
+        'TARGET_HOSTNAME="ep-cr-kit-01"' \
+        'DOMAIN_SUDO_USER="martin.campetta"' \
+        'DR_TOOLS_MOUNT_CRUID="1000"' > "$case_dir/state"
+    output="$(PATH="$fake_bin:$PATH" FAKE_HOSTNAME=ep-cr-kit-05 DR_JOIN_STATE_DIR="$case_dir" DR_LOCAL_KEYTAB="$case_dir/krb5.keytab" DR_SAMBA_SECRETS_TDB="$case_dir/secrets.tdb" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; load_state; state_is_postjoin_complete && exit 1 || true; recover_stale_state; grep -E '^(STAGE|TARGET_HOSTNAME|JOIN_LIFECYCLE|DOMAIN_SUDO_USER|DR_TOOLS_MOUNT_CRUID)=' \"\$STATE_FILE\"")"
+    assert_contains "$output" 'STAGE="WAITING_FOR_ADMIN"' "stale completed state returns to pre-admin stage"
+    assert_contains "$output" 'TARGET_HOSTNAME="ep-cr-kit-05"' "stale recovery records the current candidate hostname"
+    assert_contains "$output" 'JOIN_LIFECYCLE="RECOVERY_REQUIRED"' "stale recovery lifecycle is explicit"
+    if grep -Eq 'DOMAIN_SUDO_USER="martin.campetta"|DR_TOOLS_MOUNT_CRUID="1000"' "$case_dir/state"; then
+        fail "stale recovery must clear unresolved user and guessed local UID state"
+    fi
+    pass "exact stale persisted-state contradiction is detected and recovered"
+}
+
+test_cifs_kernel_and_mount_gates() {
+    local fake_bin case_dir output helper
+    fake_bin="$TMP_DIR/cifs-fake-bin"
+    mkdir -p "$fake_bin"
+    cat > "$fake_bin/uname" << 'EOF'
+#!/bin/bash
+[ "${1:-}" = -r ] && printf '7.1.2-2-cachyos\n' || /usr/bin/uname "$@"
+EOF
+    cat > "$fake_bin/modinfo" << 'EOF'
+#!/bin/bash
+[ "${CIFS_MODINFO_OK:-0}" = 1 ]
+EOF
+    chmod 755 "$fake_bin"/*
+
+    case_dir="$TMP_DIR/cifs-kernel"
+    mkdir -p "$case_dir/modules/7.1.2-2-cachyos"
+    printf 'nodev\tcifs\n' > "$case_dir/filesystems"
+    output="$(PATH="$fake_bin:$PATH" DR_CIFS_MODULES_ROOT="$case_dir/modules" DR_CIFS_PROC_FILESYSTEMS="$case_dir/filesystems" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; PREFLIGHT_BLOCKERS=0; platform_validate_cifs_kernel")"
+    assert_contains "$output" 'PASS CIFS is built into the running kernel 7.1.2-2-cachyos' "CIFS built-in capability passes"
+
+    : > "$case_dir/filesystems"
+    output="$(PATH="$fake_bin:$PATH" CIFS_MODINFO_OK=1 DR_CIFS_MODULES_ROOT="$case_dir/modules" DR_CIFS_PROC_FILESYSTEMS="$case_dir/filesystems" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; PREFLIGHT_BLOCKERS=0; platform_validate_cifs_kernel")"
+    assert_contains "$output" 'PASS CIFS module is available for the running kernel' "loadable CIFS module capability passes"
+
+    set +e
+    output="$(PATH="$fake_bin:$PATH" DR_CIFS_MODULES_ROOT="$case_dir/modules" DR_CIFS_PROC_FILESYSTEMS="$case_dir/filesystems" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; PREFLIGHT_BLOCKERS=0; platform_validate_cifs_kernel || true; printf 'blockers=%s\n' \"\$PREFLIGHT_BLOCKERS\"")"
+    set -e
+    assert_contains "$output" 'BLOCKED CIFS is neither built into nor loadable' "missing CIFS module is blocked"
+
+    case_dir="$TMP_DIR/cifs-missing-tree"
+    mkdir -p "$case_dir"
+    set +e
+    output="$(PATH="$fake_bin:$PATH" DR_CIFS_MODULES_ROOT="$case_dir/modules" DR_CIFS_PROC_FILESYSTEMS="$case_dir/filesystems" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; PREFLIGHT_BLOCKERS=0; platform_validate_cifs_kernel || true")"
+    set -e
+    assert_contains "$output" 'Running kernel 7.1.2-2-cachyos has no matching module tree' "missing running-kernel module tree is a blocker"
+    assert_contains "$output" 'Reboot into the installed kernel before continuing' "kernel update recovery guidance is explicit"
+
+    helper="$TMP_DIR/mount-kit-tools-authoritative"
+    DR_JOIN_STATE_DIR="$TMP_DIR/mount-helper-render" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; TOOLS_SERVER=dr-ep1-tools; render_arch_tools_mount_helper 1001" > "$helper"
+    bash -n "$helper" || fail "generated mount helper with findmnt validation is syntactically valid"
+    assert_contains "$(<"$helper")" 'findmnt --noheadings --raw --target' "mount helper uses authoritative findmnt validation"
+    assert_contains "$(<"$helper")" 'FSTYPE,SOURCE' "mount helper checks filesystem type and source"
+
+    case_dir="$TMP_DIR/mount-authority"
+    mkdir -p "$case_dir/bin"
+    cat > "$case_dir/bin/findmnt" << 'EOF'
+#!/bin/bash
+if [ "${FINDMNT_CIFS_OK:-0}" = 1 ]; then
+    printf 'cifs //dr-ep1-tools/Tools\n'
+else
+    printf 'ext4 /dev/nvme0n1p2\n'
+fi
+EOF
+    chmod 755 "$case_dir/bin/findmnt"
+    output="$(PATH="$case_dir/bin:$PATH" FINDMNT_CIFS_OK=1 bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; TOOLS_SERVER=dr-ep1-tools; platform_tools_mount_is_authoritative" 2>&1)" || fail "authoritative CIFS fixture should pass"
+    pass "CIFS mount validation accepts the expected source and filesystem"
+    set +e
+    PATH="$case_dir/bin:$PATH" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; TOOLS_SERVER=dr-ep1-tools; platform_tools_mount_is_authoritative" >/dev/null 2>&1
+    local mount_rc=$?
+    set -e
+    [ "$mount_rc" -ne 0 ] || fail "local mountpoint must not masquerade as a successful CIFS mount"
+    pass "empty/local mountpoint is rejected as Tool Server mount success"
+}
+
+test_domain_uid_resolution_gate() {
+    local fake_bin output rc
+    fake_bin="$TMP_DIR/domain-uid-fake-bin"
+    mkdir -p "$fake_bin"
+    cat > "$fake_bin/getent" << 'EOF'
+#!/bin/bash
+if [ "${1:-}" = passwd ] && [ "${2:-}" = martin.campetta ] && [ "${DOMAIN_USER_RESOLVES:-0}" = 1 ]; then
+    printf 'martin.campetta:x:2001:2001:Domain User:/home/martin.campetta:/bin/bash\n'
+fi
+EOF
+    cat > "$fake_bin/id" << 'EOF'
+#!/bin/bash
+if [ "${1:-}" = -u ] && [ "${2:-}" = martin.campetta ]; then printf '2001\n'; else /usr/bin/id "$@"; fi
+EOF
+    chmod 755 "$fake_bin"/*
+
+    set +e
+    output="$(PATH="$fake_bin:$PATH" DOMAIN_SUDO_USER=martin.campetta DR_TOOLS_MOUNT_CRUID=1000 bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; tools_mount_cruid" 2>&1)"
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "unresolved domain user must block Arch cruid generation"
+    assert_contains "$output" 'does not resolve through NSS/SSSD' "unresolved domain user is reported"
+    if printf '%s\n' "$output" | grep -Fq '1000'; then
+        fail "unresolved martin.campetta must not inherit local martin UID 1000"
+    fi
+    pass "unresolved domain user cannot generate a guessed/local cruid"
+
+    output="$(PATH="$fake_bin:$PATH" DOMAIN_USER_RESOLVES=1 DOMAIN_SUDO_USER=martin.campetta DR_TOOLS_MOUNT_CRUID=2001 bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; tools_mount_cruid")"
+    assert_eq '2001' "$output" "resolved domain user supplies the only Arch cruid"
+}
+
 test_rebind_failure_rollback() {
     local rebind_helper fake_bin stage case_dir unit state original_unit original_state
     rebind_helper="$TMP_DIR/rebind-rollback-helper"
@@ -688,6 +902,17 @@ test_drip_compatibility() {
         fail "configured Arch DRIP automounts must not carry global install targets"
     fi
     pass "configured Arch DRIP units are rendered without global enablement"
+
+    nested_entry='dr-ep-drip04/Image-Folders'
+    nested_mount_unit="$(systemd-escape --path --suffix=mount "/smb/$nested_entry")"
+    nested_automount_unit="$(systemd-escape --path --suffix=automount "/smb/$nested_entry")"
+    DR_JOIN_STATE_DIR="$TMP_DIR/drip-nested-render" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; render_arch_drip_mount_unit '$nested_entry' > '$unit_dir/$nested_mount_unit'; render_arch_drip_automount_unit '$nested_entry' > '$unit_dir/$nested_automount_unit'"
+    [[ "$nested_mount_unit" == *'\x2d'* ]] || fail "hyphenated DRIP server/share must use systemd hexadecimal escaping"
+    [[ "$nested_mount_unit" != 'smb-dr-ep-drip04-Image-Folders.mount' ]] || fail "DRIP validator must not use ad-hoc hyphen escaping"
+    assert_contains "$(<"$unit_dir/$nested_mount_unit")" 'Where=/smb/dr-ep-drip04/Image-Folders' "nested DRIP target preserves the configured path"
+    printf '%s\t%s\t%s\n' "$nested_entry" "$nested_mount_unit" "$nested_automount_unit" > "$TMP_DIR/drip-nested.manifest"
+    DR_DRIP_SEARCH_ROOTS="$nested_entry" DR_DRIP_MANIFEST="$TMP_DIR/drip-nested.manifest" DR_DRIP_UNIT_DIR="$unit_dir" DR_JOIN_STATE_DIR="$TMP_DIR/drip-nested-verify" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_verify_drip_search"
+    pass "DRIP generation, manifest, validator, and cleanup share canonical systemd escaping"
 
     helper="$(DR_DRIP_MANIFEST="$TMP_DIR/drip.manifest" DR_DRIP_UNIT_DIR="$unit_dir" DR_JOIN_STATE_DIR="$TMP_DIR/drip-helper" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; render_drip_search_mount_helper")"
     assert_contains "$helper" 'systemctl start "$automount_unit"' "DRIP helper starts automount units only"
@@ -1408,6 +1633,9 @@ test_renderers
 test_time_provider_and_timesyncd
 test_dns_preservation_and_fallback
 test_office_argument_workflow
+test_hostname_collision_and_recovery
+test_cifs_kernel_and_mount_gates
+test_domain_uid_resolution_gate
 test_rebind_failure_rollback
 test_drip_compatibility
 test_machine_account_renewal

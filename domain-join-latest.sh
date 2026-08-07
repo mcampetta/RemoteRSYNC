@@ -107,6 +107,11 @@ DR_DRIP_HELPER_PATH="${DR_DRIP_HELPER_PATH:-/usr/local/sbin/dr-drip-search}"
 # normal path derives this from DOMAIN_SUDO_USER; an explicit UID is useful for
 # a staged candidate run and is safe to store because it is not a credential.
 DR_TOOLS_MOUNT_CRUID="${DR_TOOLS_MOUNT_CRUID:-}"
+DR_CIFS_MODULES_ROOT="${DR_CIFS_MODULES_ROOT:-/usr/lib/modules}"
+DR_CIFS_PROC_FILESYSTEMS="${DR_CIFS_PROC_FILESYSTEMS:-/proc/filesystems}"
+DR_LOCAL_KEYTAB="${DR_LOCAL_KEYTAB:-/etc/krb5.keytab}"
+DR_SAMBA_SECRETS_TDB="${DR_SAMBA_SECRETS_TDB:-/var/lib/samba/private/secrets.tdb}"
+JOIN_LIFECYCLE="${JOIN_LIFECYCLE:-NEW_JOIN}"
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 
@@ -207,7 +212,8 @@ is_managed_workstation_admin() {
 }
 
 state_is_postjoin_complete() {
-    [ -f "$STATE_FILE" ] && grep -q '^STAGE="POSTJOIN_COMPLETE"$' "$STATE_FILE" 2>/dev/null
+    [ -f "$STATE_FILE" ] && grep -q '^STAGE="POSTJOIN_COMPLETE"$' "$STATE_FILE" 2>/dev/null || return 1
+    ! state_identity_contradiction
 }
 
 show_completed_workstation_message() {
@@ -733,6 +739,35 @@ platform_validate_auth_stack() {
     return "$failed"
 }
 
+platform_validate_cifs_kernel() {
+    [ "$PLATFORM_FAMILY" = arch ] || return 0
+    local running_kernel="$(uname -r)"
+    local module_tree="$DR_CIFS_MODULES_ROOT/$running_kernel"
+    if [ ! -d "$module_tree" ]; then
+        preflight_blocked "Running kernel $running_kernel has no matching module tree."
+        preflight_blocked "Installed kernel packages have changed since boot. Reboot into the installed kernel before continuing."
+        return 1
+    fi
+    if grep -Eq '(^|[[:space:]])cifs([[:space:]]|$)' "$DR_CIFS_PROC_FILESYSTEMS" 2>/dev/null; then
+        preflight_pass "CIFS is built into the running kernel $running_kernel"
+        return 0
+    fi
+    if command -v modinfo >/dev/null 2>&1 && modinfo -k "$running_kernel" cifs >/dev/null 2>&1; then
+        preflight_pass "CIFS module is available for the running kernel $running_kernel"
+        return 0
+    fi
+    preflight_blocked "CIFS is neither built into nor loadable for the running kernel $running_kernel"
+    return 1
+}
+
+platform_cifs_kernel_is_ready() {
+    [ "$PLATFORM_FAMILY" = arch ] || return 0
+    local running_kernel="$(uname -r)"
+    [ -d "$DR_CIFS_MODULES_ROOT/$running_kernel" ] || return 1
+    grep -Eq '(^|[[:space:]])cifs([[:space:]]|$)' "$DR_CIFS_PROC_FILESYSTEMS" 2>/dev/null && return 0
+    command -v modinfo >/dev/null 2>&1 && modinfo -k "$running_kernel" cifs >/dev/null 2>&1
+}
+
 backup_config_file() {
     local file="$1"
     local backup
@@ -1096,8 +1131,13 @@ platform_preflight() {
     PREFLIGHT_BLOCKERS=0
     platform_report
 
+    if state_requires_recovery; then
+        preflight_blocked "Persisted join state contradicts the current hostname and active machine credentials are absent; recovery is required before provisioning"
+    fi
+
     [ "$PLATFORM_SUPPORTED" = true ] || preflight_blocked "platform is not supported by this candidate"
     [ "$PLATFORM_REPORT_BLOCKERS" -eq 0 ] || preflight_blocked "$PLATFORM_REPORT_BLOCKERS required package capabilities are unavailable or unmapped"
+    platform_validate_cifs_kernel || true
     platform_validate_drip_requirement || true
 
     if nmcli general status >/dev/null 2>&1; then
@@ -1183,7 +1223,7 @@ platform_preflight() {
     if [ "$PLATFORM_FAMILY" = "debian" ]; then
         required_commands+=(realm adcli automount)
     else
-        required_commands+=(net testparm systemd-escape systemd-analyze)
+        required_commands+=(net testparm ldapsearch systemd-escape systemd-analyze findmnt)
     fi
     for command_name in "${required_commands[@]}"; do
         if command -v "$command_name" >/dev/null 2>&1; then
@@ -1193,7 +1233,9 @@ platform_preflight() {
         fi
     done
 
-    for command_name in ldapsearch sssctl; do
+    local diagnostic_commands=(ldapsearch sssctl)
+    [ "$PLATFORM_FAMILY" = arch ] && diagnostic_commands=(sssctl)
+    for command_name in "${diagnostic_commands[@]}"; do
         if command -v "$command_name" >/dev/null 2>&1; then
             preflight_pass "Diagnostic/post-install command available: $command_name"
         elif [ "$PLATFORM_FAMILY" = "arch" ] && { [ "$command_name" = ldapsearch ] || [ "$command_name" = sssctl ]; }; then
@@ -1651,6 +1693,7 @@ DOMAIN="${DOMAIN:-}"
 TARGET_HOSTNAME="${DOMAIN_TARGET_HOSTNAME:-}"
 DOMAIN_SUDO_USER="${DOMAIN_SUDO_USER:-}"
 DR_TOOLS_MOUNT_CRUID="${DR_TOOLS_MOUNT_CRUID:-}"
+JOIN_LIFECYCLE="${JOIN_LIFECYCLE:-NEW_JOIN}"
 DR_DRIP_SEARCH_ROOTS="${DR_DRIP_SEARCH_ROOTS:-}"
 HOSTNAME_CHANGED="${HOSTNAME_CHANGED:-0}"
 EOF
@@ -1666,9 +1709,54 @@ load_state() {
     [ -n "${OFFICE_CODE:-}" ] && OFFICE_CODE="$OFFICE_CODE"
     [ -n "${DOMAIN_SUDO_USER:-}" ] && DOMAIN_SUDO_USER="$DOMAIN_SUDO_USER"
     [ -n "${DR_TOOLS_MOUNT_CRUID:-}" ] && DR_TOOLS_MOUNT_CRUID="$DR_TOOLS_MOUNT_CRUID"
+    [ -n "${JOIN_LIFECYCLE:-}" ] && JOIN_LIFECYCLE="$JOIN_LIFECYCLE"
     [ -n "${DR_DRIP_SEARCH_ROOTS:-}" ] && DR_DRIP_SEARCH_ROOTS="$DR_DRIP_SEARCH_ROOTS"
     [ -n "${TARGET_HOSTNAME:-}" ] && DOMAIN_TARGET_HOSTNAME="$TARGET_HOSTNAME"
     return 0
+}
+
+state_identity_contradiction() {
+    local current_host persisted_host
+    case "${STAGE:-}" in
+        DOMAIN_JOIN_COMPLETE|POSTJOIN_COMPLETE) ;;
+        *) return 1 ;;
+    esac
+    persisted_host="${DOMAIN_TARGET_HOSTNAME:-${TARGET_HOSTNAME:-}}"
+    current_host="$(hostnamectl --static 2>/dev/null || hostname 2>/dev/null || true)"
+    [ -n "$persisted_host" ] && [ -n "$current_host" ] || return 1
+    [ "${persisted_host,,}" != "${current_host,,}" ] || return 1
+    # A completed state without the active local machine secret and keytab is
+    # not trusted when the local hostname contradicts the persisted identity.
+    [ ! -s "$DR_SAMBA_SECRETS_TDB" ] || return 1
+    [ ! -s "$DR_LOCAL_KEYTAB" ]
+}
+
+state_requires_recovery() {
+    [ "$PLATFORM_FAMILY" = arch ] || return 1
+    state_identity_contradiction
+}
+
+recover_stale_state() {
+    local current_host persisted_host
+    state_requires_recovery || return 1
+    current_host="$(hostnamectl --static 2>/dev/null || hostname 2>/dev/null || true)"
+    persisted_host="${DOMAIN_TARGET_HOSTNAME:-${TARGET_HOSTNAME:-unknown}}"
+    print_error "Persisted provisioning state is stale or contaminated."
+    print_error "Persisted target hostname: $persisted_host"
+    print_error "Current hostname:          $current_host"
+    print_error "Active Samba machine secret: absent"
+    print_error "Active local keytab:          absent"
+    print_warning "The old AD computer object will not be deleted, reset, disabled, moved, or reused."
+    print_info "The current candidate $current_host must be checked by the privileged AD helper before joining."
+
+    DOMAIN_TARGET_HOSTNAME="$current_host"
+    TARGET_HOSTNAME="$current_host"
+    DOMAIN_SUDO_USER=""
+    DR_TOOLS_MOUNT_CRUID=""
+    JOIN_LIFECYCLE="RECOVERY_REQUIRED"
+    save_state "WAITING_FOR_ADMIN"
+    print_info "Recovery state saved as WAITING_FOR_ADMIN for a fresh authoritative admin join."
+    print_info "Run: sudo /usr/local/sbin/dr-domain-admin-join"
 }
 
 clear_state() {
@@ -2459,7 +2547,8 @@ EOF
             cat << 'EOF'
 kdestroy
 kinit ADMIN_USER@REALM                 # human enters password at Kerberos prompt
-net ads join --use-kerberos=required      # creates or updates the AD computer account
+dr-domain-admin-join                     # authoritative AD allocation and collision gate
+net ads join --use-kerberos=required      # only after the final AD availability check
 net ads testjoin                         # validates local machine membership
 net ads keytab create                    # materializes /etc/krb5.keytab from smb.conf
 klist -k /etc/krb5.keytab
@@ -2473,31 +2562,15 @@ EOF
 
 platform_domain_join() {
     local admin_user="${1:-}"
-    local kerberos_principal
 
     case "$PLATFORM_FAMILY" in
         debian)
             realm join -v "$DOMAIN" -U "$admin_user"
             ;;
         arch)
-            if [ -z "$admin_user" ]; then
-                read -r -p "Domain admin username: " admin_user
-            fi
-            case "$admin_user" in
-                *@*) kerberos_principal="$admin_user" ;;
-                *) kerberos_principal="${admin_user}@${REALM}" ;;
-            esac
-            [ -n "$admin_user" ] || {
-                print_error "Domain admin username is required"
-                return 1
-            }
-            kdestroy >/dev/null 2>&1 || true
-            print_info "Obtaining a Kerberos ticket for $kerberos_principal; the password is entered directly into kinit"
-            kinit "$kerberos_principal" || return 1
-            net ads join --use-kerberos=required || return 1
-            platform_domain_testjoin || return 1
-            platform_generate_machine_keytab || return 1
-            platform_validate_machine_keytab
+            print_error "Arch joins must use /usr/local/sbin/dr-domain-admin-join"
+            print_error "That helper performs the independent authoritative AD collision gate immediately before net ads join"
+            return 1
             ;;
         *)
             print_error "No domain-join adapter exists for platform family '$PLATFORM_FAMILY'"
@@ -2506,17 +2579,8 @@ platform_domain_join() {
     esac
 }
 
-install_arch_domain_admin_join_helper() {
-    local helper="/usr/local/sbin/dr-domain-admin-join"
-    local motd="/etc/update-motd.d/99-dr-domain-join"
-    local profiled="/etc/profile.d/dr-domain-join.sh"
-
-    mkdir -p /usr/local/sbin /etc/update-motd.d /etc/profile.d
-    backup_config_file "$helper"
-    backup_config_file "$motd"
-    backup_config_file "$profiled"
-
-    cat > "$helper" << EOF
+render_arch_domain_admin_join_helper() {
+    cat << EOF
 #!/bin/bash
 set -euo pipefail
 
@@ -2524,10 +2588,13 @@ DOMAIN="$DOMAIN"
 REALM="$REALM"
 OFFICE_CODE="${OFFICE_CODE:-EP1}"
 SCRIPT_VERSION="$SCRIPT_VERSION"
-STATE_DIR="$STATE_DIR"
-STATE_FILE="$STATE_FILE"
-SMB_CONF="/etc/samba/smb.conf"
-KEYTAB="/etc/krb5.keytab"
+STATE_DIR="\${DR_ADMIN_STATE_DIR:-$STATE_DIR}"
+STATE_FILE="\${DR_ADMIN_STATE_FILE:-\$STATE_DIR/state}"
+SMB_CONF="\${DR_ADMIN_SMB_CONF:-/etc/samba/smb.conf}"
+KEYTAB="\${DR_ADMIN_KEYTAB:-/etc/krb5.keytab}"
+SECRETS_TDB="\${DR_ADMIN_SECRETS_TDB:-/var/lib/samba/private/secrets.tdb}"
+HOSTS_FILE="\${DR_ADMIN_HOSTS_FILE:-/etc/hosts}"
+JOIN_LIFECYCLE="NEW_JOIN"
 
 print_info() { echo "[INFO] \$*"; }
 print_warn() { echo "[WARN] \$*" >&2; }
@@ -2542,6 +2609,7 @@ STAGE="\${1:-DOMAIN_JOIN_COMPLETE}"
 OFFICE_CODE="\$OFFICE_CODE"
 DOMAIN="\$DOMAIN"
 TARGET_HOSTNAME="\${2:-}"
+JOIN_LIFECYCLE="\$JOIN_LIFECYCLE"
 HOSTNAME_CHANGED="0"
 STATEEOF
     chmod 600 "\$STATE_FILE"
@@ -2566,13 +2634,176 @@ if [ "\$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-for required in net kinit klist hostnamectl testparm; do
+for required in net kinit klist hostnamectl testparm ldapsearch; do
     if ! command -v "\$required" >/dev/null 2>&1; then
         print_error "Required Arch join command not found: \$required"
         print_error "Have the technician rerun the candidate after the approved dependency checkpoint."
         exit 1
     fi
 done
+
+office_hostname_prefix() {
+    case "\$(echo "\${OFFICE_CODE:-}" | tr '[:lower:]' '[:upper:]')" in
+        EP|EP1) echo "ep-cr-kit" ;;
+        MSP) echo "msp-cr-kit" ;;
+        CHI) echo "chi-cr-kit" ;;
+        ATL) echo "atl-cr-kit" ;;
+        LON|UK|UK1) echo "lon-cr-kit" ;;
+        DE|DE1) echo "de-cr-kit" ;;
+        PL|PL1) echo "pl-cr-kit" ;;
+        *)
+            local office_lower
+            office_lower="\$(echo "\${OFFICE_CODE:-kit}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
+            [ -n "\$office_lower" ] || office_lower="kit"
+            echo "\${office_lower}-cr-kit" | cut -c1-12 | sed 's/-\$//'
+            ;;
+    esac
+}
+
+is_valid_ad_hostname() {
+    local hostname_value="\$1"
+    [ "\${#hostname_value}" -le 15 ] || return 1
+    echo "\$hostname_value" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\$'
+}
+
+suggest_hostname() {
+    local prefix="\$1" number="\$2"
+    number="\$(echo "\$number" | tr -cd '0-9')"
+    [ -n "\$number" ] || number="01"
+    [ "\${#number}" -eq 1 ] && number="0\$number"
+    echo "\${prefix}-\${number}"
+}
+
+hostname_matches_managed_policy() {
+    local hostname_value="\$1" prefix suffix
+    prefix="\$(office_hostname_prefix)"
+    case "\$hostname_value" in
+        "\${prefix}-"[0-9][0-9]) suffix="\${hostname_value#\${prefix}-}" ;;
+        *) return 1 ;;
+    esac
+    [ "\${#suffix}" -eq 2 ] && is_valid_ad_hostname "\$hostname_value"
+}
+
+machine_identity_trusted() {
+    local current_host
+    [ -s "\$KEYTAB" ] && [ -s "\$SECRETS_TDB" ] || return 1
+    net ads testjoin >/dev/null 2>&1 || return 1
+    current_host="\$(hostnamectl --static 2>/dev/null || hostname)"
+    LC_ALL=C klist -k "\$KEYTAB" 2>/dev/null \
+        | grep -Eiq "(host|cifs)/\${current_host}([.@]|$)" || return 1
+}
+
+domain_to_base_dn() {
+    echo "\$DOMAIN" | awk -F. '{
+        for (i = 1; i <= NF; i++) {
+            if (i > 1) printf ",";
+            printf "DC=%s", \$i;
+        }
+        printf "\\n";
+    }'
+}
+
+discover_ldap_dcs() {
+    local dc_hosts=""
+    if command -v dig >/dev/null 2>&1; then
+        dc_hosts="\$(dig +short _ldap._tcp.\$DOMAIN SRV 2>/dev/null \
+            | sort -n -k1,1 -k2,2 \
+            | awk '{print \$4}' \
+            | sed 's/[.]\$//' \
+            | awk 'NF && !seen[\$0]++' || true)"
+    fi
+    if [ -z "\$dc_hosts" ] && command -v host >/dev/null 2>&1; then
+        dc_hosts="\$(host -t SRV _ldap._tcp.\$DOMAIN 2>/dev/null \
+            | awk '{print \$NF}' \
+            | sed 's/[.]\$//' \
+            | awk 'NF && !seen[\$0]++' || true)"
+    fi
+    [ -n "\$dc_hosts" ] || {
+        print_error "Unable to discover LDAP domain controllers from _ldap._tcp.\$DOMAIN."
+        return 1
+    }
+    echo "\$dc_hosts"
+}
+
+ldap_search_computer_object() {
+    local ldap_dc="\$1" base_dn="\$2" sam="\$3"
+    timeout 15s env KRB5_CONFIG=/tmp/dr-domain-admin-krb5.conf \
+        ldapsearch -LLL -Q -Y GSSAPI -N \
+        -o nettimeout=10 -o timelimit=10 -o referrals=false \
+        -H "ldap://\$ldap_dc" -b "\$base_dn" -s sub \
+        "(&(objectClass=computer)(sAMAccountName=\$sam))" \
+        dn sAMAccountName dNSHostName description whenCreated </dev/null
+}
+
+ad_computer_exists() {
+    local candidate="\$1" sam base_dn output rc dc
+    local successful_queries=0 failed_queries=0
+    sam="\$(echo "\$candidate" | tr '[:lower:]' '[:upper:]')\$"
+    base_dn="\$(domain_to_base_dn)"
+
+    for dc in \$LDAP_DCS; do
+        if output="\$(ldap_search_computer_object "\$dc" "\$base_dn" "\$sam" 2>&1)"; then
+            rc=0
+        else
+            rc=\$?
+        fi
+        if [ "\$rc" -ne 0 ]; then
+            failed_queries=\$((failed_queries + 1))
+            print_error "AD query failed on \$dc while checking \$candidate"
+            echo "\$output" | sed 's/^/  /' >&2
+            continue
+        fi
+        successful_queries=\$((successful_queries + 1))
+        if echo "\$output" | grep -qi '^dn:'; then
+            print_error "Computer account \$candidate already exists in Active Directory."
+            print_error "Existing object:"
+            echo "\$output" | sed 's/^/  /' >&2
+            return 0
+        fi
+    done
+
+    [ "\$successful_queries" -gt 0 ] || return 2
+    [ "\$failed_queries" -eq 0 ] || return 2
+    return 1
+}
+
+find_next_available_ad_hostname() {
+    local prefix="\$(office_hostname_prefix)" candidate rc n
+    for n in \$(seq 1 99); do
+        candidate="\$(suggest_hostname "\$prefix" "\$n")"
+        is_valid_ad_hostname "\$candidate" || continue
+        echo "  checking authoritative AD computer object: \$candidate" >&2
+        if ad_computer_exists "\$candidate"; then
+            continue
+        else
+            rc=\$?
+        fi
+        [ "\$rc" -eq 1 ] || {
+            print_error "AD availability query for \$candidate was not authoritative; refusing hostname allocation."
+            return 1
+        }
+        echo "\$candidate"
+        return 0
+    done
+    return 1
+}
+
+update_hosts_for_hostname_admin() {
+    local new_hostname="\$1" hosts_file="\$HOSTS_FILE" tmp_file
+    tmp_file="\$(mktemp)"
+    cp "\$hosts_file" "\${hosts_file}.dr-domain-admin-join.bak.\$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    awk -v hn="\$new_hostname" -v fqdn="\${new_hostname}.\$DOMAIN" '
+        BEGIN { replaced=0 }
+        /^127[.]0[.]1[.]1[[:space:]]+/ {
+            if (!replaced) { print "127.0.1.1    " fqdn "    " hn; replaced=1 }
+            next
+        }
+        { print }
+        END { if (!replaced) print "127.0.1.1    " fqdn "    " hn }
+    ' "\$hosts_file" > "\$tmp_file"
+    cat "\$tmp_file" > "\$hosts_file"
+    rm -f "\$tmp_file"
+}
 
 testparm -s "\$SMB_CONF" >/dev/null
 current_host="\$(hostnamectl --static 2>/dev/null || hostname)"
@@ -2582,8 +2813,9 @@ echo "Office code:      \$OFFICE_CODE"
 echo "Join backend:     Samba ADS (SSSD remains the NSS/PAM provider)"
 echo ""
 
-if [ -s "\$KEYTAB" ] && net ads testjoin >/dev/null 2>&1; then
-    print_info "Existing Samba machine membership is valid."
+if machine_identity_trusted; then
+    print_info "Existing Samba machine membership and local host/keytab identity are valid."
+    JOIN_LIFECYCLE="MANAGED_RERUN"
     save_join_state "DOMAIN_JOIN_COMPLETE" "\$current_host"
     exit 0
 fi
@@ -2602,6 +2834,56 @@ print_info "Enter the password directly at the kinit prompt; it is not captured 
 kdestroy >/dev/null 2>&1 || true
 kinit "\$kerberos_principal"
 
+LDAP_DCS="\$(discover_ldap_dcs)"
+[ -n "\$LDAP_DCS" ] || {
+    print_error "Cannot query AD authoritatively without discovered LDAP domain controllers."
+    exit 1
+}
+print_info "Using LDAP domain controller(s) for authoritative hostname checks:"
+echo "\$LDAP_DCS" | sed 's/^/  /'
+
+selected_host=""
+if is_valid_ad_hostname "\$current_host" && hostname_matches_managed_policy "\$current_host"; then
+    if ad_computer_exists "\$current_host"; then
+        print_info "Current hostname \$current_host is occupied; allocating the next free AD name."
+    else
+        current_rc=\$?
+        [ "\$current_rc" -eq 1 ] || {
+            print_error "Current hostname availability could not be established authoritatively."
+            exit 1
+        }
+        selected_host="\$current_host"
+    fi
+fi
+if [ -z "\$selected_host" ]; then
+    selected_host="\$(find_next_available_ad_hostname)" || {
+        print_error "Active Directory did not provide an authoritative unused workstation name."
+        exit 1
+    }
+fi
+
+if [ "\$selected_host" != "\$current_host" ]; then
+    print_info "Allocating unused AD hostname \$selected_host (current local hostname: \$current_host)."
+    hostnamectl set-hostname "\$selected_host"
+    update_hosts_for_hostname_admin "\$selected_host"
+    current_host="\$selected_host"
+fi
+
+# Independent last-moment collision gate. This query is deliberately repeated
+# immediately before net ads join to close stale-state and TOCTOU races.
+if ad_computer_exists "\$selected_host"; then
+    print_error "Computer account \$selected_host already exists in Active Directory."
+    print_error "No domain join was attempted. Rerun provisioning to allocate an unused workstation name."
+    exit 1
+else
+    collision_rc=\$?
+fi
+[ "\$collision_rc" -eq 1 ] || {
+    print_error "Unable to prove that \$selected_host is unused in Active Directory."
+    print_error "No domain join was attempted."
+    exit 1
+}
+
 print_info "Joining the AD domain with Samba's Kerberos ticket."
 net ads join --use-kerberos=required
 print_info "Validating the local machine membership."
@@ -2619,11 +2901,25 @@ print_info "Generating the system keytab using Samba's 4.21+ synchronization rul
 net ads keytab create
 klist -k "\$KEYTAB" | grep -qi "\$REALM"
 chmod 600 "\$KEYTAB"
+JOIN_LIFECYCLE="NEW_JOIN"
 save_join_state "DOMAIN_JOIN_COMPLETE" "\$current_host"
 print_info "Join is OK and \$KEYTAB is valid."
 echo ""
 echo "Rerun the candidate provisioning script locally to configure SSSD, PAM, sudo, and Tool Server mounting."
 EOF
+}
+
+install_arch_domain_admin_join_helper() {
+    local helper="/usr/local/sbin/dr-domain-admin-join"
+    local motd="/etc/update-motd.d/99-dr-domain-join"
+    local profiled="/etc/profile.d/dr-domain-join.sh"
+
+    mkdir -p /usr/local/sbin /etc/update-motd.d /etc/profile.d
+    backup_config_file "$helper"
+    backup_config_file "$motd"
+    backup_config_file "$profiled"
+
+    render_arch_domain_admin_join_helper > "$helper"
     chmod 755 "$helper"
     chown root:root "$helper"
 
@@ -5388,6 +5684,7 @@ BRAND_WALLPAPER_DEST="${BRAND_WALLPAPER_DEST}"
 STATE_DIR="${STATE_DIR}"
 STATE_FILE="${STATE_FILE}"
 OFFICE_CODE="${OFFICE_CODE:-}"
+TOOLS_SOURCE="//$TOOLS_SERVER/Tools"
 LOG_FILE="/var/log/dr-post-mount-provision.log"
 
 log() {
@@ -5401,6 +5698,12 @@ state_mark() {
 
 state_has() {
     [ -f "\$STATE_DIR/\$1" ]
+}
+
+tools_mount_is_authoritative() {
+    command -v findmnt >/dev/null 2>&1 || return 1
+    findmnt --noheadings --raw --target /mnt/x --output FSTYPE,SOURCE 2>/dev/null \
+        | awk -v expected="\$TOOLS_SOURCE" '\$1 == "cifs" && \$2 == expected { found=1 } END { exit(found ? 0 : 1) }'
 }
 
 install_root_kit_launcher_helper() {
@@ -5510,9 +5813,9 @@ else
     log "No saved office code found in \$STATE_FILE."
 fi
 
-if ! mountpoint -q /mnt/x; then
-    log "DR Tools share is not mounted at /mnt/x; skipping post-mount provisioning."
-    exit 0
+if ! tools_mount_is_authoritative; then
+    log "DR Tools share is not an authoritative CIFS mount at /mnt/x; refusing post-mount provisioning."
+    exit 1
 fi
 
 install_root_kit_launcher_helper
@@ -6120,13 +6423,52 @@ tools_automount_unit_name() {
     systemd-escape --path --suffix=automount "${1:-/mnt/x}"
 }
 
+resolve_domain_user_uid() {
+    local user="${1:-}" passwd_line resolved_uid
+    local -a records fields
+    [ -n "$user" ] || return 1
+    mapfile -t records < <(getent passwd "$user" 2>/dev/null || true)
+    [ "${#records[@]}" -eq 1 ] || return 1
+    passwd_line="${records[0]}"
+    IFS=: read -r -a fields <<< "$passwd_line"
+    [ "${#fields[@]}" -eq 7 ] || return 1
+    [ -n "${fields[0]}" ] || return 1
+    resolved_uid="${fields[2]}"
+    case "$resolved_uid" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$(id -u "${fields[0]}" 2>/dev/null || true)" = "$resolved_uid" ] || return 1
+    # A local account with the same name is not proof of an SSSD/domain
+    # identity. Never bind a Kerberos CIFS mount to that local UID.
+    if awk -F: -v user="${fields[0]}" '$1 == user { found=1 } END { exit(found ? 0 : 1) }' /etc/passwd 2>/dev/null; then
+        return 1
+    fi
+    printf '%s\n' "$resolved_uid"
+}
+
 tools_mount_cruid() {
     local uid="${DR_TOOLS_MOUNT_CRUID:-}"
-    if [ -z "$uid" ] && [ -n "${DOMAIN_SUDO_USER:-}" ]; then
-        uid="$(id -u "$DOMAIN_SUDO_USER" 2>/dev/null || true)"
-    fi
-    if [ -z "$uid" ] && [ -n "${SUDO_UID:-}" ] && [ "${SUDO_UID}" != 0 ]; then
-        uid="$SUDO_UID"
+    if [ "$PLATFORM_FAMILY" = arch ]; then
+        local resolved_domain_uid
+        resolved_domain_uid="$(resolve_domain_user_uid "${DOMAIN_SUDO_USER:-}" || true)"
+        [ -n "$resolved_domain_uid" ] || {
+            print_error "Selected Arch domain user '${DOMAIN_SUDO_USER:-}' does not resolve through NSS/SSSD"
+            print_error "No local UID or SUDO_UID fallback will be used for /mnt/x"
+            return 1
+        }
+        if [ -n "$uid" ] && [ "$uid" != "$resolved_domain_uid" ]; then
+            print_error "Persisted Tool Server cruid=$uid does not match resolved domain-user UID $resolved_domain_uid"
+            return 1
+        fi
+        uid="$resolved_domain_uid"
+    else
+        # Preserve the established Debian behavior. Arch deliberately does
+        # not use these fallbacks because a local UID must never stand in for
+        # an unresolved domain identity.
+        if [ -z "$uid" ] && [ -n "${DOMAIN_SUDO_USER:-}" ]; then
+            uid="$(id -u "$DOMAIN_SUDO_USER" 2>/dev/null || true)"
+        fi
+        if [ -z "$uid" ] && [ -n "${SUDO_UID:-}" ] && [ "${SUDO_UID}" != 0 ]; then
+            uid="$SUDO_UID"
+        fi
     fi
     case "$uid" in
         ''|*[!0-9]*) return 1 ;;
@@ -6667,18 +7009,30 @@ platform_install_drip_search() {
 
 platform_verify_drip_search() {
     [ "$PLATFORM_FAMILY" = "arch" ] || return 0
-    [ -r "$DR_DRIP_MANIFEST" ] || return 1
-    local entry mount_unit automount_unit
-    while IFS=$'\t' read -r entry mount_unit automount_unit; do
+    [ -r "$DR_DRIP_MANIFEST" ] && [ ! -L "$DR_DRIP_MANIFEST" ] || return 1
+    local entry mount_unit automount_unit extra count=0 server share
+    while IFS=$'\t' read -r entry mount_unit automount_unit extra; do
         [ -n "$entry" ] || continue
+        [ -z "${extra:-}" ] || return 1
+        validate_drip_search_root_entry "$entry" || return 1
         [ "$(drip_mount_unit_name "$entry")" = "$mount_unit" ] || return 1
         [ "$(drip_automount_unit_name "$entry")" = "$automount_unit" ] || return 1
+        [ -f "$DR_DRIP_UNIT_DIR/$mount_unit" ] && [ ! -L "$DR_DRIP_UNIT_DIR/$mount_unit" ] || return 1
+        [ -f "$DR_DRIP_UNIT_DIR/$automount_unit" ] && [ ! -L "$DR_DRIP_UNIT_DIR/$automount_unit" ] || return 1
+        server="${entry%%/*}"
+        share="${entry#*/}"
+        grep -Fxq "What=//$server/$share" "$DR_DRIP_UNIT_DIR/$mount_unit" || return 1
+        grep -Fxq "Where=/smb/$entry" "$DR_DRIP_UNIT_DIR/$mount_unit" || return 1
+        grep -Fxq 'Options=_netdev,nofail,sec=krb5,cruid=0,vers=3.0' "$DR_DRIP_UNIT_DIR/$mount_unit" || return 1
+        grep -Fxq "Where=/smb/$entry" "$DR_DRIP_UNIT_DIR/$automount_unit" || return 1
         systemd-analyze verify "$DR_DRIP_UNIT_DIR/$mount_unit" "$DR_DRIP_UNIT_DIR/$automount_unit" >/dev/null 2>&1 || return 1
         if systemctl is-enabled --quiet "$automount_unit" 2>/dev/null; then
             print_error "DRIP search automount must not be enabled globally: $automount_unit"
             return 1
         fi
+        count=$((count + 1))
     done < "$DR_DRIP_MANIFEST"
+    [ "$count" -gt 0 ]
 }
 
 platform_remove_drip_search() {
@@ -7033,10 +7387,18 @@ platform_verify_tools_mount() {
         [ -f "/etc/systemd/system/$mount_unit" ] || return 1
         [ -f "/etc/systemd/system/$automount_unit" ] || return 1
         systemd-analyze verify "/etc/systemd/system/$mount_unit" "/etc/systemd/system/$automount_unit" >/dev/null 2>&1
-        systemctl is-enabled --quiet "$automount_unit" 2>/dev/null
+        systemctl is-enabled --quiet "$automount_unit" 2>/dev/null || return 1
+        platform_tools_mount_is_authoritative
     else
         command -v automount >/dev/null 2>&1 && systemctl is-active --quiet autofs
     fi
+}
+
+platform_tools_mount_is_authoritative() {
+    local expected="//$TOOLS_SERVER/Tools"
+    command -v findmnt >/dev/null 2>&1 || return 1
+    findmnt --noheadings --raw --target /mnt/x --output FSTYPE,SOURCE 2>/dev/null \
+        | awk -v expected="$expected" '$1 == "cifs" && $2 == expected { found=1 } END { exit(found ? 0 : 1) }'
 }
 
 platform_start_tools_mount() {
@@ -7076,10 +7438,36 @@ platform_remove_tools_mount() {
     systemctl disable --now autofs
 }
 
+platform_validate_selected_domain_user() {
+    [ "$PLATFORM_FAMILY" = arch ] || return 0
+    local uid
+    if [ -z "${DOMAIN_SUDO_USER:-}" ]; then
+        print_error "No Arch domain user was selected for the Tool Server mount"
+        print_error "Post-mount provisioning is blocked until a domain identity is selected and resolved"
+        return 1
+    fi
+    if uid="$(resolve_domain_user_uid "$DOMAIN_SUDO_USER")"; then
+        print_info "Selected domain user $DOMAIN_SUDO_USER resolves through NSS/SSSD as UID $uid"
+        return 0
+    fi
+    print_error "Selected domain user $DOMAIN_SUDO_USER does not resolve through NSS/SSSD"
+    print_error "SSSD may still be failing domain/site SRV discovery; no local UID will be substituted"
+    if command -v sssctl >/dev/null 2>&1; then
+        sssctl domain-status "$DOMAIN" 2>&1 | sed 's/^/  /' || true
+    fi
+    return 1
+}
+
 platform_install_tools_mount() {
     if [ "$PLATFORM_FAMILY" != "arch" ]; then
         return 0
     fi
+
+    platform_cifs_kernel_is_ready || {
+        print_error "Cannot configure the Arch Tool Server mount because CIFS is unavailable for the running kernel"
+        print_error "Run --preflight and reboot into the installed kernel when its module tree is required"
+        return 1
+    }
 
     local mount_unit automount_unit cruid
     cruid="$(tools_mount_cruid)" || {
@@ -7114,9 +7502,10 @@ platform_install_tools_mount() {
 
 render_arch_tools_mount_helper() {
     local configured_cruid="${1:-${DR_TOOLS_MOUNT_CRUID:-}}"
-    local mount_unit automount_unit
+    local mount_unit automount_unit server
     mount_unit="$(tools_mount_unit_name)" || return 1
     automount_unit="$(tools_automount_unit_name)" || return 1
+    server="$TOOLS_SERVER"
     case "$configured_cruid" in
         ''|*[!0-9]*)
             print_error "Arch Tool Server helper requires a configured domain-user UID as cruid" >&2
@@ -7127,10 +7516,17 @@ render_arch_tools_mount_helper() {
 #!/bin/bash
 set -euo pipefail
 
-MOUNT_POINT="/mnt/x"
+MOUNT_POINT="\${DR_TOOLS_MOUNT_POINT:-/mnt/x}"
+TOOLS_SOURCE="//$server/Tools"
 MOUNT_UNIT="$mount_unit"
 AUTOMOUNT_UNIT="$automount_unit"
 CONFIGURED_CRUID="$configured_cruid"
+
+verify_tools_mount() {
+    command -v findmnt >/dev/null 2>&1 || return 1
+    findmnt --noheadings --raw --target "\$MOUNT_POINT" --output FSTYPE,SOURCE 2>/dev/null \
+        | awk -v expected="\$TOOLS_SOURCE" '\$1 == "cifs" && \$2 == expected { found=1 } END { exit(found ? 0 : 1) }'
+}
 
 if [ "\${1:-}" = "--sudo-self-test" ]; then
     exit 0
@@ -7138,6 +7534,7 @@ fi
 
 if [ "\${1:-}" = "--access-self-test" ]; then
     [ "\$(id -u)" -eq 0 ] || { echo "--access-self-test must run as root" >&2; exit 1; }
+    verify_tools_mount || { echo "Tool Server is not an authoritative CIFS mount at \$MOUNT_POINT" >&2; exit 1; }
     timeout 30s ls -la "\$MOUNT_POINT" >/dev/null
     exit 0
 fi
@@ -7166,11 +7563,11 @@ if [ "\$(id -u)" -ne 0 ]; then
     fi
     USER_UID="\$(id -u)"
     sudo -n /usr/local/bin/mount-kit-tools --cruid "\$USER_UID"
-    if ! timeout 30s ls -la "\$MOUNT_POINT" >/dev/null 2>&1; then
+    if ! verify_tools_mount || ! timeout 30s ls -la "\$MOUNT_POINT" >/dev/null 2>&1; then
         echo "Tool Server access failed. Ensure the logged-in user has a valid Kerberos ticket." >&2
         exit 1
     fi
-    mountpoint -q "\$MOUNT_POINT"
+    verify_tools_mount
     exit 0
 fi
 
@@ -7180,15 +7577,15 @@ if ! KRB5CCNAME="FILE:/tmp/krb5cc_\$CURRENT_CONFIGURED_CRUID" klist -s 2>/dev/nu
     exit 1
 fi
 systemctl start "\$AUTOMOUNT_UNIT"
-if mountpoint -q "\$MOUNT_POINT"; then
+if verify_tools_mount; then
     exit 0
 fi
 
-if ! timeout 30s ls -la "\$MOUNT_POINT" >/dev/null 2>&1; then
+if ! timeout 30s ls -la "\$MOUNT_POINT" >/dev/null 2>&1 || ! verify_tools_mount; then
     echo "Tool Server access failed. Ensure the logged-in user has a valid Kerberos ticket." >&2
     exit 1
 fi
-mountpoint -q "\$MOUNT_POINT"
+verify_tools_mount
 EOF
 }
 
@@ -7236,6 +7633,7 @@ configure_autofs_cifs() {
     print_info "Configuring CIFS access for DRIP and KIT tools..."
 
     if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        platform_validate_selected_domain_user || return 1
         platform_install_tools_mount || return 1
         if platform_validate_drip_search_roots; then
             platform_install_drip_search || return 1
@@ -7997,6 +8395,7 @@ verify_join() {
     print_info "Domain join verified: $DOMAIN"
 
     if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        platform_validate_selected_domain_user || return 1
         platform_validate_machine_keytab || return 1
         platform_verify_machine_account_renewal || {
             print_error "Arch machine-account renewal timer/helper is missing or invalid"
@@ -8212,6 +8611,11 @@ main() {
     # read-only platform/preflight pass.
     detect_os || exit 1
     load_config
+
+    if state_requires_recovery; then
+        recover_stale_state
+        exit 2
+    fi
 
     print_resume_state
     print_machine_status
