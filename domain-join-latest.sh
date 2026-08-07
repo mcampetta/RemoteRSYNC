@@ -25,14 +25,16 @@
 #          reruns stop safely and direct users to dr-workstation commands.
 #
 # DNS behavior:
-#   This script expects DHCP/VPN to provide the correct office-local AD DNS
-#   servers. The script applies the required corporate DNS search list before
-#   realm discovery.
+#   Debian/Ubuntu preserve DHCP/VPN DNS and apply the required corporate search
+#   list. On Arch, a resolver that already passes AD SRV discovery is preserved;
+#   otherwise the selected office's configured fallback servers are validated
+#   before NetworkManager is changed.
 #
 # Optional override:
 #   If DHCP does not provide usable AD DNS, create domain-join.conf next to this
-#   script and set DNS_SERVERS="10.x.x.x 10.x.x.x". When DNS_SERVERS is set,
-#   the script will explicitly apply those DNS servers via NetworkManager.
+#   script and set DNS_SERVERS="10.x.x.x 10.x.x.x". Arch may also use
+#   office-specific DR_DNS_SERVERS_<OFFICE> and DR_TIME_SERVERS_<OFFICE>
+#   mappings; only the selected office's validated fallback is applied.
 #
 # Test mode:
 #   wget -qO- http://ontrack.link/joindomain | sudo bash -s -- --dns-test
@@ -85,6 +87,11 @@ CONFIG_FILE="/etc/domain-join.conf"
 DR_WORKSTATION_USERS_GROUP="dr-workstation-users"
 DR_WORKSTATION_ADMINS_GROUP="dr-workstation-admins"
 DR_LOCAL_ADMIN_USER="${DR_LOCAL_ADMIN_USER:-drone}"
+DR_DNS_SERVERS_EP1="${DR_DNS_SERVERS_EP1:-10.59.4.201 10.59.4.202}"
+DR_TIME_SERVERS_EP1="${DR_TIME_SERVERS_EP1:-10.59.4.201 10.59.4.202}"
+DR_DNS_SERVERS="${DR_DNS_SERVERS:-}"
+DR_TIME_SERVERS="${DR_TIME_SERVERS:-}"
+DR_TIMESYNCD_DROPIN="${DR_TIMESYNCD_DROPIN:-/etc/systemd/timesyncd.conf.d/90-dr-domain.conf}"
 # The production workflow depends on KIT/IOLib DRIP paths. Arch provides only
 # configured /smb/server/share roots through systemd automount units; arbitrary
 # dynamic /smb or /net paths remain unsupported. A candidate may opt into
@@ -139,9 +146,9 @@ load_config() {
     fi
 
     if [ -n "$DNS_SERVERS" ]; then
-        print_info "Configuration loaded; DNS override enabled: $DNS_SERVERS"
+        print_info "Configuration loaded; explicit DNS override enabled: $DNS_SERVERS"
     else
-        print_info "No DNS override configured; using DHCP/VPN-provided DNS servers"
+        print_info "No explicit DNS override configured; preserving working DNS or using the selected office fallback"
     fi
 }
 
@@ -740,7 +747,7 @@ platform_capability_status() {
     local capability="$1"
     local package
     if [ "$capability" = "time-sync" ] && platform_time_provider_satisfies; then
-        printf 'PASS|%s|existing supported provider is active or enabled' "$capability"
+        printf 'PASS|%s|existing selected provider is active or enabled (%s)' "$capability" "$(platform_time_provider selected)"
         return 0
     fi
     package="$(platform_package_name "$capability")"
@@ -768,7 +775,7 @@ platform_capability_status() {
 }
 
 platform_report() {
-    local capability status name detail package_db
+    local capability status name detail package_db display_package
     PLATFORM_REPORT_BLOCKERS=0
     platform_admin_group >/dev/null
 
@@ -809,7 +816,11 @@ platform_report() {
     echo "Capability/package mapping"
     for capability in "${PLATFORM_CAPABILITIES[@]}"; do
         IFS='|' read -r status name detail <<< "$(platform_capability_status "$capability")"
-        printf '  %-8s %-18s %-28s %s (%s)\n' "$status" "$name" "$(platform_capability_class "$name")" "$detail" "$(platform_package_name "$name")"
+        display_package="$(platform_package_name "$name")"
+        if [ "$name" = time-sync ] && [ "$(platform_time_provider selected)" != none ]; then
+            display_package="$(platform_time_provider selected)"
+        fi
+        printf '  %-8s %-18s %-28s %s (%s)\n' "$status" "$name" "$(platform_capability_class "$name")" "$detail" "$display_package"
         [ "$status" = "BLOCKED" ] && PLATFORM_REPORT_BLOCKERS=$((PLATFORM_REPORT_BLOCKERS + 1))
     done
     echo ""
@@ -826,7 +837,16 @@ platform_time_provider() {
     local mode="${1:-active}"
     local service
 
-    if [ "$mode" = "enabled" ]; then
+    if [ "$mode" = "selected" ]; then
+        service="$(platform_time_provider active)"
+        if [ "$service" != none ]; then
+            echo "$service"
+            return 0
+        fi
+        service="$(platform_time_provider enabled)"
+        [ "$service" != none ] && echo "$service" || echo none
+        return 0
+    elif [ "$mode" = "enabled" ]; then
         for service in chronyd chrony systemd-timesyncd; do
             if systemctl is-enabled --quiet "$service" 2>/dev/null; then
                 echo "$service"
@@ -846,10 +866,133 @@ platform_time_provider() {
 }
 
 platform_time_provider_satisfies() {
-    local active enabled
-    active="$(platform_time_provider active)"
-    enabled="$(platform_time_provider enabled)"
-    [ "$active" != "none" ] || [ "$enabled" != "none" ]
+    [ "$(platform_time_provider selected)" != none ]
+}
+
+platform_time_sources() {
+    platform_office_server_list TIME
+}
+
+render_arch_timesyncd_dropin() {
+    [ "$PLATFORM_FAMILY" = arch ] || return 1
+    local sources
+    sources="$(platform_time_sources)"
+    platform_validate_server_list "$sources" || return 1
+    cat << EOF
+# Managed by DR Domain Join; vendor files under /usr/lib are not modified.
+[Time]
+NTP=
+NTP=$sources
+FallbackNTP=
+EOF
+}
+
+platform_timesyncd_source_matches() {
+    local status sources source
+    sources="$(platform_time_sources)"
+    platform_validate_server_list "$sources" || return 1
+    status="$(timedatectl timesync-status 2>/dev/null || true)"
+    [ -n "$status" ] || return 1
+    for source in $sources; do
+        if printf '%s\n' "$status" | grep -Fq -- "$source"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+platform_timesyncd_dropin_matches() {
+    [ -f "$DR_TIMESYNCD_DROPIN" ] || return 1
+    diff -q <(render_arch_timesyncd_dropin) "$DR_TIMESYNCD_DROPIN" >/dev/null 2>&1
+}
+
+platform_timesyncd_is_ready() {
+    [ "$(platform_time_provider selected)" = systemd-timesyncd ] || return 1
+    [ "$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || true)" = yes ] || return 1
+    platform_timesyncd_source_matches
+}
+
+platform_wait_for_timesyncd() {
+    local retries="${DR_TIME_SYNC_RETRIES:-6}"
+    local delay="${DR_TIME_SYNC_RETRY_DELAY:-5}"
+    local count=0
+    while [ "$count" -lt "$retries" ]; do
+        if platform_timesyncd_is_ready; then
+            return 0
+        fi
+        count=$((count + 1))
+        [ "$count" -lt "$retries" ] && sleep "$delay"
+    done
+    return 1
+}
+
+platform_configure_timesyncd() {
+    [ "$PLATFORM_FAMILY" = arch ] || return 0
+    if [ "${1:-}" != force ] && [ "$(platform_time_provider selected)" != systemd-timesyncd ]; then
+        return 0
+    fi
+    local target="$DR_TIMESYNCD_DROPIN"
+    local directory staged rollback_copy old_exists=0
+    directory="$(dirname "$target")"
+    mkdir -p "$directory" || return 1
+    staged="$(mktemp "$directory/.90-dr-domain.conf.XXXXXX")" || return 1
+    rollback_copy="$(mktemp "$directory/.90-dr-domain.rollback.XXXXXX")" || {
+        rm -f -- "$staged"
+        return 1
+    }
+    rm -f -- "$rollback_copy"
+
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        old_exists=1
+        cp -a -- "$target" "$rollback_copy" || {
+            rm -f -- "$staged" "$rollback_copy"
+            return 1
+        }
+    fi
+    render_arch_timesyncd_dropin > "$staged" || {
+        rm -f -- "$staged" "$rollback_copy"
+        return 1
+    }
+    chmod 644 "$staged"
+    chown root:root "$staged" 2>/dev/null || true
+
+    if cmp -s "$staged" "$target" 2>/dev/null; then
+        rm -f -- "$staged" "$rollback_copy"
+        if command -v systemd-analyze >/dev/null 2>&1; then
+            systemd-analyze cat-config systemd/timesyncd.conf >/dev/null 2>&1 || return 1
+        fi
+        return 0
+    fi
+
+    backup_config_file "$target"
+    mv -f -- "$staged" "$target" || {
+        rm -f -- "$staged" "$rollback_copy"
+        return 1
+    }
+    if command -v systemd-analyze >/dev/null 2>&1 && ! systemd-analyze cat-config systemd/timesyncd.conf >/dev/null 2>&1; then
+        if [ "$old_exists" -eq 1 ]; then
+            rm -f -- "$target"
+            cp -a -- "$rollback_copy" "$target"
+        else
+            rm -f -- "$target"
+        fi
+        rm -f -- "$rollback_copy"
+        return 1
+    fi
+
+    if ! systemctl restart systemd-timesyncd >/dev/null 2>&1 || ! platform_wait_for_timesyncd; then
+        if [ "$old_exists" -eq 1 ]; then
+            rm -f -- "$target"
+            cp -a -- "$rollback_copy" "$target"
+        else
+            rm -f -- "$target"
+        fi
+        systemctl restart systemd-timesyncd >/dev/null 2>&1 || true
+        rm -f -- "$rollback_copy"
+        return 1
+    fi
+    rm -f -- "$rollback_copy"
+    return 0
 }
 
 platform_time_is_synchronized() {
@@ -885,7 +1028,11 @@ platform_time_diagnostics() {
         echo "$chrony_sources" | sed 's/^/    /'
     fi
 
-    if platform_time_is_synchronized; then
+    if [ "$(platform_time_provider selected)" = systemd-timesyncd ] && ! platform_timesyncd_source_matches; then
+        echo "  Source availability: synchronized state is not tied to a configured corporate source"
+        echo "  Kerberos impact:     BLOCKED — time source policy is not satisfied"
+        echo "  Proposed correction: install $DR_TIMESYNCD_DROPIN with NTP reset, configured office sources, and FallbackNTP reset"
+    elif platform_time_is_synchronized; then
         echo "  Source availability: synchronized source reported"
         echo "  Kerberos impact:     PASS"
         echo "  Proposed correction: none"
@@ -895,6 +1042,18 @@ platform_time_diagnostics() {
         echo "  Proposed correction: operator-approved repair of the active provider"
         echo "                       after checking UDP/123 reachability and approved AD NTP sources"
         echo "                       (no provider switch or NTP change is performed automatically)"
+    fi
+}
+
+platform_time_preflight_ready() {
+    local selected_provider
+    selected_provider="$(platform_time_provider selected)"
+    [ "$selected_provider" != none ] || return 1
+    if [ "$selected_provider" = systemd-timesyncd ]; then
+        platform_validate_server_list "$(platform_time_sources)" || return 1
+        [ "$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || true)" = yes ]
+    else
+        platform_time_is_synchronized
     fi
 }
 
@@ -933,7 +1092,7 @@ preflight_warning() { printf 'WARNING %s\n' "$*"; }
 preflight_blocked() { PREFLIGHT_BLOCKERS=$((PREFLIGHT_BLOCKERS + 1)); printf 'BLOCKED %s\n' "$*"; }
 
 platform_preflight() {
-    local current_host dns_output
+    local current_host dns_output dns_source
     PREFLIGHT_BLOCKERS=0
     platform_report
 
@@ -958,8 +1117,10 @@ platform_preflight() {
         local active_connection dns_search
         active_connection="$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | awk -F: '$2 != "" {print $1; exit}')"
         dns_search="$(nmcli -g ipv4.dns-search connection show "$active_connection" 2>/dev/null || true)"
-        if printf '%s\n' "$dns_search" | tr ',' '\n' | grep -Fxq "$DOMAIN"; then
-            preflight_pass "Active NetworkManager connection advertises the AD DNS search domain"
+        if platform_ad_dns_discovery_current && printf '%s\n' "$dns_search" | tr ',' '\n' | awk '{$1=$1; print}' | grep -Fxq "$DOMAIN"; then
+            preflight_pass "Active NetworkManager connection preserves working AD DNS and search configuration"
+        elif printf '%s\n' "$dns_search" | tr ',' '\n' | awk '{$1=$1; print}' | grep -Fxq "$DOMAIN"; then
+            preflight_warning "Active NetworkManager connection advertises $DOMAIN but current resolver AD discovery is failing"
         else
             preflight_warning "Active NetworkManager connection does not yet advertise $DOMAIN; normal provisioning would propose the search-domain change"
         fi
@@ -967,17 +1128,40 @@ platform_preflight() {
 
     if [ "${DR_JOIN_TEST_MODE:-false}" = true ]; then
         preflight_warning "Fixture test mode: external DNS and realm probes skipped"
+    elif [ "$PLATFORM_FAMILY" = arch ] && dns_source="$(platform_dns_discovery_source)"; then
+        if [ "$dns_source" = current ]; then
+            preflight_pass "AD DNS SRV discovery works using the current resolver"
+        else
+            preflight_pass "AD DNS SRV discovery works via the configured office fallback resolver(s)"
+        fi
     elif platform_dns_srv_records "_kerberos._tcp.$DOMAIN" | grep -q .; then
-            preflight_pass "Kerberos SRV discovery works for $DOMAIN"
+        preflight_pass "Kerberos SRV discovery works for $DOMAIN"
     else
-        preflight_blocked "Kerberos SRV discovery failed for $DOMAIN"
+        if [ "$PLATFORM_FAMILY" = arch ]; then
+            preflight_blocked "AD DNS SRV discovery failed using the current resolver and configured office fallback resolver(s)"
+        else
+            preflight_blocked "Kerberos SRV discovery failed for $DOMAIN"
+        fi
     fi
 
     platform_time_diagnostics
-    if platform_time_is_synchronized; then
-        preflight_pass "System clock is synchronized"
+    if platform_time_preflight_ready; then
+        if [ "$(platform_time_provider selected)" = systemd-timesyncd ]; then
+            if platform_timesyncd_source_matches; then
+                preflight_pass "System clock is synchronized via systemd-timesyncd to a configured corporate source"
+            else
+                preflight_pass "System clock is synchronized via systemd-timesyncd"
+                preflight_warning "Current timesyncd source is not one of the configured corporate sources; the modifying path will install/verify the office override"
+            fi
+        else
+            preflight_pass "System clock is synchronized via $(platform_time_provider selected)"
+        fi
     else
-        preflight_blocked "System clock is not synchronized; no time repair will be attempted"
+        if [ "$(platform_time_provider selected)" = systemd-timesyncd ]; then
+            preflight_blocked "systemd-timesyncd is not synchronized to a configured corporate source"
+        else
+            preflight_blocked "System clock is not synchronized; no time repair will be attempted"
+        fi
     fi
 
     current_host="$(hostnamectl --static 2>/dev/null || hostname 2>/dev/null || true)"
@@ -1077,8 +1261,15 @@ platform_dry_run() {
     echo "Ordered dry-run plan (no persistent changes made)"
     echo "  WOULD CHANGE packages: logical capabilities mapped above, using $PLATFORM_PACKAGE_MANAGER --needed"
     echo "  WOULD CHANGE hostname and /etc/hosts after explicit operator confirmation"
-    echo "  WOULD CHANGE NetworkManager search domains; DNS servers remain DHCP/VPN unless explicit override is configured"
-    echo "  WOULD CHANGE time configuration using the platform time-service adapter"
+    if [ "$PLATFORM_FAMILY" = arch ] && platform_ad_dns_configuration_usable; then
+        echo "  WOULD PRESERVE already-valid AD DNS configuration"
+    else
+        if [ "$PLATFORM_FAMILY" = arch ]; then
+            echo "  WOULD CHANGE NetworkManager DNS/search settings using current or office-specific fallback policy"
+        else
+            echo "  WOULD CHANGE NetworkManager search domains; DNS servers remain DHCP/VPN unless explicit override is configured"
+        fi
+    fi
     echo "  WOULD CHANGE /etc/krb5.conf, /etc/sssd/sssd.conf, native PAM files, /etc/sudoers.d/*, /etc/samba/smb.conf, /etc/nsswitch.conf"
     if [ "$PLATFORM_FAMILY" = "arch" ]; then
         echo "  WOULD CHANGE configured /smb roots: ${DR_DRIP_SEARCH_ROOTS:-none}"
@@ -1090,8 +1281,14 @@ platform_dry_run() {
         echo "  WOULD INSTALL /usr/local/sbin/dr-tools-rebind for explicit selected-user remounts; shared multi-user /mnt/x is not claimed"
         echo "  WOULD CHANGE /etc/systemd/system/dr-domain-machine-password-renew.{service,timer} and /usr/local/sbin/dr-domain-machine-password-renew"
         echo "  WOULD CHANGE /usr/local/bin/*, /usr/local/sbin/*, desktop integration files"
-        if platform_time_provider_satisfies; then
-            echo "  WOULD VALIDATE existing time provider: $(platform_time_provider active); no chrony install or provider switch"
+        if [ "$(platform_time_provider selected)" = systemd-timesyncd ]; then
+            if platform_timesyncd_dropin_matches && platform_timesyncd_is_ready; then
+                echo "  WOULD PRESERVE already-valid corporate systemd-timesyncd configuration"
+            else
+                echo "  WOULD INSTALL/VERIFY Arch corporate timesyncd override: $DR_TIMESYNCD_DROPIN"
+            fi
+        elif platform_time_provider_satisfies; then
+            echo "  WOULD VALIDATE existing time provider: $(platform_time_provider selected); no provider switch"
         else
             echo "  WOULD ENABLE/RESTART time provider: $(platform_service_name time-sync)"
         fi
@@ -2038,13 +2235,114 @@ platform_domain_discover() {
 
 platform_dns_srv_records() {
     local record="$1"
+    local nameserver="${2:-}"
     if command -v dig >/dev/null 2>&1; then
-        timeout 5s dig +time=2 +tries=1 +short SRV "$record" 2>/dev/null \
-            | awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /\.$/'
+        if [ -n "$nameserver" ]; then
+            timeout 5s dig +time=2 +tries=1 +short SRV "$record" "@$nameserver" 2>/dev/null \
+                | awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /\.$/'
+        else
+            timeout 5s dig +time=2 +tries=1 +short SRV "$record" 2>/dev/null \
+                | awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /\.$/'
+        fi
     elif command -v host >/dev/null 2>&1; then
-        timeout 5s host -t SRV "$record" 2>/dev/null \
-            | awk '/has SRV record/ {print}'
+        if [ -n "$nameserver" ]; then
+            timeout 5s host -t SRV "$record" "$nameserver" 2>/dev/null \
+                | awk '/has SRV record/ {print}'
+        else
+            timeout 5s host -t SRV "$record" 2>/dev/null \
+                | awk '/has SRV record/ {print}'
+        fi
     fi
+}
+
+platform_office_server_list() {
+    local kind="$1"
+    local office="${OFFICE_CODE^^}"
+    local variable
+
+    case "$office" in
+        ''|*[!A-Z0-9]*) office="" ;;
+    esac
+
+    if [ -n "$office" ]; then
+        variable="DR_${kind}_SERVERS_${office}"
+        if [ -n "${!variable+x}" ]; then
+            printf '%s\n' "${!variable}"
+            return 0
+        fi
+    fi
+
+    case "$kind" in
+        DNS)
+            printf '%s\n' "$DR_DNS_SERVERS"
+            ;;
+        TIME)
+            printf '%s\n' "$DR_TIME_SERVERS"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+platform_validate_server_list() {
+    local servers="$1" server
+    [ -n "$servers" ] || return 1
+    case "$servers" in
+        *$'\n'*|*$'\r'*|*$'\t'*) return 1 ;;
+    esac
+    for server in $servers; do
+        case "$server" in
+            ''|*[!A-Za-z0-9._:-]*) return 1 ;;
+        esac
+    done
+}
+
+platform_ad_dns_discovery_current() {
+    local kerberos_records ldap_records
+    kerberos_records="$(platform_dns_srv_records "_kerberos._tcp.$DOMAIN")"
+    ldap_records="$(platform_dns_srv_records "_ldap._tcp.$DOMAIN")"
+    [ -n "$kerberos_records" ] && [ -n "$ldap_records" ]
+}
+
+platform_ad_dns_discovery_via_servers() {
+    local servers="$1" server kerberos_records ldap_records
+    platform_validate_server_list "$servers" || return 1
+    for server in $servers; do
+        kerberos_records="$(platform_dns_srv_records "_kerberos._tcp.$DOMAIN" "$server")"
+        ldap_records="$(platform_dns_srv_records "_ldap._tcp.$DOMAIN" "$server")"
+        if [ -n "$kerberos_records" ] && [ -n "$ldap_records" ]; then
+            printf '%s\n' "$server"
+            return 0
+        fi
+    done
+    return 1
+}
+
+platform_dns_search_has_ad_domain() {
+    local connection current
+    connection="$(get_active_connection)"
+    [ -n "$connection" ] || return 1
+    current="$(nmcli -g ipv4.dns-search connection show "$connection" 2>/dev/null || true)"
+    printf '%s\n' "$current" | tr ',' '\n' | awk '{$1=$1; print}' | grep -Fxq "$DOMAIN"
+}
+
+platform_ad_dns_configuration_usable() {
+    platform_ad_dns_discovery_current && platform_dns_search_has_ad_domain
+}
+
+platform_dns_discovery_source() {
+    if platform_ad_dns_discovery_current; then
+        printf 'current\n'
+        return 0
+    fi
+    local fallback
+    fallback="$(platform_office_server_list DNS)"
+    if platform_ad_dns_discovery_via_servers "$fallback" >/dev/null; then
+        printf 'office-fallback\n'
+        return 0
+    fi
+    return 1
 }
 
 platform_domain_testjoin() {
@@ -3042,7 +3340,36 @@ bootstrap_time_before_apt() {
     # if it is already present.
     print_info "Bootstrapping system clock before apt..."
 
-    if systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd.service'; then
+    local selected_provider
+    selected_provider="$(platform_time_provider selected)"
+
+    if [ "$PLATFORM_FAMILY" = arch ] && {
+        [ "$selected_provider" = systemd-timesyncd ] || {
+            [ "$selected_provider" = none ] && ! command -v chronyc >/dev/null 2>&1 && \
+                systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd.service'
+        }
+    }; then
+        print_info "Preparing Arch systemd-timesyncd configuration..."
+        platform_configure_timesyncd force || return 1
+        print_info "Trying systemd-timesyncd..."
+        systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || true
+        timedatectl set-ntp true >/dev/null 2>&1 || true
+
+        local arch_count=0
+        while [ "$arch_count" -lt 6 ]; do
+            if platform_timesyncd_is_ready; then
+                print_info "Clock synchronized via systemd-timesyncd"
+                hwclock --systohc >/dev/null 2>&1 || true
+                return 0
+            fi
+            sleep 5
+            arch_count=$((arch_count + 1))
+        done
+        print_error "Arch systemd-timesyncd did not synchronize to a configured corporate source"
+        return 1
+    fi
+
+    if [ "$PLATFORM_FAMILY" != arch ] && systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd.service'; then
         print_info "Trying systemd-timesyncd..."
         systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || true
         timedatectl set-ntp true >/dev/null 2>&1 || true
@@ -3370,7 +3697,7 @@ get_current_dns_servers() {
 # correctly; the failure was missing search domains, not wrong DNS servers.
 
 configure_dns_servers() {
-    local connection
+    local connection servers dns_source
     connection="$(get_active_connection)"
 
     if [ -z "$connection" ]; then
@@ -3379,25 +3706,42 @@ configure_dns_servers() {
     fi
 
     if [ -z "$DNS_SERVERS" ]; then
-        print_info "Keeping DHCP/VPN DNS servers on '$connection'"
-        nmcli -g IP4.DNS device show "$(nmcli -g GENERAL.DEVICES connection show "$connection" 2>/dev/null | head -1)" 2>/dev/null || true
-        return 0
+        if [ "$PLATFORM_FAMILY" != arch ]; then
+            print_info "Keeping DHCP/VPN DNS servers on '$connection'"
+            nmcli -g IP4.DNS device show "$(nmcli -g GENERAL.DEVICES connection show "$connection" 2>/dev/null | head -1)" 2>/dev/null || true
+            return 0
+        fi
+        if dns_source="$(platform_dns_discovery_source)" && [ "$dns_source" = current ]; then
+            print_info "Preserving already-valid AD DNS configuration on '$connection' (source: $dns_source)"
+            return 0
+        fi
+
+        servers="$(platform_office_server_list DNS)"
+        if [ -z "$servers" ] || ! platform_ad_dns_discovery_via_servers "$servers" >/dev/null; then
+            print_error "Current DNS fails AD discovery and no reachable office-specific fallback DNS is configured"
+            return 1
+        fi
+        print_info "Applying reachable office-specific fallback DNS servers to '$connection': $servers"
+    else
+        servers="$DNS_SERVERS"
     fi
 
     local first_dns
-    first_dns=$(echo "$DNS_SERVERS" | awk '{print $1}')
+    first_dns=$(echo "$servers" | awk '{print $1}')
     local current
     current=$(nmcli -g ipv4.dns connection show "$connection" 2>/dev/null || true)
-    if echo "$current" | grep -q "$first_dns"; then
-        print_info "DNS override already configured on '$connection'"
+    local ignore_auto_dns
+    ignore_auto_dns="$(nmcli -g ipv4.ignore-auto-dns connection show "$connection" 2>/dev/null || true)"
+    if echo "$current" | grep -Fq "$first_dns" && [ "$ignore_auto_dns" = yes ]; then
+        print_info "DNS servers already configured explicitly on '$connection'"
         return 0
     fi
 
     backup_config_file /etc/NetworkManager/system-connections
-    print_info "Applying DNS override to connection '$connection': $DNS_SERVERS"
-    nmcli connection modify "$connection" ipv4.dns "$DNS_SERVERS"
+    print_info "Applying DNS servers to connection '$connection': $servers"
+    nmcli connection modify "$connection" ipv4.ignore-auto-dns yes ipv4.dns "$servers"
     nmcli connection up "$connection" > /dev/null
-    print_info "DNS override applied"
+    print_info "DNS servers applied"
 
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         systemctl restart systemd-resolved
@@ -3523,20 +3867,20 @@ force_step_from_chrony_offset() {
 }
 
 sync_time() {
-    if [ "$PLATFORM_FAMILY" = "arch" ] && ! command -v chronyc >/dev/null 2>&1; then
+    local selected_provider
+    selected_provider="$(platform_time_provider selected)"
+    if [ "$PLATFORM_FAMILY" = arch ] && [ "$selected_provider" = systemd-timesyncd ]; then
         print_info "Using systemd-timesyncd for time synchronization on Arch family"
+        platform_configure_timesyncd || return 1
         timedatectl set-ntp true >/dev/null 2>&1 || true
-        local timesync_retries=6
-        local timesync_count=0
-        while [ "$timesync_count" -lt "$timesync_retries" ]; do
-            if timedatectl show --property=NTPSynchronized --value 2>/dev/null | grep -q '^yes$'; then
-                print_info "Clock is synchronized via systemd-timesyncd"
-                return 0
-            fi
-            sleep 5
-            timesync_count=$((timesync_count + 1))
-        done
-        print_warning "systemd-timesyncd did not confirm synchronization"
+        if platform_wait_for_timesyncd; then
+            print_info "Clock is synchronized via systemd-timesyncd"
+            return 0
+        fi
+        print_error "systemd-timesyncd did not confirm synchronization with a configured corporate source"
+        return 1
+    elif [ "$PLATFORM_FAMILY" = arch ] && [ "$selected_provider" = none ] && ! command -v chronyc >/dev/null 2>&1; then
+        print_error "No supported Arch time provider is selected"
         return 1
     fi
 
@@ -7382,6 +7726,11 @@ configure_dns_search_domains() {
     local current
     current=$(nmcli -g ipv4.dns-search connection show "$connection" 2>/dev/null || true)
 
+    if [ "$PLATFORM_FAMILY" = arch ] && platform_ad_dns_discovery_current && printf '%s\n' "$current" | tr ',' '\n' | awk '{$1=$1; print}' | grep -Fxq "$DOMAIN"; then
+        print_info "Preserving already-valid AD DNS search configuration on '$connection'"
+        return 0
+    fi
+
     local missing_domain=false
     local domain
     for domain in $(echo "$DNS_SEARCH" | tr ',' ' '); do
@@ -7707,6 +8056,8 @@ prompt_office_code() {
 }
 
 parse_args() {
+    local requested_office=""
+    local persisted_office="${OFFICE_CODE:-}"
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --platform-report)
@@ -7741,8 +8092,8 @@ parse_args() {
                 exit 1
                 ;;
             *)
-                if [ -z "$OFFICE_CODE" ]; then
-                    OFFICE_CODE="$1"
+                if [ -z "$requested_office" ]; then
+                    requested_office="$1"
                 else
                     print_error "Unexpected argument: $1"
                     echo 'Usage: wget -qO- http://ontrack.link/joindomain | sudo bash'
@@ -7753,20 +8104,23 @@ parse_args() {
         shift
     done
 
+    if [ -n "$requested_office" ]; then
+        requested_office="$(echo "$requested_office" | tr '[:lower:]' '[:upper:]' | xargs)"
+        persisted_office="$(echo "$persisted_office" | tr '[:lower:]' '[:upper:]' | xargs)"
+        if [ -n "$persisted_office" ] && [ "$requested_office" != "$persisted_office" ]; then
+            print_error "Office code $requested_office conflicts with persisted office code $persisted_office."
+            print_error "Rerun with the persisted code or resolve the state explicitly before continuing."
+            return 1
+        fi
+        OFFICE_CODE="$requested_office"
+    elif [ -n "$persisted_office" ]; then
+        OFFICE_CODE="$persisted_office"
+        print_info "Using saved office code: $OFFICE_CODE"
+    fi
+
     # The inspection modes must not prompt for office selection or save state.
     if [ "$PLATFORM_REPORT_ONLY" = true ] || [ "$PREFLIGHT_ONLY" = true ] || [ "$DRY_RUN_ONLY" = true ]; then
         return 0
-    fi
-
-    # If the office was not provided on the command line, reuse the value saved
-    # during the first run. This prevents the post-join rerun from asking again.
-    if [ -z "$OFFICE_CODE" ] && [ -f "$STATE_FILE" ]; then
-        # shellcheck disable=SC1090
-        . "$STATE_FILE"
-        OFFICE_CODE="${OFFICE_CODE:-}"
-        if [ -n "$OFFICE_CODE" ]; then
-            print_info "Using saved office code: $OFFICE_CODE"
-        fi
     fi
 
     # If no saved value exists, prompt interactively.
@@ -7949,7 +8303,9 @@ main() {
     fi
 
     install_domain_packages
-    configure_chrony
+    if [ "$PLATFORM_FAMILY" = debian ] || [ "$(platform_time_provider selected)" = chronyd ] || [ "$(platform_time_provider selected)" = chrony ]; then
+        configure_chrony
+    fi
     sync_time
     configure_no_reboot_policy
     verify_krb5_conf
