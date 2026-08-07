@@ -179,6 +179,7 @@ test_rebind_failure_rollback() {
     fake_bin="$TMP_DIR/rebind-fake-bin"
     mkdir -p "$fake_bin"
     DR_JOIN_STATE_DIR="$TMP_DIR/rebind-rollback-render" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; TOOLS_SERVER=dr-ep1-tools; render_arch_tools_rebind_helper > '$rebind_helper'"
+    chmod 755 "$rebind_helper"
     bash -n "$rebind_helper" || fail "rollback test helper syntax"
 
     cat > "$fake_bin/id" << 'EOF'
@@ -186,6 +187,8 @@ test_rebind_failure_rollback() {
 if [ "${1:-}" = "-u" ]; then
     if [ "$#" -eq 1 ]; then
         echo 0
+    elif [ "${2:-}" = fixture.user ]; then
+        echo 1001
     else
         echo "${2:-0}"
     fi
@@ -196,7 +199,18 @@ EOF
     cat > "$fake_bin/getent" << 'EOF'
 #!/bin/bash
 if [ "${1:-}" = passwd ] && [ "${2:-}" = 1001 ]; then
-    echo '1001:fixture:x:1001:Fixture User:/tmp/fixture:/bin/bash'
+    if [ "${REBIN_OLD_FIXTURE:-0}" = 1 ]; then
+        echo '1001:fixture:x:1001:Fixture User:/tmp/fixture:/bin/bash'
+    elif [ "${REBIN_EMPTY_FIXTURE:-0}" = 1 ]; then
+        exit 0
+    elif [ "${REBIN_DUPLICATE_FIXTURE:-0}" = 1 ]; then
+        echo 'fixture.user:x:1001:1001:Fixture User:/tmp/fixture:/bin/bash'
+        echo 'fixture.user2:x:1001:1001:Fixture User 2:/tmp/fixture2:/bin/bash'
+    elif [ "${REBIN_MISMATCH_FIXTURE:-0}" = 1 ]; then
+        echo 'fixture.user:x:1000:1000:Fixture User:/tmp/fixture:/bin/bash'
+    else
+        echo 'fixture.user:x:1001:1001:Fixture User:/tmp/fixture:/bin/bash'
+    fi
     exit 0
 fi
 exec /usr/bin/getent "$@"
@@ -221,7 +235,92 @@ EOF
 #!/bin/bash
 exit 0
 EOF
+    cat > "$fake_bin/chown" << 'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "$REBIND_CHOWN_LOG"
+exit 0
+EOF
+    cat > "$fake_bin/stat" << 'EOF'
+#!/bin/bash
+if [ "${1:-}" = -c ] && [ "${2:-}" = '%u:%a' ]; then
+    echo '0:600'
+    exit 0
+fi
+exec /usr/bin/stat "$@"
+EOF
     chmod 755 "$fake_bin"/*
+
+    case_dir="$TMP_DIR/rebind-malformed-record"
+    unit="$case_dir/units/mnt-x.mount"
+    state="$case_dir/state"
+    mkdir -p "$(dirname "$unit")"
+    printf '%s\n' '[Mount]' 'What=//dr-ep1-tools/Tools' 'Where=/mnt/x' 'Type=cifs' 'Options=_netdev,nofail,sec=krb5,cruid=1000,vers=3.0' > "$unit"
+    printf '%s\n' 'DR_TOOLS_MOUNT_CRUID="1000"' > "$state"
+    chmod 600 "$state"
+    set +e
+    PATH="$fake_bin:$PATH" REBIN_OLD_FIXTURE=1 \
+        DR_REBIND_UNIT_DIR="$case_dir/units" DR_REBIND_STATE_FILE="$state" \
+        DR_REBIND_LOCK_DIR="$case_dir/lock" DR_REBIND_STAGE_ROOT="$case_dir/stage" \
+        "$rebind_helper" 1001 > "$case_dir/output" 2>&1
+    local malformed_rc=$?
+    set -e
+    [ "$malformed_rc" -ne 0 ] || fail "old malformed getent fixture is rejected"
+    pass "old malformed getent fixture is not sufficient"
+
+    for fixture in empty duplicate mismatch; do
+        set +e
+        env "REBIN_${fixture^^}_FIXTURE=1" PATH="$fake_bin:$PATH" \
+            DR_REBIND_UNIT_DIR="$case_dir/units" DR_REBIND_STATE_FILE="$state" \
+            DR_REBIND_LOCK_DIR="$case_dir/lock-$fixture" DR_REBIND_STAGE_ROOT="$case_dir/stage-$fixture" \
+            "$rebind_helper" 1001 >/dev/null 2>&1
+        local fixture_rc=$?
+        set -e
+        [ "$fixture_rc" -ne 0 ] || fail "NSS $fixture passwd fixture is rejected"
+        pass "NSS $fixture passwd fixture is rejected"
+    done
+
+    case_dir="$TMP_DIR/rebind-success"
+    unit="$case_dir/units/mnt-x.mount"
+    state="$case_dir/state"
+    mkdir -p "$(dirname "$unit")"
+    printf '%s\n' '[Mount]' 'What=//dr-ep1-tools/Tools' 'Where=/mnt/x' 'Type=cifs' 'Options=_netdev,nofail,sec=krb5,cruid=1000,vers=3.0' > "$unit"
+    printf '%s\n' 'STAGE="POSTJOIN_AWAITING_LIVE_VALIDATION"' 'DR_TOOLS_MOUNT_CRUID="1000"' > "$state"
+    chmod 600 "$state"
+    : > "$case_dir/chown.log"
+    PATH="$fake_bin:$PATH" REBIND_CHOWN_LOG="$case_dir/chown.log" \
+        DR_REBIND_UNIT_DIR="$case_dir/units" DR_REBIND_STATE_FILE="$state" \
+        DR_REBIND_LOCK_DIR="$case_dir/lock" DR_REBIND_STAGE_ROOT="$case_dir/stage" \
+        "$rebind_helper" 1001 > "$case_dir/output" 2>&1 || fail "successful rebind fixture commits"
+    assert_contains "$(<"$unit")" "cruid=1001" "successful rebind changes the installed UID"
+    assert_contains "$(<"$state")" 'DR_TOOLS_MOUNT_CRUID="1001"' "successful rebind persists the new UID"
+    [ "$(stat -c '%a' "$unit")" = 644 ] || fail "successful rebind preserves unit mode"
+    [ "$(stat -c '%a' "$state")" = 600 ] || fail "successful rebind preserves state mode"
+    assert_contains "$(<"$case_dir/chown.log")" "root:root" "successful rebind requests root ownership"
+    if grep -Fq 'restoring the original' "$case_dir/output"; then
+        fail "successful rebind must not trigger rollback"
+    fi
+    pass "successful rebind commits NSS-resolved UID, unit, and state"
+    status_output="$(PATH="$fake_bin:$PATH" DR_REBIND_UNIT_DIR="$case_dir/units" DR_REBIND_STATE_FILE="$state" "$rebind_helper" --status)"
+    assert_contains "$status_output" "unit_cruid=1001" "rebind status uses numeric cruid extraction"
+
+    for bad_cruid in absent conflicting nonnumeric mismatch; do
+        bad_unit="$case_dir/units/bad-$bad_cruid.mount"
+        case "$bad_cruid" in
+            absent) printf '%s\n' '[Mount]' 'Options=_netdev,nofail,vers=3.0' > "$bad_unit" ;;
+            conflicting) printf '%s\n' '[Mount]' 'Options=sec=krb5,cruid=1000,cruid=1001,vers=3.0' > "$bad_unit" ;;
+            nonnumeric) printf '%s\n' '[Mount]' 'Options=sec=krb5,cruid=user,vers=3.0' > "$bad_unit" ;;
+            mismatch) printf '%s\n' '[Mount]' 'Options=sec=krb5,cruid=1000,vers=3.0' > "$bad_unit" ;;
+        esac
+        cp -- "$unit" "$case_dir/units/mnt-x.mount.save"
+        cp -- "$bad_unit" "$unit"
+        set +e
+        PATH="$fake_bin:$PATH" DR_REBIND_UNIT_DIR="$case_dir/units" DR_REBIND_STATE_FILE="$state" "$rebind_helper" --status >/dev/null 2>&1
+        local bad_rc=$?
+        set -e
+        [ "$bad_rc" -ne 0 ] || fail "cruid extraction rejects $bad_cruid unit"
+        mv -f -- "$case_dir/units/mnt-x.mount.save" "$unit"
+        pass "cruid extraction rejects $bad_cruid unit"
+    done
 
     for stage in automount-stop mount-stop render verify replace daemon-reload automount-enable automount-start state-update; do
         case_dir="$TMP_DIR/rebind-failure-$stage"
@@ -644,16 +743,335 @@ test_kit_root_access_and_helpers() {
     printf '%s\n' "$drip_support" > "$TMP_DIR/drip-launcher-support.sh"
     bash -n "$TMP_DIR/drip-launcher-support.sh" || fail "generated DRIP launcher support syntax"
     pass "generated DRIP launcher support syntax"
-    assert_contains "$drip_support" '/usr/local/sbin/dr-drip-search start' "KIT launcher starts configured DRIP search units"
-    assert_contains "$drip_support" '/usr/local/sbin/dr-drip-search cleanup' "KIT launcher cleans configured DRIP search units"
+    assert_contains "$drip_support" 'DRIP_SEARCH_HELPER="' "KIT launcher embeds the configured DRIP helper path"
+    assert_contains "$drip_support" '"$DRIP_SEARCH_HELPER" start' "KIT launcher starts configured DRIP search units"
+    assert_contains "$drip_support" '"$DRIP_SEARCH_HELPER" cleanup' "KIT launcher cleans configured DRIP search units"
     assert_contains "$drip_support" 'Configured DRIP search automounts could not be started' "KIT launcher blocks when DRIP search start fails"
     if printf '%s\n' "$drip_support" | grep -Eq '(/mnt/p|krb5cc_0)'; then
         fail "KIT launcher DRIP support must not own /mnt/p or /tmp/krb5cc_0"
     fi
-    start_line="$(printf '%s\n' "$drip_support" | grep -n '/usr/local/sbin/dr-drip-search start' | cut -d: -f1)"
+    start_line="$(printf '%s\n' "$drip_support" | grep -n '"\$DRIP_SEARCH_HELPER" start' | cut -d: -f1)"
     trap_line="$(printf '%s\n' "$drip_support" | grep -n 'trap .*EXIT' | head -1 | cut -d: -f1)"
     [ "$trap_line" -lt "$start_line" ] || fail "KIT launcher must install cleanup traps before DRIP start"
     pass "KIT launcher preserves root-cache and /mnt/p ownership boundaries"
+}
+
+test_drip_launcher_fail_closed() {
+    local case_dir fake_bin launcher support output rc mount_unit automount_unit helper manifest
+    case_dir="$TMP_DIR/drip-launcher-fail-closed"
+    fake_bin="$case_dir/bin"
+    launcher="$case_dir/launcher"
+    helper="$case_dir/dr-drip-search"
+    manifest="$case_dir/drip.manifest"
+    mkdir -p "$fake_bin" "$case_dir/units"
+
+    cat > "$fake_bin/stat" << 'EOF'
+#!/bin/bash
+set -euo pipefail
+path="${!#}"
+if [ "${1:-}" = -c ]; then
+    case "${2:-}" in
+        %u)
+            [ "${path:-}" = "${FAKE_UNSAFE_PATH:-}" ] && printf '%s\n' "${FAKE_UNSAFE_OWNER:-1000}" || printf '0\n'
+            ;;
+        %a)
+            if [ "${path:-}" = "${FAKE_HELPER:-}" ]; then
+                printf '%s\n' "${FAKE_HELPER_MODE:-755}"
+            elif [ "${path:-}" = "${FAKE_MANIFEST:-}" ]; then
+                printf '%s\n' "${FAKE_MANIFEST_MODE:-600}"
+            else
+                printf '644\n'
+            fi
+            ;;
+        *) exec /usr/bin/stat "$@" ;;
+    esac
+    exit 0
+fi
+exec /usr/bin/stat "$@"
+EOF
+    cat > "$fake_bin/systemctl" << 'EOF'
+#!/bin/bash
+set -euo pipefail
+case "${1:-}" in
+    start)
+        [ "${DRIP_TEST_FAIL_START:-0}" != 1 ] || exit 1
+        exit 0
+        ;;
+    is-active)
+        unit="${!#}"
+        if [ "${DRIP_TEST_INACTIVE:-0}" = 1 ] && [[ "$unit" = *.automount ]]; then
+            exit 1
+        fi
+        exit 0
+        ;;
+    stop|daemon-reload) exit 0 ;;
+    *) exit 0 ;;
+esac
+EOF
+    cat > "$fake_bin/systemd-analyze" << 'EOF'
+#!/bin/bash
+exit 0
+EOF
+    cat > "$helper" << 'EOF'
+#!/bin/bash
+set -euo pipefail
+case "${1:-}" in
+    start)
+        printf 'start\n' >> "${DRIP_HELPER_LOG:?}"
+        [ "${DRIP_TEST_HELPER_FAIL:-0}" != 1 ]
+        ;;
+    cleanup)
+        printf 'cleanup\n' >> "${DRIP_HELPER_LOG:?}"
+        ;;
+    *) exit 2 ;;
+esac
+EOF
+    chmod 755 "$fake_bin/stat" "$fake_bin/systemctl" "$fake_bin/systemd-analyze" "$helper"
+
+    mount_unit="$(systemd-escape --path --suffix=mount /smb/dr-ep-drip04/Images)"
+    automount_unit="$(systemd-escape --path --suffix=automount /smb/dr-ep-drip04/Images)"
+    DR_JOIN_STATE_DIR="$case_dir/render" bash -c "source '$SCRIPT'; render_arch_drip_mount_unit dr-ep-drip04/Images > '$case_dir/units/$mount_unit'; render_arch_drip_automount_unit dr-ep-drip04/Images > '$case_dir/units/$automount_unit'"
+    printf 'dr-ep-drip04/Images\t%s\t%s\n' "$mount_unit" "$automount_unit" > "$manifest"
+    chmod 600 "$manifest"
+
+    support="$(DRIP_REQUIRED=true DR_DRIP_SEARCH_ROOTS='dr-ep-drip04/Images' DR_DRIP_MANIFEST="$manifest" DR_DRIP_UNIT_DIR="$case_dir/units" DR_DRIP_HELPER_PATH="$helper" DR_JOIN_STATE_DIR="$case_dir/support" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; render_drip_launcher_support")"
+    {
+        printf '%s\n' '#!/bin/bash' 'set -euo pipefail'
+        printf '%s\n' 'if [ "${1:-}" = --credential-self-test ]; then echo SELF_TEST; exit 0; fi'
+        printf '%s\n' "$support"
+        printf '%s\n' 'echo KIT_STARTED'
+    } > "$launcher"
+    chmod 755 "$launcher"
+
+    run_launcher() {
+        set +e
+        output="$(PATH="$fake_bin:$PATH" FAKE_HELPER="$helper" FAKE_MANIFEST="$manifest" DRIP_HELPER_LOG="$case_dir/helper.log" DRIP_SEARCH_HELPER="$helper" "$@" 2>&1)"
+        rc=$?
+        set -e
+    }
+
+    run_launcher env DRIP_SEARCH_HELPER="$case_dir/missing-helper" "$launcher"
+    [ "$rc" -ne 0 ] || fail "required DRIP launch blocks when helper is missing"
+    [[ "$output" != *KIT_STARTED* ]] || fail "missing required DRIP helper cannot launch KIT"
+    pass "required DRIP launch blocks when helper is missing"
+
+    mv -- "$manifest" "$manifest.saved"
+    run_launcher "$launcher"
+    [ "$rc" -ne 0 ] || fail "required DRIP launch blocks when manifest is missing"
+    pass "required DRIP launch blocks when manifest is missing"
+    mv -- "$manifest.saved" "$manifest"
+    printf 'dr-ep-drip04/Images\t%s\t%s\n' "$mount_unit" "$automount_unit" > "$manifest"
+    chmod 600 "$manifest"
+
+    run_launcher env FAKE_UNSAFE_PATH="$helper" FAKE_UNSAFE_OWNER=1000 "$launcher"
+    [ "$rc" -ne 0 ] || fail "required DRIP launch blocks unsafe helper ownership"
+    pass "required DRIP launch blocks unsafe helper ownership"
+
+    run_launcher env FAKE_UNSAFE_PATH="$manifest" FAKE_UNSAFE_OWNER=1000 "$launcher"
+    [ "$rc" -ne 0 ] || fail "required DRIP launch blocks unsafe manifest ownership"
+    pass "required DRIP launch blocks unsafe manifest ownership"
+
+    run_launcher env FAKE_HELPER_MODE=777 "$launcher"
+    [ "$rc" -ne 0 ] || fail "required DRIP launch blocks group/other-writable helper"
+    pass "required DRIP launch blocks group/other-writable helper"
+
+    run_launcher env FAKE_MANIFEST_MODE=666 "$launcher"
+    [ "$rc" -ne 0 ] || fail "required DRIP launch blocks group/other-writable manifest"
+    pass "required DRIP launch blocks group/other-writable manifest"
+
+    ln -s -- "$helper" "$case_dir/helper.link"
+    run_launcher env DRIP_SEARCH_HELPER="$case_dir/helper.link" "$launcher"
+    [ "$rc" -ne 0 ] || fail "required DRIP launch blocks symlinked helper"
+    pass "required DRIP launch blocks symlinked helper"
+    cp -- "$manifest" "$manifest.real"
+    rm -f -- "$manifest"
+    ln -s -- "$manifest.real" "$manifest"
+    run_launcher "$launcher"
+    [ "$rc" -ne 0 ] || fail "required DRIP launch blocks symlinked manifest"
+    pass "required DRIP launch blocks symlinked manifest"
+    rm -f -- "$manifest"
+    mv -- "$manifest.real" "$manifest"
+    chmod 600 "$manifest"
+
+    : > "$manifest"
+    run_launcher "$launcher"
+    [ "$rc" -ne 0 ] || fail "required DRIP launch blocks empty manifest"
+    pass "required DRIP launch blocks empty manifest"
+    printf 'dr-ep-drip04/Images\t%s\t%s\n' "$mount_unit" "$automount_unit" > "$manifest"
+    chmod 600 "$manifest"
+
+    run_launcher env DRIP_TEST_HELPER_FAIL=1 "$launcher"
+    [ "$rc" -ne 0 ] || fail "required DRIP launch blocks failed automount startup"
+    pass "required DRIP launch blocks failed automount startup"
+
+    run_launcher env DRIP_TEST_INACTIVE=1 "$launcher"
+    [ "$rc" -ne 0 ] || fail "required DRIP launch blocks inactive automount"
+    pass "required DRIP launch blocks inactive automount"
+
+    support="$(DRIP_REQUIRED=false DR_DRIP_SEARCH_ROOTS='dr-ep-drip04/Images' DR_DRIP_MANIFEST="$manifest" DR_DRIP_UNIT_DIR="$case_dir/units" DR_DRIP_HELPER_PATH="$case_dir/no-helper" DR_JOIN_STATE_DIR="$case_dir/optional-support" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; render_drip_launcher_support")"
+    {
+        printf '%s\n' '#!/bin/bash' 'set -euo pipefail'
+        printf '%s\n' "$support"
+        printf '%s\n' 'echo KIT_STARTED'
+    } > "$case_dir/optional-launcher"
+    chmod 755 "$case_dir/optional-launcher"
+    : > "$case_dir/helper.log"
+    run_launcher env DRIP_SEARCH_HELPER="$case_dir/no-helper" "$case_dir/optional-launcher"
+    [ "$rc" -eq 0 ] || fail "optional DRIP launch permits approved KIT-only path"
+    assert_contains "$output" KIT_STARTED "optional DRIP launch permits KIT-only path"
+    if [ -f "$case_dir/helper.log" ]; then
+        if grep -Fq start "$case_dir/helper.log"; then
+            fail "optional KIT-only launch must not start an absent DRIP helper"
+        fi
+    fi
+    pass "DRIP_REQUIRED=false permits KIT-only launch with a warning"
+
+    : > "$case_dir/helper.log"
+    run_launcher "$launcher" --credential-self-test
+    [ "$rc" -eq 0 ] || fail "credential self-test does not require DRIP startup"
+    assert_contains "$output" SELF_TEST "credential self-test exits before DRIP startup"
+    [ ! -s "$case_dir/helper.log" ] || fail "credential self-test must not start DRIP automounts"
+    pass "credential self-test does not start DRIP automounts"
+    if printf '%s\n' "$support" | grep -Eq '(/mnt/p|/tmp/krb5cc_0)'; then
+        fail "generated DRIP launcher support must not own /mnt/p or /tmp/krb5cc_0"
+    fi
+    pass "generated DRIP launcher support has no /mnt/p or root-cache ownership"
+}
+
+test_drip_install_transaction() {
+    local base fake_bin stage case_dir unit_dir manifest helper old_mount old_auto new_mount new_auto
+    local old_manifest original_helper original_mount original_auto output rc
+    base="$TMP_DIR/drip-install"
+    fake_bin="$base/bin"
+    mkdir -p "$fake_bin"
+
+    cat > "$fake_bin/systemctl" << 'EOF'
+#!/bin/bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${DRIP_SYSTEMCTL_LOG:?}"
+case "${1:-}" in
+    is-active) exit 1 ;;
+    daemon-reload)
+        [ "${DRIP_TEST_DAEMON_FAIL:-0}" != 1 ]
+        ;;
+    *) exit 0 ;;
+esac
+EOF
+    cat > "$fake_bin/systemd-analyze" << 'EOF'
+#!/bin/bash
+exit 0
+EOF
+    cat > "$fake_bin/mountpoint" << 'EOF'
+#!/bin/bash
+exit 1
+EOF
+    cat > "$fake_bin/chown" << 'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "${DRIP_CHOWN_LOG:?}"
+exit 0
+EOF
+    chmod 755 "$fake_bin"/*
+
+    prepare_fixture() {
+        local root="$1"
+        local units="$root/units" manifest_path="$root/drip.manifest" helper_path="$root/helper"
+        local old_mount_name old_automount_name
+        rm -rf -- "$root"
+        mkdir -p "$units"
+        old_mount_name="$(systemd-escape --path --suffix=mount /smb/dr-ep-drip04/Images)"
+        old_automount_name="$(systemd-escape --path --suffix=automount /smb/dr-ep-drip04/Images)"
+        printf 'OLD-MOUNT\n' > "$units/$old_mount_name"
+        printf 'OLD-AUTOMOUNT\n' > "$units/$old_automount_name"
+        printf 'dr-ep-drip04/Images\t%s\t%s\n' "$old_mount_name" "$old_automount_name" > "$manifest_path"
+        printf 'old helper\n' > "$helper_path"
+        chmod 644 "$units/$old_mount_name" "$units/$old_automount_name"
+        chmod 600 "$manifest_path"
+        chmod 755 "$helper_path"
+    }
+
+    for stage in render verify unit-install manifest daemon-reload; do
+        case_dir="$base/failure-$stage"
+        prepare_fixture "$case_dir"
+        unit_dir="$case_dir/units"
+        manifest="$case_dir/drip.manifest"
+        helper="$case_dir/helper"
+        old_mount="$(systemd-escape --path --suffix=mount /smb/dr-ep-drip04/Images)"
+        old_auto="$(systemd-escape --path --suffix=automount /smb/dr-ep-drip04/Images)"
+        new_mount="$(systemd-escape --path --suffix=mount /smb/dr-ep-drip05/Images)"
+        new_auto="$(systemd-escape --path --suffix=automount /smb/dr-ep-drip05/Images)"
+        old_manifest="$case_dir/original.manifest"
+        original_helper="$case_dir/original.helper"
+        original_mount="$case_dir/original.mount"
+        original_auto="$case_dir/original.automount"
+        cp -- "$manifest" "$old_manifest"
+        cp -- "$helper" "$original_helper"
+        cp -- "$unit_dir/$old_mount" "$original_mount"
+        cp -- "$unit_dir/$old_auto" "$original_auto"
+        : > "$case_dir/systemctl.log"
+        : > "$case_dir/chown.log"
+        set +e
+        output="$(PATH="$fake_bin:$PATH" DRIP_SYSTEMCTL_LOG="$case_dir/systemctl.log" DRIP_CHOWN_LOG="$case_dir/chown.log" \
+            DR_DRIP_SKIP_MOUNT_ROOT=true DR_DRIP_SEARCH_ROOTS='dr-ep-drip05/Images' \
+            DR_DRIP_MANIFEST="$manifest" DR_DRIP_UNIT_DIR="$unit_dir" DR_DRIP_HELPER_PATH="$helper" \
+            DR_DRIP_INSTALL_FAIL_STAGE="$stage" DR_JOIN_STATE_DIR="$case_dir/state" \
+            bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_install_drip_search" 2>&1)"
+        rc=$?
+        set -e
+        [ "$rc" -ne 0 ] || fail "DRIP install failure injection $stage returns failure"
+        cmp -s "$original_mount" "$unit_dir/$old_mount" || fail "DRIP install failure $stage restores old mount unit"
+        cmp -s "$original_auto" "$unit_dir/$old_auto" || fail "DRIP install failure $stage restores old automount unit"
+        cmp -s "$old_manifest" "$manifest" || fail "DRIP install failure $stage restores manifest"
+        cmp -s "$original_helper" "$helper" || fail "DRIP install failure $stage restores helper"
+        [ ! -e "$unit_dir/$new_mount" ] && [ ! -e "$unit_dir/$new_auto" ] || fail "DRIP install failure $stage removes orphan new units"
+        [ -z "$(find "$case_dir" -maxdepth 2 -type d -name '.drip-install.*' -print -quit)" ] || fail "DRIP install failure $stage removes transaction directory"
+        pass "DRIP install failure injection $stage restores units, manifest, helper, and cleanup"
+    done
+
+    case_dir="$base/success"
+    prepare_fixture "$case_dir"
+    unit_dir="$case_dir/units"
+    manifest="$case_dir/drip.manifest"
+    helper="$case_dir/helper"
+    old_mount="$(systemd-escape --path --suffix=mount /smb/dr-ep-drip04/Images)"
+    old_auto="$(systemd-escape --path --suffix=automount /smb/dr-ep-drip04/Images)"
+    new_mount="$(systemd-escape --path --suffix=mount /smb/dr-ep-drip05/Images)"
+    new_auto="$(systemd-escape --path --suffix=automount /smb/dr-ep-drip05/Images)"
+    : > "$case_dir/systemctl.log"
+    : > "$case_dir/chown.log"
+    PATH="$fake_bin:$PATH" DRIP_SYSTEMCTL_LOG="$case_dir/systemctl.log" DRIP_CHOWN_LOG="$case_dir/chown.log" \
+        DR_DRIP_SKIP_MOUNT_ROOT=true DR_DRIP_SEARCH_ROOTS='dr-ep-drip05/Images' \
+        DR_DRIP_MANIFEST="$manifest" DR_DRIP_UNIT_DIR="$unit_dir" DR_DRIP_HELPER_PATH="$helper" \
+        DR_JOIN_STATE_DIR="$case_dir/state" \
+        bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_install_drip_search" >/dev/null || fail "successful DRIP install commits"
+    [ -f "$unit_dir/$new_mount" ] && [ -f "$unit_dir/$new_auto" ] || fail "successful DRIP install creates new units"
+    [ ! -e "$unit_dir/$old_mount" ] && [ ! -e "$unit_dir/$old_auto" ] || fail "successful DRIP install removes inactive stale units"
+    grep -Fq $'dr-ep-drip05/Images\t' "$manifest" || fail "successful DRIP install persists the new manifest"
+    [ "$(stat -c '%a' "$manifest")" = 600 ] || fail "successful DRIP install keeps manifest mode 0600"
+    [ "$(stat -c '%a' "$helper")" = 755 ] || fail "successful DRIP install keeps helper executable mode"
+    [ "$(stat -c '%a' "$unit_dir/$new_mount")" = 644 ] || fail "successful DRIP install keeps mount unit mode"
+    if grep -Eq 'enable|is-enabled' "$case_dir/systemctl.log"; then
+        fail "successful DRIP install must not enable units globally"
+    fi
+    assert_contains "$(<"$case_dir/chown.log")" 'root:root' "successful DRIP install requests root ownership"
+    pass "successful DRIP install commits configured roots and removes inactive stale units"
+
+    prepare_fixture "$base/busy"
+    case_dir="$base/busy"
+    unit_dir="$case_dir/units"
+    manifest="$case_dir/drip.manifest"
+    helper="$case_dir/helper"
+    : > "$case_dir/systemctl.log"
+    : > "$case_dir/chown.log"
+    set +e
+    output="$(PATH="$fake_bin:$PATH" DRIP_SYSTEMCTL_LOG="$case_dir/systemctl.log" DRIP_CHOWN_LOG="$case_dir/chown.log" \
+        DRIP_TEST_STALE_ACTIVE=1 DR_DRIP_SKIP_MOUNT_ROOT=true DR_DRIP_SEARCH_ROOTS='dr-ep-drip05/Images' \
+        DR_DRIP_MANIFEST="$manifest" DR_DRIP_UNIT_DIR="$unit_dir" DR_DRIP_HELPER_PATH="$helper" \
+        DR_JOIN_STATE_DIR="$case_dir/state" bash -c "source '$SCRIPT'; systemctl(){ if [ \"\${1:-}\" = is-active ] && [ \"\${DRIP_TEST_STALE_ACTIVE:-0}\" = 1 ]; then return 0; fi; return 1; }; export -f systemctl; PLATFORM_FAMILY=arch; platform_install_drip_search" 2>&1)"
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "active stale DRIP unit blocks configuration replacement"
+    assert_contains "$output" 'Stale DRIP mount is active or busy' "active stale DRIP unit reports a preservation blocker"
+    pass "active stale DRIP unit blocks replacement and preserves evidence"
 }
 
 test_debian_kit_and_autofs_regression() {
@@ -801,6 +1219,8 @@ test_machine_account_renewal
 test_machine_account_renewal_behavior
 test_kit_root_access_and_helpers
 test_kit_cache_validation
+test_drip_launcher_fail_closed
+test_drip_install_transaction
 test_debian_kit_and_autofs_regression
 test_debian_golden_renderers
 test_state_and_guard
