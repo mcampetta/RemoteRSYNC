@@ -83,10 +83,13 @@ KIT_PROCESS_PATTERN="${KIT_PROCESS_PATTERN:-KIT}"
 KIT_INSTALLER_PATH="${KIT_INSTALLER_PATH:-/mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/KIT-installer-modified.sh}"
 DR_KIT_ARCH_COMPAT_DIR="${DR_KIT_ARCH_COMPAT_DIR:-/usr/local/libexec/dr-kit-arch}"
 DR_KIT_CPPREST_LIBRARY_PATH="${DR_KIT_CPPREST_LIBRARY_PATH:-}"
-DR_HASP_SCRIPT_INSTALLER_PATH="${DR_HASP_SCRIPT_INSTALLER_PATH:-}"
 DR_HASP_SOURCE_DIR="${DR_HASP_SOURCE_DIR:-/mnt/x/DRTools/frozen/Generic/HASP/V10.21}"
+DR_HASP_DEB_PATH="${DR_HASP_DEB_PATH:-/mnt/x/DRTools/frozen/Generic/HASP/V10.21/Sentinel_LDK_Ubuntu_DEB_Run-time_Installer/aksusbd_10.21-1_amd64.deb}"
 DR_HASP_CONFIG_DIR="${DR_HASP_CONFIG_DIR:-/etc/hasplm}"
-DR_HASP_SERVICE_NAME="${DR_HASP_SERVICE_NAME:-aksusbd}"
+DR_HASP_UDEV_RULE="${DR_HASP_UDEV_RULE:-/etc/udev/rules.d/80-hasp.rules}"
+DR_HASP_SBIN_DIR="${DR_HASP_SBIN_DIR:-/usr/sbin}"
+DR_HASP_INIT_DIR="${DR_HASP_INIT_DIR:-/var/hasplm/init}"
+DR_HASP_SYSTEMD_DIR="${DR_HASP_SYSTEMD_DIR:-/etc/systemd/system}"
 BRAND_WALLPAPER_SOURCE="${BRAND_WALLPAPER_SOURCE:-/mnt/x/CRtools/Frozen/Branding/Wallpaper/1080p_ontrackwallpaper.jpg}"
 BRAND_WALLPAPER_DEST="/usr/share/backgrounds/dr-company-wallpaper"
 OFFICE_CODE=""
@@ -6087,9 +6090,21 @@ have_cpprest() {
 }
 
 have_sentinel() {
+    local sbin_dir="${DR_KIT_HASP_SBIN_DIR:-/usr/sbin}"
+    local systemd_dir="${DR_KIT_HASP_SYSTEMD_DIR:-/etc/systemd/system}"
     [ -r "${DR_KIT_HASP_CONFIG_DIR:-/etc/hasplm}/hasplm.ini" ] || return 1
-    command -v aksusbd >/dev/null 2>&1 || return 1
-    systemctl is-active --quiet "${DR_KIT_HASP_SERVICE_NAME:-aksusbd}"
+    [ -f "$sbin_dir/aksusbd" ] && [ ! -L "$sbin_dir/aksusbd" ] && [ -x "$sbin_dir/aksusbd" ] || return 1
+    [ -f "$sbin_dir/aksusbd_x86_64" ] && [ ! -L "$sbin_dir/aksusbd_x86_64" ] && [ -x "$sbin_dir/aksusbd_x86_64" ] || return 1
+    [ -f "$sbin_dir/hasplmd" ] && [ ! -L "$sbin_dir/hasplmd" ] && [ -x "$sbin_dir/hasplmd" ] || return 1
+    [ -f "$sbin_dir/hasplmd_x86_64" ] && [ ! -L "$sbin_dir/hasplmd_x86_64" ] && [ -x "$sbin_dir/hasplmd_x86_64" ] || return 1
+    [ -f "$systemd_dir/aksusbd.service" ] && [ ! -L "$systemd_dir/aksusbd.service" ] || return 1
+    [ -f "$systemd_dir/hasplmd.service" ] && [ ! -L "$systemd_dir/hasplmd.service" ] || return 1
+    [ -f "${DR_KIT_HASP_UDEV_RULE:-/etc/udev/rules.d/80-hasp.rules}" ] && [ ! -L "${DR_KIT_HASP_UDEV_RULE:-/etc/udev/rules.d/80-hasp.rules}" ] || return 1
+    ldd "$sbin_dir/aksusbd_x86_64" "$sbin_dir/hasplmd_x86_64" >/dev/null 2>&1 || return 1
+    ldd "$sbin_dir/aksusbd_x86_64" "$sbin_dir/hasplmd_x86_64" 2>/dev/null | grep -Fq 'not found' && return 1
+    [ "$(systemctl show aksusbd.service -p LoadState --value 2>/dev/null)" = loaded ] || return 1
+    [ "$(systemctl show hasplmd.service -p LoadState --value 2>/dev/null)" = loaded ] || return 1
+    systemctl is-active --quiet aksusbd.service && systemctl is-active --quiet hasplmd.service
 }
 
 case "$package_name" in
@@ -6116,7 +6131,7 @@ case "$package_name" in
     gedit) command -v gedit >/dev/null 2>&1 ;;
     cifs-utils) pacman -Q cifs-utils >/dev/null 2>&1 && command -v mount.cifs >/dev/null 2>&1 ;;
     winbind) pacman -Q samba >/dev/null 2>&1 && command -v winbindd >/dev/null 2>&1 ;;
-    libjpeg62-turbo|libjpeg8) pacman -Q libjpeg-turbo >/dev/null 2>&1 && have_soname libjpeg.so.8 ;;
+    libjpeg62-turbo|libjpeg-turbo8) pacman -Q libjpeg-turbo >/dev/null 2>&1 && have_soname libjpeg.so.8 ;;
     libtiff6) pacman -Q libtiff >/dev/null 2>&1 && have_soname libtiff.so.6 ;;
     aksusbd) have_sentinel ;;
     *) echo "dr-kit-arch dpkg-query compatibility adapter: unsupported package '$package_name'" >&2; exit 2 ;;
@@ -6131,7 +6146,9 @@ render_arch_kit_launcher_support() {
     cat <<EOF
 ARCH_KIT_COMPAT_DIR="$DR_KIT_ARCH_COMPAT_DIR"
 ARCH_KIT_HASP_CONFIG_DIR="$DR_HASP_CONFIG_DIR"
-ARCH_KIT_HASP_SERVICE_NAME="$DR_HASP_SERVICE_NAME"
+ARCH_KIT_HASP_UDEV_RULE="$DR_HASP_UDEV_RULE"
+ARCH_KIT_HASP_SBIN_DIR="$DR_HASP_SBIN_DIR"
+ARCH_KIT_HASP_SYSTEMD_DIR="$DR_HASP_SYSTEMD_DIR"
 ARCH_KIT_CPPREST_LIBRARY_PATH="$DR_KIT_CPPREST_LIBRARY_PATH"
 
 validate_arch_kit_runtime() {
@@ -6144,7 +6161,7 @@ validate_arch_kit_runtime() {
     expected="\$(stat -c '%u:%a' "\$adapter" 2>/dev/null || true)"
     case "\$expected" in 0:7[05][05]|0:7[05]0|0:750|0:700|0:755) ;; *) echo "Arch KIT compatibility adapter must be root-owned and not group/other writable: \$adapter" >&2; return 1 ;; esac
     for package in libgtk-3-0 libgl1 libglu1-mesa libx11-6 libxext6 libxrender1 libxrandr2 libpango-1.0-0 libpangocairo-1.0-0 libcairo2 libpng16-16 libnotify4 libsm6 libexpat1 libstdc++6 libglib2.0-0 libpcre2-32-0 libglibmm-2.4-1 libcpprest2.10 libudev1 libxml++2.6-2v5 gedit cifs-utils winbind libjpeg62-turbo libtiff6 aksusbd; do
-        if ! DR_KIT_RUNTIME_DIR="\$KIT_DIR" DR_KIT_CPPREST_LIBRARY_PATH="\$ARCH_KIT_CPPREST_LIBRARY_PATH" DR_KIT_HASP_CONFIG_DIR="\$ARCH_KIT_HASP_CONFIG_DIR" DR_KIT_HASP_SERVICE_NAME="\$ARCH_KIT_HASP_SERVICE_NAME" "\$adapter" -W '-f=\${Status}' "\$package" >/dev/null; then
+        if ! DR_KIT_RUNTIME_DIR="\$KIT_DIR" DR_KIT_CPPREST_LIBRARY_PATH="\$ARCH_KIT_CPPREST_LIBRARY_PATH" DR_KIT_HASP_CONFIG_DIR="\$ARCH_KIT_HASP_CONFIG_DIR" DR_KIT_HASP_UDEV_RULE="\$ARCH_KIT_HASP_UDEV_RULE" DR_KIT_HASP_SBIN_DIR="\$ARCH_KIT_HASP_SBIN_DIR" DR_KIT_HASP_SYSTEMD_DIR="\$ARCH_KIT_HASP_SYSTEMD_DIR" "\$adapter" -W '-f=\${Status}' "\$package" >/dev/null; then
             echo "Arch KIT runtime prerequisite is not satisfied: \$package" >&2
             [ "\$package" != libcpprest2.10 ] || echo "No matching official Arch cpprest package was characterized; provide the exact libcpprest.so.2.10 through an approved vendor/runtime source before launching KIT." >&2
             return 1
@@ -6165,9 +6182,14 @@ render_arch_kit_post_mount_support() {
     cat <<EOF
 ARCH_KIT_COMPAT_DIR="$DR_KIT_ARCH_COMPAT_DIR"
 HASP_SOURCE_DIR="$DR_HASP_SOURCE_DIR"
+HASP_DEB_PATH="$DR_HASP_DEB_PATH"
 HASP_CONFIG_DIR="$DR_HASP_CONFIG_DIR"
-HASP_SERVICE_NAME="$DR_HASP_SERVICE_NAME"
-HASP_SCRIPT_INSTALLER_PATH="$DR_HASP_SCRIPT_INSTALLER_PATH"
+HASP_UDEV_RULE="$DR_HASP_UDEV_RULE"
+HASP_SBIN_DIR="$DR_HASP_SBIN_DIR"
+HASP_INIT_DIR="$DR_HASP_INIT_DIR"
+HASP_SYSTEMD_DIR="$DR_HASP_SYSTEMD_DIR"
+HASP_CONTROL_ARCHIVE=""
+HASP_DATA_ARCHIVE=""
 
 arch_kit_cpprest_available() {
     local candidate
@@ -6207,62 +6229,191 @@ arch_kit_install_native_dependencies() {
     fi
 }
 
-arch_kit_safe_archive() {
-    tar -tzf "\$1" | awk '
-        /^\// || /(^|\/)\.\.($|\/)/ || /[[:cntrl:]]/ { bad=1 }
-        { seen=1 }
-        END { exit((seen && !bad) ? 0 : 1) }
+arch_kit_tar_list() {
+    case "\$1" in
+        *.tar.gz) tar -tzf - ;;
+        *.tar.xz) tar -tJf - ;;
+        *.tar.zst) tar --zstd -tf - ;;
+        *) return 1 ;;
+    esac
+}
+
+arch_kit_tar_extract_file() {
+    local archive_name="\$1" member="\$2"
+    case "\$archive_name" in
+        *.tar.gz) ar p "\$HASP_DEB_PATH" "\$archive_name" | tar -xOzf - "\$member" ;;
+        *.tar.xz) ar p "\$HASP_DEB_PATH" "\$archive_name" | tar -xOJf - "\$member" ;;
+        *.tar.zst) ar p "\$HASP_DEB_PATH" "\$archive_name" | tar --zstd -xOf - "\$member" ;;
+        *) return 1 ;;
+    esac
+}
+
+arch_kit_metadata_field() {
+    local field="\$1" metadata="\$2"
+    printf '%s\n' "\$metadata" | awk -F ': ' -v wanted="\$field" '
+        \$1 == wanted { count++; value=substr(\$0, length(wanted) + 3) }
+        END { if (count == 1 && value != "") print value; else exit 1 }
     '
 }
 
-arch_kit_find_sentinel_archive() {
-    local -a candidates=()
-    local candidate
-    if [ -n "\$HASP_SCRIPT_INSTALLER_PATH" ]; then
-        case "\$(basename "\$HASP_SCRIPT_INSTALLER_PATH")" in aksusbd-*.tar.gz) ;; *) return 1 ;; esac
-        [ -f "\$HASP_SCRIPT_INSTALLER_PATH" ] && [ ! -L "\$HASP_SCRIPT_INSTALLER_PATH" ] || return 1
-        printf '%s\n' "\$HASP_SCRIPT_INSTALLER_PATH"
-        return 0
+arch_kit_validate_sentinel_deb() {
+    local -a members=()
+    local member metadata package version architecture
+
+    [ -f "\$HASP_DEB_PATH" ] && [ ! -L "\$HASP_DEB_PATH" ] || return 1
+    mapfile -t members < <(ar t "\$HASP_DEB_PATH" 2>/dev/null) || return 1
+    [ "\${#members[@]}" -eq 3 ] || return 1
+    [ "\${members[0]}" = debian-binary ] || return 1
+    [ "\${members[1]}" = control.tar.gz ] || return 1
+    [ "\${members[2]}" = data.tar.gz ] || return 1
+    [ "\$(ar p "\$HASP_DEB_PATH" debian-binary 2>/dev/null)" = 2.0 ] || return 1
+    HASP_CONTROL_ARCHIVE="\${members[1]}"
+    HASP_DATA_ARCHIVE="\${members[2]}"
+    metadata="\$(arch_kit_tar_extract_file "\$HASP_CONTROL_ARCHIVE" ./control 2>/dev/null)" || return 1
+    package="\$(arch_kit_metadata_field Package "\$metadata")" || return 1
+    version="\$(arch_kit_metadata_field Version "\$metadata")" || return 1
+    architecture="\$(arch_kit_metadata_field Architecture "\$metadata")" || return 1
+    [ "\$package" = aksusbd ] && [ "\$version" = 10.21-1 ] && [ "\$architecture" = amd64 ] || return 1
+    while IFS= read -r member; do
+        case "\$member" in
+            ./|./usr/|./usr/sbin/|./usr/sbin/aksusbd|./usr/sbin/aksusbd_x86_64|./usr/sbin/hasplmd|./usr/sbin/hasplmd_x86_64|./usr/share/|./usr/share/doc/|./usr/share/doc/aksusbd/|./usr/share/doc/aksusbd/copyright|./var/|./var/hasplm/|./var/hasplm/init/|./var/hasplm/init/aksusbd.rc|./var/hasplm/init/aksusbd.service|./var/hasplm/init/aksusbd_x86_64.service|./var/hasplm/init/hasplmd.service|./var/hasplm/init/hasplmd_x86_64.service|./etc/|./etc/udev/|./etc/udev/rules.d/|./etc/udev/rules.d/80-hasp.rules|./etc/hasplm/|./etc/hasplm/templates/|./etc/hasplm/templates/*.alp|./etc/hasplm/help/|./etc/hasplm/help/*) ;;
+            *) return 1 ;;
+        esac
+        case "\$member" in /*|*'..'*|*[[:cntrl:]]*) return 1 ;; esac
+    done < <(ar p "\$HASP_DEB_PATH" "\$HASP_DATA_ARCHIVE" | arch_kit_tar_list "\$HASP_DATA_ARCHIVE")
+    ar p "\$HASP_DEB_PATH" "\$HASP_DATA_ARCHIVE" | {
+        case "\$HASP_DATA_ARCHIVE" in *.tar.gz) tar -tvzf - ;; *.tar.xz) tar -tvJf - ;; *.tar.zst) tar --zstd -tvf - ;; esac
+    } | awk 'substr(\$1, 1, 1) !~ /^[d-]\$/ { bad=1 } END { exit(bad ? 1 : 0) }'
+}
+
+arch_kit_selected_sentinel_suffix() {
+    if [ ! -e /lib/ld-linux.so.2 ] || [ -e "\$HASP_INIT_DIR/force_x86_64" ]; then
+        printf '%s\n' _x86_64
+    else
+        printf '%s\n' ''
     fi
-    while IFS= read -r -d '' candidate; do candidates+=("\$candidate"); done < <(find -P "\$HASP_SOURCE_DIR" -maxdepth 2 -type f -name 'aksusbd-*.tar.gz' -print0 2>/dev/null)
-    [ "\${#candidates[@]}" -eq 1 ] || return 1
-    printf '%s\n' "\${candidates[0]}"
+}
+
+arch_kit_backup_if_present() {
+    local path="\$1" stamp
+    [ -e "\$path" ] || return 0
+    stamp="\$(date +%Y%m%d%H%M%S)"
+    cp -a -- "\$path" "\$path.dr-domain-join.bak.\$stamp"
+}
+
+arch_kit_extract_allowlisted_sentinel_payload() {
+    local work="\$1" archive="\$work/data.tar.gz" payload="\$work/payload"
+    ar p "\$HASP_DEB_PATH" "\$HASP_DATA_ARCHIVE" > "\$archive"
+    mkdir -p "\$payload"
+    tar -xzf "\$archive" -C "\$payload" --no-same-owner --no-same-permissions \
+        ./usr/sbin/aksusbd ./usr/sbin/aksusbd_x86_64 ./usr/sbin/hasplmd ./usr/sbin/hasplmd_x86_64 \
+        ./var/hasplm/init/aksusbd.service ./var/hasplm/init/aksusbd_x86_64.service \
+        ./var/hasplm/init/hasplmd.service ./var/hasplm/init/hasplmd_x86_64.service \
+        ./etc/udev/rules.d/80-hasp.rules ./etc/hasplm/templates
+    find "\$payload" \( -type l -o -type b -o -type c -o -type p -o -type s \) -print -quit | grep -q . && return 1
+}
+
+arch_kit_install_vendor_sentinel_payload() {
+    local work="\$1" payload="\$work/payload" suffix unit
+    local daemon
+    for daemon in aksusbd aksusbd_x86_64 hasplmd hasplmd_x86_64; do
+        [ -f "\$payload/usr/sbin/\$daemon" ] && [ ! -L "\$payload/usr/sbin/\$daemon" ] || return 1
+        arch_kit_backup_if_present "\$HASP_SBIN_DIR/\$daemon"
+        install -o root -g root -m 0755 "\$payload/usr/sbin/\$daemon" "\$HASP_SBIN_DIR/\$daemon"
+    done
+    install -d -o root -g root -m 0755 "\$HASP_INIT_DIR" "\$HASP_CONFIG_DIR" "\$(dirname "\$HASP_UDEV_RULE")"
+    for unit in aksusbd.service aksusbd_x86_64.service hasplmd.service hasplmd_x86_64.service; do
+        [ -f "\$payload/var/hasplm/init/\$unit" ] || return 1
+        install -o root -g root -m 0644 "\$payload/var/hasplm/init/\$unit" "\$HASP_INIT_DIR/\$unit"
+    done
+    while IFS= read -r -d '' unit; do
+        install -D -o root -g root -m 0644 "\$unit" "\$HASP_CONFIG_DIR/templates/\${unit##*/}"
+    done < <(find "\$payload/etc/hasplm/templates" -type f -print0)
+    arch_kit_backup_if_present "\$HASP_UDEV_RULE"
+    install -o root -g root -m 0644 "\$payload/etc/udev/rules.d/80-hasp.rules" "\$HASP_UDEV_RULE"
+    suffix="\$(arch_kit_selected_sentinel_suffix)"
+    for unit in aksusbd hasplmd; do
+        arch_kit_backup_if_present "\$HASP_SYSTEMD_DIR/\$unit.service"
+        install -o root -g root -m 0644 "\$HASP_INIT_DIR/\$unit\$suffix.service" "\$HASP_SYSTEMD_DIR/\$unit.service"
+    done
+}
+
+arch_kit_vendor_member_matches() {
+    local member="\$1" destination="\$2"
+    ar p "\$HASP_DEB_PATH" "\$HASP_DATA_ARCHIVE" | tar -xOzf - "\$member" | cmp -s - "\$destination"
 }
 
 arch_kit_verify_sentinel() {
-    command -v aksusbd >/dev/null 2>&1 || return 1
-    [ -r "\$HASP_CONFIG_DIR/hasplm.ini" ] || return 1
-    systemctl is-active --quiet "\$HASP_SERVICE_NAME"
+    local suffix daemon config_source
+    arch_kit_validate_sentinel_deb || return 1
+    config_source="\$HASP_SOURCE_DIR/hasplm-\$OFFICE_CODE.ini"
+    [ -f "\$config_source" ] && [ ! -L "\$config_source" ] && cmp -s "\$config_source" "\$HASP_CONFIG_DIR/hasplm.ini" || return 1
+    for daemon in "\$HASP_SBIN_DIR/aksusbd" "\$HASP_SBIN_DIR/aksusbd_x86_64" "\$HASP_SBIN_DIR/hasplmd" "\$HASP_SBIN_DIR/hasplmd_x86_64"; do
+        [ -f "\$daemon" ] && [ ! -L "\$daemon" ] && [ -x "\$daemon" ] || return 1
+    done
+    ldd "\$HASP_SBIN_DIR/aksusbd_x86_64" "\$HASP_SBIN_DIR/hasplmd_x86_64" >/dev/null 2>&1 || return 1
+    ldd "\$HASP_SBIN_DIR/aksusbd_x86_64" "\$HASP_SBIN_DIR/hasplmd_x86_64" 2>/dev/null | grep -Fq 'not found' && return 1
+    suffix="\$(arch_kit_selected_sentinel_suffix)"
+    arch_kit_vendor_member_matches ./etc/udev/rules.d/80-hasp.rules "\$HASP_UDEV_RULE" || return 1
+    cmp -s "\$HASP_INIT_DIR/aksusbd\$suffix.service" "\$HASP_SYSTEMD_DIR/aksusbd.service" || return 1
+    cmp -s "\$HASP_INIT_DIR/hasplmd\$suffix.service" "\$HASP_SYSTEMD_DIR/hasplmd.service" || return 1
+    [ "\$(systemctl show aksusbd.service -p LoadState --value 2>/dev/null)" = loaded ] || return 1
+    [ "\$(systemctl show hasplmd.service -p LoadState --value 2>/dev/null)" = loaded ] || return 1
+    systemctl is-active --quiet aksusbd.service && systemctl is-active --quiet hasplmd.service
 }
 
 install_arch_sentinel_runtime() {
-    local archive work copied dinst config_source
-    archive="\$(arch_kit_find_sentinel_archive)" || { log "Arch KIT blocker: provide exactly one generic vendor Sentinel archive matching aksusbd-*.tar.gz beneath \$HASP_SOURCE_DIR, or set DR_HASP_SCRIPT_INSTALLER_PATH. Debian .deb installers are intentionally unsupported on Arch."; return 1; }
-    arch_kit_safe_archive "\$archive" || { log "Arch KIT blocker: Sentinel archive has unsafe or empty member paths: \$archive"; return 1; }
+    local work config_source
+    arch_kit_validate_sentinel_deb || { log "Arch KIT blocker: approved Sentinel .deb must be a safe aksusbd 10.21-1 amd64 Debian ar package: \$HASP_DEB_PATH"; return 1; }
     config_source="\$HASP_SOURCE_DIR/hasplm-\$OFFICE_CODE.ini"
     [ -f "\$config_source" ] && [ ! -L "\$config_source" ] || { log "Arch KIT blocker: validated office HASP configuration is missing: \$config_source"; return 1; }
-    work="\$(mktemp -d /var/tmp/dr-hasp.XXXXXXXX)"
+    work="\$(mktemp -d /var/tmp/dr-hasp-deb.XXXXXXXX)"
     trap 'rm -rf -- "\$work"' RETURN
-    copied="\$work/\$(basename "\$archive")"
-    install -o root -g root -m 0600 "\$archive" "\$copied"
-    tar -xzf "\$copied" -C "\$work"
-    dinst="\$(find "\$work" -type f -name dinst -perm -u+x -print -quit)"
-    [ -n "\$dinst" ] && [ "\$(find "\$work" -type f -name dinst -perm -u+x | wc -l)" -eq 1 ] || { log "Arch KIT blocker: generic Sentinel archive must contain exactly one executable dinst."; return 1; }
-    ( cd "\$(dirname "\$dinst")" && "\$dinst" ) || { log "Vendor Sentinel dinst failed."; return 1; }
-    install -d -o root -g root -m 0755 "\$HASP_CONFIG_DIR"
+    arch_kit_extract_allowlisted_sentinel_payload "\$work" || { log "Arch KIT blocker: approved Sentinel payload extraction failed allowlist validation."; return 1; }
+    arch_kit_install_vendor_sentinel_payload "\$work" || { log "Arch KIT blocker: Sentinel runtime payload installation failed."; return 1; }
+    arch_kit_backup_if_present "\$HASP_CONFIG_DIR/hasplm.ini"
     install -o root -g root -m 0644 "\$config_source" "\$HASP_CONFIG_DIR/hasplm.ini"
-    arch_kit_verify_sentinel || { log "Sentinel runtime or licensing service verification failed after dinst."; return 1; }
+    systemctl daemon-reload
+    systemctl enable aksusbd.service hasplmd.service
+    systemctl restart aksusbd.service hasplmd.service
+    arch_kit_verify_sentinel || { log "Sentinel runtime verification failed after vendor payload deployment."; return 1; }
+}
+
+arch_kit_verify_native_dependencies() {
+    local package
+    local -a required=(gtk3 libglvnd glu libx11 libxext libxrender libxrandr pango cairo libpng libnotify libsm expat gcc-libs glib2 pcre2 glibmm systemd-libs libxml++2.6 libjpeg-turbo libtiff cifs-utils samba gedit)
+    arch_kit_cpprest_available || return 1
+    for package in "\${required[@]}"; do pacman -Q "\$package" >/dev/null 2>&1 || return 1; done
+}
+
+arch_kit_verify_local_preflight() {
+    local package kit_dir="\$(dirname "\$KIT_INSTALLER_PATH")"
+    [ -f "\$ARCH_KIT_COMPAT_DIR/dpkg-query" ] && [ ! -L "\$ARCH_KIT_COMPAT_DIR/dpkg-query" ] && [ -x "\$ARCH_KIT_COMPAT_DIR/dpkg-query" ] || return 1
+    [ -r "\$kit_dir/KIT" ] && [ -r "\$kit_dir/KIT.sh" ] || return 1
+    for package in libgtk-3-0 libgl1 libglu1-mesa libx11-6 libxext6 libxrender1 libxrandr2 libpango-1.0-0 libpangocairo-1.0-0 libcairo2 libpng16-16 libnotify4 libsm6 libexpat1 libstdc++6 libglib2.0-0 libpcre2-32-0 libglibmm-2.4-1 libcpprest2.10 libudev1 libxml++2.6-2v5 gedit cifs-utils winbind libjpeg62-turbo libtiff6 aksusbd; do
+        DR_KIT_RUNTIME_DIR="\$kit_dir" DR_KIT_CPPREST_LIBRARY_PATH="\${DR_KIT_CPPREST_LIBRARY_PATH:-}" DR_KIT_HASP_CONFIG_DIR="\$HASP_CONFIG_DIR" DR_KIT_HASP_UDEV_RULE="\$HASP_UDEV_RULE" DR_KIT_HASP_SBIN_DIR="\$HASP_SBIN_DIR" DR_KIT_HASP_SYSTEMD_DIR="\$HASP_SYSTEMD_DIR" "\$ARCH_KIT_COMPAT_DIR/dpkg-query" -W '-f=\${Status}' "\$package" >/dev/null || return 1
+    done
 }
 
 install_kit_arch() {
-    if state_has "KIT_INSTALL_COMPLETE"; then log "Arch KIT installation already marked complete; verifying current local compatibility adapter."; install_arch_kit_compatibility_adapter; return 0; fi
     [ -n "\${OFFICE_CODE:-}" ] || { log "No office code is available for Arch KIT installation."; return 1; }
+    if state_has "KIT_INSTALL_COMPLETE"; then
+        log "Arch KIT installation marker exists; validating current native runtime before reusing it."
+        install_arch_kit_compatibility_adapter
+        arch_kit_verify_native_dependencies || { log "Arch KIT runtime dependencies are no longer valid; marker is not trusted."; return 1; }
+        arch_kit_verify_sentinel || { log "Arch Sentinel runtime is no longer valid; marker is not trusted."; return 1; }
+        arch_kit_verify_local_preflight || { log "Arch KIT launcher prerequisites are no longer valid; marker is not trusted."; return 1; }
+        log "Existing Arch KIT installation remains valid; no package or Sentinel reinstall was performed."
+        return 0
+    fi
     arch_kit_install_native_dependencies || return 1
     install_arch_sentinel_runtime || return 1
     install_arch_kit_compatibility_adapter
-    if ! DR_KIT_HASP_CONFIG_DIR="\$HASP_CONFIG_DIR" DR_KIT_HASP_SERVICE_NAME="\$HASP_SERVICE_NAME" "\$ARCH_KIT_COMPAT_DIR/dpkg-query" -W '-f=\${Status}' aksusbd >/dev/null; then log "Arch KIT compatibility adapter cannot verify Sentinel runtime."; return 1; fi
+    arch_kit_verify_native_dependencies || return 1
+    arch_kit_verify_sentinel || return 1
+    arch_kit_verify_local_preflight || return 1
     state_mark "KIT_INSTALL_COMPLETE"
-    log "Arch KIT native dependencies, Sentinel runtime, and local compatibility adapter verified."
+    log "Arch KIT native dependencies, approved Sentinel runtime, and local compatibility adapter verified."
 }
 EOF
 }
