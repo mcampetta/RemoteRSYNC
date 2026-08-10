@@ -81,6 +81,12 @@ PREFLIGHT_BLOCKERS=0
 OS_RELEASE_FILE="${DR_JOIN_OS_RELEASE_FILE:-/etc/os-release}"
 KIT_PROCESS_PATTERN="${KIT_PROCESS_PATTERN:-KIT}"
 KIT_INSTALLER_PATH="${KIT_INSTALLER_PATH:-/mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/KIT-installer-modified.sh}"
+DR_KIT_ARCH_COMPAT_DIR="${DR_KIT_ARCH_COMPAT_DIR:-/usr/local/libexec/dr-kit-arch}"
+DR_KIT_CPPREST_LIBRARY_PATH="${DR_KIT_CPPREST_LIBRARY_PATH:-}"
+DR_HASP_SCRIPT_INSTALLER_PATH="${DR_HASP_SCRIPT_INSTALLER_PATH:-}"
+DR_HASP_SOURCE_DIR="${DR_HASP_SOURCE_DIR:-/mnt/x/DRTools/frozen/Generic/HASP/V10.21}"
+DR_HASP_CONFIG_DIR="${DR_HASP_CONFIG_DIR:-/etc/hasplm}"
+DR_HASP_SERVICE_NAME="${DR_HASP_SERVICE_NAME:-aksusbd}"
 BRAND_WALLPAPER_SOURCE="${BRAND_WALLPAPER_SOURCE:-/mnt/x/CRtools/Frozen/Branding/Wallpaper/1080p_ontrackwallpaper.jpg}"
 BRAND_WALLPAPER_DEST="/usr/share/backgrounds/dr-company-wallpaper"
 OFFICE_CODE=""
@@ -6044,6 +6050,223 @@ EOF
 }
 
 
+# ── Arch KIT compatibility renderers ─────────────────────────────────────────
+#
+# KIT.sh is a shared Tool Server artifact.  It deliberately remains untouched:
+# the Arch adapter below is generated locally and is prepended to PATH only for
+# the one KIT.sh child process.  It implements precisely the read-only
+# dpkg-query predicate that the current shared script uses, not dpkg generally.
+render_arch_kit_dpkg_query_shim() {
+    cat <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+if [ "$#" -ne 3 ] || [ "$1" != "-W" ] || [ "$2" != '-f=${Status}' ]; then
+    echo "dr-kit-arch dpkg-query compatibility adapter: unsupported query" >&2
+    exit 2
+fi
+
+package_name="$3"
+
+have_soname() {
+    local soname="$1"
+    ldconfig -p 2>/dev/null | awk -v wanted="$soname" '$1 == wanted { found=1 } END { exit(found ? 0 : 1) }' \
+        || [ -e "/usr/lib/$soname" ]
+}
+
+have_cpprest() {
+    local candidate
+    if [ -n "${DR_KIT_CPPREST_LIBRARY_PATH:-}" ]; then
+        candidate="$DR_KIT_CPPREST_LIBRARY_PATH"
+        [ -f "$candidate" ] && [ ! -L "$candidate" ] && return 0
+    fi
+    have_soname libcpprest.so.2.10 && return 0
+    find "${DR_KIT_RUNTIME_DIR:-/nonexistent}" \
+        /mnt/x/DRTools/Frozen/DLL /mnt/x/DRTools/UA/DLL \
+        -xdev -type f -name 'libcpprest.so.2.10' -print -quit 2>/dev/null | grep -q .
+}
+
+have_sentinel() {
+    [ -r "${DR_KIT_HASP_CONFIG_DIR:-/etc/hasplm}/hasplm.ini" ] || return 1
+    command -v aksusbd >/dev/null 2>&1 || return 1
+    systemctl is-active --quiet "${DR_KIT_HASP_SERVICE_NAME:-aksusbd}"
+}
+
+case "$package_name" in
+    libgtk-3-0) pacman -Q gtk3 >/dev/null 2>&1 && have_soname libgtk-3.so.0 ;;
+    libgl1) pacman -Q libglvnd >/dev/null 2>&1 && have_soname libGL.so.1 ;;
+    libglu1-mesa) pacman -Q glu >/dev/null 2>&1 && have_soname libGLU.so.1 ;;
+    libx11-6) pacman -Q libx11 >/dev/null 2>&1 && have_soname libX11.so.6 ;;
+    libxext6) pacman -Q libxext >/dev/null 2>&1 && have_soname libXext.so.6 ;;
+    libxrender1) pacman -Q libxrender >/dev/null 2>&1 && have_soname libXrender.so.1 ;;
+    libxrandr2) pacman -Q libxrandr >/dev/null 2>&1 && have_soname libXrandr.so.2 ;;
+    libpango-1.0-0|libpangocairo-1.0-0) pacman -Q pango >/dev/null 2>&1 && have_soname libpango-1.0.so.0 ;;
+    libcairo2) pacman -Q cairo >/dev/null 2>&1 && have_soname libcairo.so.2 ;;
+    libpng16-16) pacman -Q libpng >/dev/null 2>&1 && have_soname libpng16.so.16 ;;
+    libnotify4) pacman -Q libnotify >/dev/null 2>&1 && have_soname libnotify.so.4 ;;
+    libsm6) pacman -Q libsm >/dev/null 2>&1 && have_soname libSM.so.6 ;;
+    libexpat1) pacman -Q expat >/dev/null 2>&1 && have_soname libexpat.so.1 ;;
+    libstdc++6) pacman -Q gcc-libs >/dev/null 2>&1 && have_soname libstdc++.so.6 ;;
+    libglib2.0-0) pacman -Q glib2 >/dev/null 2>&1 && have_soname libglib-2.0.so.0 ;;
+    libpcre2-32-0) pacman -Q pcre2 >/dev/null 2>&1 && have_soname libpcre2-32.so.0 ;;
+    libglibmm-2.4-1) pacman -Q glibmm >/dev/null 2>&1 && have_soname libglibmm-2.4.so.1 ;;
+    libcpprest2.10) have_cpprest ;;
+    libudev1) pacman -Q systemd-libs >/dev/null 2>&1 && have_soname libudev.so.1 ;;
+    libxml++2.6-2v5) pacman -Q libxml++2.6 >/dev/null 2>&1 && have_soname libxml++-2.6.so.2 ;;
+    gedit) command -v gedit >/dev/null 2>&1 ;;
+    cifs-utils) pacman -Q cifs-utils >/dev/null 2>&1 && command -v mount.cifs >/dev/null 2>&1 ;;
+    winbind) pacman -Q samba >/dev/null 2>&1 && command -v winbindd >/dev/null 2>&1 ;;
+    libjpeg62-turbo|libjpeg8) pacman -Q libjpeg-turbo >/dev/null 2>&1 && have_soname libjpeg.so.8 ;;
+    libtiff6) pacman -Q libtiff >/dev/null 2>&1 && have_soname libtiff.so.6 ;;
+    aksusbd) have_sentinel ;;
+    *) echo "dr-kit-arch dpkg-query compatibility adapter: unsupported package '$package_name'" >&2; exit 2 ;;
+esac
+
+printf 'install ok installed\n'
+EOF
+}
+
+render_arch_kit_launcher_support() {
+    [ "$PLATFORM_FAMILY" = arch ] || return 0
+    cat <<EOF
+ARCH_KIT_COMPAT_DIR="$DR_KIT_ARCH_COMPAT_DIR"
+ARCH_KIT_HASP_CONFIG_DIR="$DR_HASP_CONFIG_DIR"
+ARCH_KIT_HASP_SERVICE_NAME="$DR_HASP_SERVICE_NAME"
+ARCH_KIT_CPPREST_LIBRARY_PATH="$DR_KIT_CPPREST_LIBRARY_PATH"
+
+validate_arch_kit_runtime() {
+    local adapter expected package kit_ld_library_path
+    adapter="\$ARCH_KIT_COMPAT_DIR/dpkg-query"
+    if [ ! -f "\$adapter" ] || [ -L "\$adapter" ] || [ ! -x "\$adapter" ]; then
+        echo "Arch KIT compatibility adapter is missing or unsafe: \$adapter" >&2
+        return 1
+    fi
+    expected="\$(stat -c '%u:%a' "\$adapter" 2>/dev/null || true)"
+    case "\$expected" in 0:7[05][05]|0:7[05]0|0:750|0:700|0:755) ;; *) echo "Arch KIT compatibility adapter must be root-owned and not group/other writable: \$adapter" >&2; return 1 ;; esac
+    for package in libgtk-3-0 libgl1 libglu1-mesa libx11-6 libxext6 libxrender1 libxrandr2 libpango-1.0-0 libpangocairo-1.0-0 libcairo2 libpng16-16 libnotify4 libsm6 libexpat1 libstdc++6 libglib2.0-0 libpcre2-32-0 libglibmm-2.4-1 libcpprest2.10 libudev1 libxml++2.6-2v5 gedit cifs-utils winbind libjpeg62-turbo libtiff6 aksusbd; do
+        if ! DR_KIT_RUNTIME_DIR="\$KIT_DIR" DR_KIT_CPPREST_LIBRARY_PATH="\$ARCH_KIT_CPPREST_LIBRARY_PATH" DR_KIT_HASP_CONFIG_DIR="\$ARCH_KIT_HASP_CONFIG_DIR" DR_KIT_HASP_SERVICE_NAME="\$ARCH_KIT_HASP_SERVICE_NAME" "\$adapter" -W '-f=\${Status}' "\$package" >/dev/null; then
+            echo "Arch KIT runtime prerequisite is not satisfied: \$package" >&2
+            [ "\$package" != libcpprest2.10 ] || echo "No matching official Arch cpprest package was characterized; provide the exact libcpprest.so.2.10 through an approved vendor/runtime source before launching KIT." >&2
+            return 1
+        fi
+    done
+    [ -r "\$KIT_DIR/KIT" ] && [ -r "\$KIT_DIR/KIT.sh" ] || { echo "KIT runtime files are not readable." >&2; return 1; }
+    kit_ld_library_path="\$KIT_DIR:/mnt/x/DRTools/Frozen/DLL/AsyncIO-Linux/V2.00/x64:/mnt/x/DRTools/Frozen/DLL/FileIO-Linux/V6.00/x64:/mnt/x/DRTools/UA/DLL/IO-Linux/V6.00/x64:/mnt/x/DRTools/UA/DLL/Secure-Linux/V2.01/x64:/mnt/x/DRTools/UA/Imaging/DRIP/Drip.Lib-Linux/V12.00/x64:/mnt/x/DRTools/UA/Imaging/DRIP/Drip.WebApi.Backend.UnmanagedClient-Linux/V12.00/x64:/mnt/x/DRTools/Frozen/DLL/3rd/wxWidgets/V3.3.1/x64"
+    if LD_LIBRARY_PATH="\$kit_ld_library_path\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" ldd "\$KIT_DIR/KIT" 2>/dev/null | grep -Fq 'not found'; then
+        echo "Arch KIT runtime still has unresolved ELF dependencies; see ldd output for \$KIT_DIR/KIT." >&2
+        return 1
+    fi
+}
+EOF
+}
+
+render_arch_kit_post_mount_support() {
+    [ "$PLATFORM_FAMILY" = arch ] || return 0
+    cat <<EOF
+ARCH_KIT_COMPAT_DIR="$DR_KIT_ARCH_COMPAT_DIR"
+HASP_SOURCE_DIR="$DR_HASP_SOURCE_DIR"
+HASP_CONFIG_DIR="$DR_HASP_CONFIG_DIR"
+HASP_SERVICE_NAME="$DR_HASP_SERVICE_NAME"
+HASP_SCRIPT_INSTALLER_PATH="$DR_HASP_SCRIPT_INSTALLER_PATH"
+
+arch_kit_cpprest_available() {
+    local candidate
+    if [ -n "\${DR_KIT_CPPREST_LIBRARY_PATH:-}" ]; then
+        candidate="\$DR_KIT_CPPREST_LIBRARY_PATH"
+        [ -f "\$candidate" ] && [ ! -L "\$candidate" ] && return 0
+    fi
+    [ -e /usr/lib/libcpprest.so.2.10 ] && return 0
+    find "\$(dirname "\$KIT_INSTALLER_PATH")" /mnt/x/DRTools/Frozen/DLL /mnt/x/DRTools/UA/DLL -xdev -type f -name 'libcpprest.so.2.10' -print -quit 2>/dev/null | grep -q .
+}
+
+install_arch_kit_compatibility_adapter() {
+    local stage
+    install -d -o root -g root -m 0755 "\$ARCH_KIT_COMPAT_DIR"
+    stage="\$(mktemp "\$ARCH_KIT_COMPAT_DIR/.dpkg-query.XXXXXXXX")"
+    cat > "\$stage" << 'EOF2'
+$(render_arch_kit_dpkg_query_shim)
+EOF2
+    chown root:root "\$stage"
+    chmod 0755 "\$stage"
+    mv -f -- "\$stage" "\$ARCH_KIT_COMPAT_DIR/dpkg-query"
+}
+
+arch_kit_install_native_dependencies() {
+    local package
+    local -a required=(gtk3 libglvnd glu libx11 libxext libxrender libxrandr pango cairo libpng libnotify libsm expat gcc-libs glib2 pcre2 glibmm systemd-libs libxml++2.6 libjpeg-turbo libtiff cifs-utils samba gedit)
+    local -a missing=()
+
+    if ! arch_kit_cpprest_available; then
+        log "Arch KIT blocker: libcpprest.so.2.10 is neither supplied by the Tool Server runtime nor available through a configured approved source. No AUR/source-build fallback will be used."
+        return 1
+    fi
+    for package in "\${required[@]}"; do pacman -Q "\$package" >/dev/null 2>&1 || missing+=("\$package"); done
+    if [ "\${#missing[@]}" -gt 0 ]; then
+        log "Installing missing native Arch KIT dependencies: \${missing[*]}"
+        pacman --needed --noconfirm -S "\${missing[@]}"
+    fi
+}
+
+arch_kit_safe_archive() {
+    tar -tzf "\$1" | awk '
+        /^\// || /(^|\/)\.\.($|\/)/ || /[[:cntrl:]]/ { bad=1 }
+        { seen=1 }
+        END { exit((seen && !bad) ? 0 : 1) }
+    '
+}
+
+arch_kit_find_sentinel_archive() {
+    local -a candidates=()
+    local candidate
+    if [ -n "\$HASP_SCRIPT_INSTALLER_PATH" ]; then
+        case "\$(basename "\$HASP_SCRIPT_INSTALLER_PATH")" in aksusbd-*.tar.gz) ;; *) return 1 ;; esac
+        [ -f "\$HASP_SCRIPT_INSTALLER_PATH" ] && [ ! -L "\$HASP_SCRIPT_INSTALLER_PATH" ] || return 1
+        printf '%s\n' "\$HASP_SCRIPT_INSTALLER_PATH"
+        return 0
+    fi
+    while IFS= read -r -d '' candidate; do candidates+=("\$candidate"); done < <(find -P "\$HASP_SOURCE_DIR" -maxdepth 2 -type f -name 'aksusbd-*.tar.gz' -print0 2>/dev/null)
+    [ "\${#candidates[@]}" -eq 1 ] || return 1
+    printf '%s\n' "\${candidates[0]}"
+}
+
+arch_kit_verify_sentinel() {
+    command -v aksusbd >/dev/null 2>&1 || return 1
+    [ -r "\$HASP_CONFIG_DIR/hasplm.ini" ] || return 1
+    systemctl is-active --quiet "\$HASP_SERVICE_NAME"
+}
+
+install_arch_sentinel_runtime() {
+    local archive work copied dinst config_source
+    archive="\$(arch_kit_find_sentinel_archive)" || { log "Arch KIT blocker: provide exactly one generic vendor Sentinel archive matching aksusbd-*.tar.gz beneath \$HASP_SOURCE_DIR, or set DR_HASP_SCRIPT_INSTALLER_PATH. Debian .deb installers are intentionally unsupported on Arch."; return 1; }
+    arch_kit_safe_archive "\$archive" || { log "Arch KIT blocker: Sentinel archive has unsafe or empty member paths: \$archive"; return 1; }
+    config_source="\$HASP_SOURCE_DIR/hasplm-\$OFFICE_CODE.ini"
+    [ -f "\$config_source" ] && [ ! -L "\$config_source" ] || { log "Arch KIT blocker: validated office HASP configuration is missing: \$config_source"; return 1; }
+    work="\$(mktemp -d /var/tmp/dr-hasp.XXXXXXXX)"
+    trap 'rm -rf -- "\$work"' RETURN
+    copied="\$work/\$(basename "\$archive")"
+    install -o root -g root -m 0600 "\$archive" "\$copied"
+    tar -xzf "\$copied" -C "\$work"
+    dinst="\$(find "\$work" -type f -name dinst -perm -u+x -print -quit)"
+    [ -n "\$dinst" ] && [ "\$(find "\$work" -type f -name dinst -perm -u+x | wc -l)" -eq 1 ] || { log "Arch KIT blocker: generic Sentinel archive must contain exactly one executable dinst."; return 1; }
+    ( cd "\$(dirname "\$dinst")" && "\$dinst" ) || { log "Vendor Sentinel dinst failed."; return 1; }
+    install -d -o root -g root -m 0755 "\$HASP_CONFIG_DIR"
+    install -o root -g root -m 0644 "\$config_source" "\$HASP_CONFIG_DIR/hasplm.ini"
+    arch_kit_verify_sentinel || { log "Sentinel runtime or licensing service verification failed after dinst."; return 1; }
+}
+
+install_kit_arch() {
+    if state_has "KIT_INSTALL_COMPLETE"; then log "Arch KIT installation already marked complete; verifying current local compatibility adapter."; install_arch_kit_compatibility_adapter; return 0; fi
+    [ -n "\${OFFICE_CODE:-}" ] || { log "No office code is available for Arch KIT installation."; return 1; }
+    arch_kit_install_native_dependencies || return 1
+    install_arch_sentinel_runtime || return 1
+    install_arch_kit_compatibility_adapter
+    if ! DR_KIT_HASP_CONFIG_DIR="\$HASP_CONFIG_DIR" DR_KIT_HASP_SERVICE_NAME="\$HASP_SERVICE_NAME" "\$ARCH_KIT_COMPAT_DIR/dpkg-query" -W '-f=\${Status}' aksusbd >/dev/null; then log "Arch KIT compatibility adapter cannot verify Sentinel runtime."; return 1; fi
+    state_mark "KIT_INSTALL_COMPLETE"
+    log "Arch KIT native dependencies, Sentinel runtime, and local compatibility adapter verified."
+}
+EOF
+}
+
 # ── Post-mount provisioning helper ───────────────────────────────────────────
 install_post_mount_provision_helper() {
     print_info "Installing post-mount provisioning helper for KIT installer and workstation branding..."
@@ -6058,10 +6281,14 @@ install_post_mount_provision_helper() {
     local kit_cache_validator
     local kit_credential_self_test
     local drip_launcher_support
+    local arch_kit_launcher_support
+    local arch_kit_post_mount_support
     kit_runtime_dir="$(dirname "$KIT_INSTALLER_PATH")"
     kit_cache_validator="$(render_kit_cache_validator)"
     kit_credential_self_test="$(render_kit_credential_self_test)"
     drip_launcher_support="$(render_drip_launcher_support)"
+    arch_kit_launcher_support="$(render_arch_kit_launcher_support)"
+    arch_kit_post_mount_support="$(render_arch_kit_post_mount_support)"
 
     # Generate this helper with quoted heredoc segments so runtime variables
     # such as $LOG, $KIT_DIR, ${1:-}, and $? are preserved until launch time,
@@ -6118,6 +6345,7 @@ fi
 validate_kit_invoking_cache
 EOF
     printf '%s\n' "$drip_launcher_support"
+    printf '%s\n' "$arch_kit_launcher_support"
     cat << 'EOF'
 
 cd "$KIT_DIR" || exit 1
@@ -6126,7 +6354,12 @@ cd "$KIT_DIR" || exit 1
 # launched like the manual known-good command:
 #   cd /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64
 #   sudo bash ./KIT.sh
-bash "$KIT_SCRIPT"
+if [ -n "${ARCH_KIT_COMPAT_DIR:-}" ]; then
+    validate_arch_kit_runtime || exit 1
+    PATH="$ARCH_KIT_COMPAT_DIR:$PATH" bash "$KIT_SCRIPT"
+else
+    bash "$KIT_SCRIPT"
+fi
 status=$?
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] KIT exited with status: $status" >> "$LOG" 2>/dev/null || true
@@ -6144,6 +6377,8 @@ EOF
 set -euo pipefail
 
 KIT_INSTALLER_PATH="${KIT_INSTALLER_PATH}"
+PLATFORM_FAMILY="${PLATFORM_FAMILY}"
+DR_KIT_ARCH_COMPAT_DIR="${DR_KIT_ARCH_COMPAT_DIR}"
 BRAND_WALLPAPER_SOURCE="${BRAND_WALLPAPER_SOURCE}"
 BRAND_WALLPAPER_DEST="${BRAND_WALLPAPER_DEST}"
 STATE_DIR="${STATE_DIR}"
@@ -6151,6 +6386,8 @@ STATE_FILE="${STATE_FILE}"
 OFFICE_CODE="${OFFICE_CODE:-}"
 TOOLS_SOURCE="//$TOOLS_SERVER/Tools"
 LOG_FILE="/var/log/dr-post-mount-provision.log"
+
+$arch_kit_post_mount_support
 
 log() {
     echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$*" | tee -a "\$LOG_FILE"
@@ -6224,6 +6461,7 @@ fi
 
 validate_kit_invoking_cache
 $drip_launcher_support
+$arch_kit_launcher_support
 
 cd "\$KIT_DIR" || exit 1
 
@@ -6231,7 +6469,12 @@ cd "\$KIT_DIR" || exit 1
 # launched like the manual known-good command:
 #   cd /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64
 #   sudo bash ./KIT.sh
-bash "\$KIT_SCRIPT"
+if [ -n "\${ARCH_KIT_COMPAT_DIR:-}" ]; then
+    validate_arch_kit_runtime || exit 1
+    PATH="\$ARCH_KIT_COMPAT_DIR:\$PATH" bash "\$KIT_SCRIPT"
+else
+    bash "\$KIT_SCRIPT"
+fi
 status=\$?
 
 echo "[\$(date '+%Y-%m-%d %H:%M:%S')] KIT exited with status: \$status" >> "\$LOG" 2>/dev/null || true
@@ -6285,7 +6528,7 @@ fi
 
 install_root_kit_launcher_helper
 
-install_kit() {
+install_kit_debian() {
     local kit_dir
     local kit_script
     local rc
@@ -6326,6 +6569,14 @@ install_kit() {
         log "KIT installer failed with exit code \$rc."
         exit "\$rc"
     fi
+}
+
+install_kit() {
+    case "\$PLATFORM_FAMILY" in
+        debian) install_kit_debian ;;
+        arch) install_kit_arch ;;
+        *) log "No KIT installation adapter exists for platform family: \$PLATFORM_FAMILY"; return 1 ;;
+    esac
 }
 
 install_kit_desktop_shortcut_for_user() {
