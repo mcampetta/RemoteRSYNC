@@ -2310,6 +2310,12 @@ test_arch_sentinel_deb_adapter() {
     done
     assert_contains "$launcher_support" 'prepare_arch_kit_runtime_wrapper' "Arch launcher prepares a private local KIT wrapper"
     assert_contains "$launcher_support" 'print "export LD_LIBRARY_PATH=\"$SCRIPT_DIR:' "private KIT wrapper retains cpprest before Tool Server paths"
+    assert_contains "$launcher_support" 'arch_kit_launcher_validate_drip_cpprest()' "launcher uses a distinct DRIP/cpprest validator"
+    assert_contains "$post_support" 'arch_kit_post_mount_validate_drip_cpprest()' "post-mount helper uses a distinct DRIP/cpprest validator"
+    if printf '%s\n%s\n' "$launcher_support" "$post_support" | grep -Eq '^arch_kit_validate_drip_cpprest\(\)'; then
+        fail "generated Arch helpers must not contain the duplicate generic DRIP/cpprest validator name"
+    fi
+    pass "generated Arch helpers contain no duplicate DRIP/cpprest validator definition"
     if printf '%s\n' "$post_support" | grep -Eq '(^|[[:space:]])(dpkg|apt|apt-get|debtap|yay|paru|make|cmake)([[:space:]]|$)'; then
         fail "Arch cpprest adapter must not use package-manager, AUR, or source-build tooling"
     fi
@@ -2346,6 +2352,18 @@ EOF
     cat > "$fake_bin/ldd" << 'EOF'
 #!/bin/bash
 exit 0
+EOF
+    cat > "$fake_bin/readelf" << 'EOF'
+#!/bin/bash
+case "${1:-}" in
+    -h) printf '  Class:                             ELF64\n  Machine:                           Advanced Micro Devices X86-64\n' ;;
+    -d) printf ' 0x000000000000000e (SONAME)             Library soname: [libcpprest.so.2.10]\n' ;;
+    *) exit 1 ;;
+esac
+EOF
+    cat > "$fake_bin/stat" << 'EOF'
+#!/bin/bash
+printf '0:644\n'
 EOF
     cat > "$fake_bin/systemctl" << 'EOF'
 #!/bin/bash
@@ -2393,6 +2411,17 @@ EOF
     set -e
     [ "$rc" -ne 0 ] || fail "inactive hasplmd must fail the Sentinel runtime predicate"
     pass "both Sentinel services are required for runtime verification"
+    : > "$case_dir/private-libcpprest.so.2.10"
+    output="$(PATH="$fake_bin:$PATH" DR_KIT_CPPREST_LIBRARY_PATH="$case_dir/private-libcpprest.so.2.10" "$case_dir/dpkg-query" -W '-f=${Status}' libcpprest2.10)"
+    assert_eq 'install ok installed' "$output" "direct cpprest shim predicate accepts the approved private runtime"
+    PATH="$fake_bin:$PATH" bash -c "source '$case_dir/post-support.sh'; CPPREST_LIBRARY_PATH='$case_dir/private-libcpprest.so.2.10'; arch_kit_cpprest_validate_library \"\$CPPREST_LIBRARY_PATH\"" || fail "post-mount private cpprest validation must return success"
+    pass "post-mount private cpprest validation has an explicit successful return"
+    PATH="$fake_bin:$PATH" bash -c "source '$case_dir/launcher-support.sh'; ARCH_KIT_CPPREST_LIBRARY_PATH='$case_dir/private-libcpprest.so.2.10'; ARCH_KIT_CPPREST_LIB_DIR='$case_dir'; arch_kit_validate_private_cpprest" || fail "launcher private cpprest validation must return success"
+    pass "launcher private cpprest validation has an explicit successful return"
+    PATH="$fake_bin:$PATH" bash -c "source '$case_dir/post-support.sh'; CPPREST_LIBRARY_PATH='$case_dir/private-libcpprest.so.2.10'; function [ { if command [ \"\$1\" = -f ] && command [ \"\$2\" = /mnt/x/DRTools/UA/Imaging/DRIP/Drip.WebApi.Backend.UnmanagedClient-Linux/V12.00/x64/libDrip.WebApi.Backend.UnmanagedClient.so ]; then return 0; fi; command [ \"\$@\"; }; arch_kit_post_mount_validate_drip_cpprest" || fail "post-mount DRIP/cpprest validation must return success"
+    pass "post-mount DRIP/cpprest validation has an explicit successful return"
+    PATH="$fake_bin:$PATH" bash -c "source '$case_dir/launcher-support.sh'; ARCH_KIT_CPPREST_LIB_DIR='$case_dir'; function [ { if command [ \"\$1\" = -f ] && command [ \"\$2\" = /mnt/x/DRTools/UA/Imaging/DRIP/Drip.WebApi.Backend.UnmanagedClient-Linux/V12.00/x64/libDrip.WebApi.Backend.UnmanagedClient.so ]; then return 0; fi; command [ \"\$@\"; }; arch_kit_launcher_validate_drip_cpprest" || fail "launcher DRIP/cpprest validation must return success"
+    pass "launcher DRIP/cpprest validation has an explicit successful return"
     set +e
     PATH="$fake_bin:$PATH" DR_KIT_RUNTIME_DIR="$case_dir/runtime" "$case_dir/dpkg-query" -W '-f=${Status}' libcpprest2.10 >/dev/null 2>&1
     rc=$?
@@ -2420,7 +2449,7 @@ case "$*" in
     *'./control'*) printf '%s\n' "${CPPREST_CONTROL:-Package: libcpprest2.10
 Version: 2.10.19-2build2
 Architecture: amd64}" ;;
-    *' -tf -'*) printf '%s\n' ${CPPREST_MEMBERS:-./ ./usr/ ./usr/lib/ ./usr/lib/x86_64-linux-gnu/ ./usr/lib/x86_64-linux-gnu/libcpprest.so.2.10} ;;
+    *' -tf -'*) printf '%s\n' ${CPPREST_MEMBERS:-./ ./usr/ ./usr/lib/ ./usr/lib/x86_64-linux-gnu/ ./usr/lib/x86_64-linux-gnu/libcpprest.so.2.10 ./usr/share/ ./usr/share/doc/ ./usr/share/doc/libcpprest2.10/ ./usr/share/doc/libcpprest2.10/changelog.Debian.gz ./usr/share/doc/libcpprest2.10/copyright} ;;
     *' -tvf -'*) printf '%s\n' "${CPPREST_TYPES:--rw-r--r-- root/root 1 2026-01-01 ./usr/lib/x86_64-linux-gnu/libcpprest.so.2.10}" ;;
     *) exit 0 ;;
 esac
@@ -2429,12 +2458,13 @@ EOF
     : > "$case_dir/libcpprest2.10_2.10.19-2build2_amd64.deb"
     PATH="$case_dir/cpprest-bin:$PATH" bash -c "source '$case_dir/post-support.sh'; arch_kit_validate_cpprest_deb '$case_dir/libcpprest2.10_2.10.19-2build2_amd64.deb'" || fail "pinned cpprest .deb fixture validates"
     pass "pinned cpprest SHA, metadata, Debian format, and allowlisted payload validate"
-    for bad_case in hash metadata path member_type; do
+    for bad_case in hash metadata path member_type unexpected_member; do
         case "$bad_case" in
             hash) env_spec="CPPREST_HASH=bad" ;;
             metadata) env_spec="CPPREST_CONTROL=Package:_wrong" ;;
             path) env_spec="CPPREST_MEMBERS=../escape" ;;
             member_type) env_spec="CPPREST_TYPES=lrwxrwxrwx_root/root_1_2026-01-01_./usr/lib/x86_64-linux-gnu/libcpprest.so.2.10" ;;
+            unexpected_member) env_spec="CPPREST_MEMBERS=./_unexpected" ;;
         esac
         set +e
         env PATH="$case_dir/cpprest-bin:$PATH" $env_spec bash -c "source '$case_dir/post-support.sh'; arch_kit_validate_cpprest_deb '$case_dir/libcpprest2.10_2.10.19-2build2_amd64.deb'" >/dev/null 2>&1
@@ -2473,6 +2503,21 @@ EOF
     : > "$case_dir/aksusbd_10.21-1_amd64.deb"
     PATH="$fake_bin:$PATH" bash -c "source '$case_dir/post-support.sh'; HASP_DEB_PATH='$case_dir/aksusbd_10.21-1_amd64.deb'; arch_kit_validate_sentinel_deb" || fail "approved Sentinel .deb fixture validates"
     pass "approved Sentinel .deb identity/version/architecture and payload allowlist validate"
+    mkdir -p "$case_dir/sentinel-extract"
+    PATH="$fake_bin:$PATH" bash -c "source '$case_dir/post-support.sh'; HASP_DEB_PATH='$case_dir/aksusbd_10.21-1_amd64.deb'; HASP_DATA_ARCHIVE=data.tar.gz; arch_kit_extract_allowlisted_sentinel_payload '$case_dir/sentinel-extract'" || fail "clean Sentinel payload extraction must return success"
+    pass "clean Sentinel payload extraction reaches an explicit successful return"
+    mkdir -p "$case_dir/bad-find-bin"
+    cat > "$case_dir/bad-find-bin/find" <<'EOF'
+#!/bin/bash
+printf '%s\n' /unsafe-payload-member
+EOF
+    chmod 755 "$case_dir/bad-find-bin/find"
+    set +e
+    PATH="$case_dir/bad-find-bin:$fake_bin:$PATH" bash -c "source '$case_dir/post-support.sh'; HASP_DEB_PATH='$case_dir/aksusbd_10.21-1_amd64.deb'; HASP_DATA_ARCHIVE=data.tar.gz; arch_kit_extract_allowlisted_sentinel_payload '$case_dir/sentinel-extract'" >/dev/null 2>&1
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "unsafe Sentinel payload members must remain fail-closed"
+    pass "unsafe Sentinel payload members remain fail-closed"
     for bad_case in metadata path member_type; do
         case "$bad_case" in
             metadata) env_spec="DEB_CONTROL=Package:_wrong" ;;
@@ -2496,6 +2541,70 @@ EOF
     assert_contains "$post_support" 'cmp -s "$config_source" "$HASP_CONFIG_DIR/hasplm.ini"' "Sentinel verification checks the selected office configuration"
     assert_contains "$post_support" '[ ! -e /lib/ld-linux.so.2 ] || [ -e "$HASP_INIT_DIR/force_x86_64" ]' "vendor x86_64 service selection condition is mirrored exactly"
     pass "Sentinel office configuration and x86_64 service-selection rules are explicit"
+
+    mkdir -p "$case_dir/hasp"
+    : > "$case_dir/hasp/hasplm-EP1.ini"
+    for cleanup_case in success extraction_failure; do
+        stage_dir="$case_dir/sentinel-cleanup-$cleanup_case"
+        mkdir -p "$stage_dir"
+        if [ "$cleanup_case" = success ]; then
+            cleanup_body='arch_kit_extract_allowlisted_sentinel_payload(){ : > "$1/extracted"; return 0; }; arch_kit_install_vendor_sentinel_payload(){ return 0; }; arch_kit_verify_sentinel(){ return 0; };'
+        else
+            cleanup_body='arch_kit_extract_allowlisted_sentinel_payload(){ return 1; }; arch_kit_install_vendor_sentinel_payload(){ return 1; }; arch_kit_verify_sentinel(){ return 1; };'
+        fi
+        set +e
+        STAGE_DIR="$stage_dir" bash -c "set -u; source '$case_dir/post-support.sh'; OFFICE_CODE=EP1; log(){ :; }; mktemp(){ printf '%s\\n' \"\$STAGE_DIR\"; }; arch_kit_validate_sentinel_deb(){ return 0; }; $cleanup_body arch_kit_backup_if_present(){ :; }; install(){ :; }; udevadm(){ :; }; systemctl(){ :; }; install_arch_sentinel_runtime" >/dev/null 2>&1
+        rc=$?
+        set -e
+        if [ "$cleanup_case" = success ]; then
+            [ "$rc" -eq 0 ] || fail "successful Sentinel staging must complete"
+        else
+            [ "$rc" -ne 0 ] || fail "failed Sentinel staging must fail"
+        fi
+        [ ! -e "$stage_dir" ] || fail "Sentinel $cleanup_case staging directory must be cleaned"
+        pass "Sentinel $cleanup_case staging cleanup is safe under set -u"
+    done
+
+    mkdir -p "$case_dir/wrapper-runtime" "$case_dir/wrapper-bin"
+    cat > "$case_dir/wrapper-runtime/KIT.sh" <<'EOF'
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export LD_LIBRARY_PATH="$SCRIPT_DIR"
+export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/mnt/x/DRTools/Frozen/DLL/AsyncIO-Linux/V2.00/x64"
+EOF
+    cat > "$case_dir/wrapper-bin/install" <<'EOF'
+#!/bin/bash
+last=""
+for argument in "$@"; do last="$argument"; done
+[ "${1:-}" = -d ] && mkdir -p "$last"
+EOF
+    cat > "$case_dir/wrapper-bin/chown" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+    cat > "$case_dir/wrapper-bin/chmod" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+    cat > "$case_dir/wrapper-bin/stat" <<'EOF'
+#!/bin/bash
+printf '0:700\n'
+EOF
+    chmod 755 "$case_dir/wrapper-bin"/*
+    output="$(PATH="$case_dir/wrapper-bin:$PATH" KIT_DIR="$case_dir/wrapper-runtime" bash -c "source '$case_dir/launcher-support.sh'; prepare_arch_kit_runtime_wrapper" 2>&1)"
+    [ -z "$output" ] || fail "KIT.cpprest.sh wrapper generation must not emit awk warnings: $output"
+    bash -n "$case_dir/compat/KIT.cpprest.sh" || fail "generated KIT.cpprest.sh wrapper syntax"
+    grep -Fx "SCRIPT_DIR=\"$case_dir/wrapper-runtime\"" "$case_dir/compat/KIT.cpprest.sh" >/dev/null || fail "KIT.cpprest.sh must replace SCRIPT_DIR exactly"
+    grep -Fx "export LD_LIBRARY_PATH=\"\$SCRIPT_DIR:$case_dir/compat/lib\"" "$case_dir/compat/KIT.cpprest.sh" >/dev/null || fail "KIT.cpprest.sh must retain private cpprest first"
+    pass "KIT.cpprest.sh wrapper generation is warning-free and replaces each path exactly once"
+
+    for child_variable in 'DR_KIT_RUNTIME_DIR="$KIT_DIR"' 'DR_KIT_CPPREST_LIBRARY_PATH="$ARCH_KIT_CPPREST_LIBRARY_PATH"' 'DR_KIT_HASP_CONFIG_DIR="$ARCH_KIT_HASP_CONFIG_DIR"' 'DR_KIT_HASP_UDEV_RULE="$ARCH_KIT_HASP_UDEV_RULE"' 'DR_KIT_HASP_SBIN_DIR="$ARCH_KIT_HASP_SBIN_DIR"' 'DR_KIT_HASP_SYSTEMD_DIR="$ARCH_KIT_HASP_SYSTEMD_DIR"'; do
+        assert_contains "$(<"$SCRIPT")" "$child_variable" "Arch KIT child receives $child_variable"
+    done
+    if rg -q '^export DR_KIT_(RUNTIME_DIR|CPPREST_LIBRARY_PATH|HASP_)' "$SCRIPT"; then
+        fail "Arch KIT runtime variables must remain child-scoped"
+    fi
+    pass "Arch KIT runtime variables are scoped only to the KIT child"
 
     set +e
     output="$(bash -c "source '$case_dir/post-support.sh'; OFFICE_CODE=EP1; log(){ printf '%s' \"\$*\"; }; state_has(){ return 0; }; install_arch_private_cpprest(){ return 0; }; install_arch_kit_compatibility_adapter(){ :; }; arch_kit_verify_native_dependencies(){ return 1; }; arch_kit_verify_sentinel(){ echo unexpected >&2; return 0; }; arch_kit_verify_local_preflight(){ return 0; }; install_kit_arch" 2>&1)"
