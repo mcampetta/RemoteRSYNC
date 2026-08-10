@@ -73,6 +73,8 @@ PLATFORM_SUPPORTED=false
 PLATFORM_PACKAGE_MANAGER=""
 PLATFORM_VERSION=""
 PLATFORM_DESKTOP=""
+PLATFORM_DISPLAY_MANAGER=""
+DISPLAY_MANAGER_RUNNING=false
 PLATFORM_ADMIN_GROUP=""
 PLATFORM_REPORT_BLOCKERS=0
 PREFLIGHT_BLOCKERS=0
@@ -111,6 +113,8 @@ DR_CIFS_MODULES_ROOT="${DR_CIFS_MODULES_ROOT:-/usr/lib/modules}"
 DR_CIFS_PROC_FILESYSTEMS="${DR_CIFS_PROC_FILESYSTEMS:-/proc/filesystems}"
 DR_LOCAL_KEYTAB="${DR_LOCAL_KEYTAB:-/etc/krb5.keytab}"
 DR_SAMBA_SECRETS_TDB="${DR_SAMBA_SECRETS_TDB:-/var/lib/samba/private/secrets.tdb}"
+ARCH_SSSD_DEFAULT_SHELL="${ARCH_SSSD_DEFAULT_SHELL:-/bin/bash}"
+DR_SUPPORTED_SHELLS_FILE="${DR_SUPPORTED_SHELLS_FILE:-/etc/shells}"
 JOIN_LIFECYCLE="${JOIN_LIFECYCLE:-NEW_JOIN}"
 
 # ── Colors ───────────────────────────────────────────────────────────────────
@@ -441,6 +445,15 @@ platform_detect_desktop() {
     esac
 }
 
+platform_detect_display_manager() {
+    local manager_id
+    manager_id="$(systemctl show display-manager.service -p Id --value 2>/dev/null || true)"
+    case "$manager_id" in
+        *.service) PLATFORM_DISPLAY_MANAGER="$manager_id" ;;
+        *) PLATFORM_DISPLAY_MANAGER="Unknown" ;;
+    esac
+}
+
 platform_validate_version() {
     case "$PLATFORM_FAMILY" in
         arch)
@@ -510,6 +523,7 @@ detect_platform() {
     esac
 
     platform_detect_desktop
+    platform_detect_display_manager
     if ! platform_validate_version; then
         PLATFORM_SUPPORTED=false
     fi
@@ -528,7 +542,7 @@ detect_os() {
         return 1
     fi
 
-    print_info "Detected platform: $OS $VER (family=$PLATFORM_FAMILY, desktop=$PLATFORM_DESKTOP)"
+    print_info "Detected platform: $OS $VER (family=$PLATFORM_FAMILY, desktop=$PLATFORM_DESKTOP, display-manager=$PLATFORM_DISPLAY_MANAGER)"
 }
 
 platform_package_name() {
@@ -827,6 +841,7 @@ platform_report() {
     echo "  Version:             ${PLATFORM_VERSION:-unknown}"
     echo "  Supported:           ${PLATFORM_SUPPORTED}"
     echo "  Desktop:             ${PLATFORM_DESKTOP:-Unknown}"
+    echo "  Display manager:     ${PLATFORM_DISPLAY_MANAGER:-Unknown}"
     echo "  Package manager:     ${PLATFORM_PACKAGE_MANAGER:-unknown}"
     echo "  Package-manager DB:  $package_db"
     echo "  Administrator group: ${PLATFORM_ADMIN_GROUP:-unavailable}"
@@ -4503,41 +4518,148 @@ join_domain() {
 
 render_arch_pam_sss_lines() {
     cat << 'EOF'
-auth       [success=1 default=ignore]  pam_sss.so          forward_pass
+auth       [success=2 default=ignore]  pam_sss.so          forward_pass
 account    [success=1 default=ignore] pam_sss.so
 session    optional                   pam_sss.so
 session    required                   pam_mkhomedir.so    skel=/etc/skel/ umask=0077
 EOF
 }
 
-configure_arch_pam() {
-    local pam_file="/etc/pam.d/system-auth"
-    local mkhomedir_line="session    required                   pam_mkhomedir.so    skel=/etc/skel/ umask=0077"
+render_arch_pam_system_auth() {
+    local pam_file="${1:-}"
+    [ -f "$pam_file" ] && [ ! -L "$pam_file" ] || {
+        print_error "Arch PAM adapter requires a regular non-symlink system-auth file: ${pam_file:-<empty>}" >&2
+        return 1
+    }
 
-    if [ ! -f "$pam_file" ]; then
-        print_error "Arch PAM file is missing: $pam_file"
+    # This deliberately recognizes only the pambase layout validated on
+    # CachyOS/Arch. Numeric PAM jumps are relative to subsequent modules, so
+    # inserting pam_sss requires adjusting the two native success counts.
+    awk '
+        function problem(message) {
+            print "Unsupported Arch system-auth layout: " message > "/dev/stderr"
+            errors = 1
+        }
+        {
+            lines[NR] = $0
+            trimmed = $0
+            sub(/^[[:space:]]*/, "", trimmed)
+
+            if (trimmed ~ /^-auth[[:space:]].*pam_systemd_home[.]so/) {
+                systemd_count++
+                systemd_index = NR
+                if (trimmed ~ /^-auth[[:space:]]+\[success=2[[:space:]]+default=ignore\][[:space:]]+pam_systemd_home[.]so[[:space:]]*$/) systemd_success = 2
+                else if (trimmed ~ /^-auth[[:space:]]+\[success=3[[:space:]]+default=ignore\][[:space:]]+pam_systemd_home[.]so[[:space:]]*$/) systemd_success = 3
+                else problem("pam_systemd_home auth control is not a supported success=2/3 default=ignore form")
+            }
+
+            if (trimmed ~ /^auth[[:space:]].*pam_sss[.]so/) {
+                sss_count++
+                sss_index = NR
+                if (trimmed ~ /^auth[[:space:]]+\[success=1[[:space:]]+default=ignore\][[:space:]]+pam_sss[.]so[[:space:]]+forward_pass[[:space:]]*$/) sss_success = 1
+                else if (trimmed ~ /^auth[[:space:]]+\[success=2[[:space:]]+default=ignore\][[:space:]]+pam_sss[.]so[[:space:]]+forward_pass[[:space:]]*$/) sss_success = 2
+                else problem("pam_sss auth control is not a supported success=1/2 default=ignore forward_pass form")
+            }
+
+            if (trimmed ~ /^auth[[:space:]].*pam_unix[.]so/) {
+                unix_count++
+                unix_index = NR
+                if (trimmed !~ /^auth[[:space:]]+\[success=1[[:space:]]+default=bad\][[:space:]]+pam_unix[.]so([[:space:]]+.*)?$/) problem("pam_unix auth control is not the native success=1 default=bad form")
+            }
+
+            if (trimmed ~ /^auth[[:space:]].*pam_faillock[.]so[[:space:]]+authfail([[:space:]]|$)/) {
+                authfail_count++
+                authfail_index = NR
+                if (trimmed !~ /^auth[[:space:]]+\[default=die\][[:space:]]+pam_faillock[.]so[[:space:]]+authfail[[:space:]]*$/) problem("pam_faillock authfail control is not the native default=die form")
+            }
+
+            if (trimmed ~ /^account[[:space:]].*pam_sss[.]so/) account_sss_count++
+            if (trimmed ~ /^session[[:space:]].*pam_sss[.]so/) session_sss_count++
+            if (trimmed ~ /^account[[:space:]].*pam_unix[.]so/) { account_unix_count++; account_unix_index = NR }
+            if (trimmed ~ /^session[[:space:]].*pam_unix[.]so/) { session_unix_count++; session_unix_index = NR }
+            if (trimmed ~ /^session[[:space:]].*pam_mkhomedir[.]so/) mkhomedir_count++
+        }
+        END {
+            if (systemd_count != 1) problem("expected exactly one auth pam_systemd_home line")
+            if (sss_count > 1) problem("expected zero or one auth pam_sss line")
+            if (unix_count != 1) problem("expected exactly one auth pam_unix line")
+            if (authfail_count != 1) problem("expected exactly one auth pam_faillock authfail line")
+
+            if (!errors) {
+                if (sss_count == 0) {
+                    if (systemd_success != 2) problem("success=3 pam_systemd_home requires the managed pam_sss insertion")
+                    if (systemd_index + 1 != unix_index) problem("native pam_systemd_home and pam_unix lines are not adjacent")
+                } else {
+                    if (systemd_index + 1 != sss_index || sss_index + 1 != unix_index) problem("managed pam_sss is not directly between pam_systemd_home and pam_unix")
+                }
+                if (unix_index + 1 != authfail_index) problem("pam_unix is not immediately followed by pam_faillock authfail")
+                if (account_sss_count == 0 && account_unix_count != 1) problem("cannot safely place the missing account pam_sss line")
+                if (session_sss_count == 0 && session_unix_count != 1) problem("cannot safely place the missing session pam_sss line")
+            }
+            if (errors) exit 2
+
+            for (i = 1; i <= NR; i++) {
+                if (account_sss_count == 0 && i == account_unix_index) print "account    [success=1 default=ignore] pam_sss.so"
+                if (i == systemd_index && systemd_success != 3) {
+                    print "-auth      [success=3 default=ignore]  pam_systemd_home.so"
+                } else if (sss_count == 1 && i == sss_index && sss_success != 2) {
+                    print "auth       [success=2 default=ignore]  pam_sss.so          forward_pass"
+                } else if (sss_count == 0 && i == unix_index) {
+                    print "auth       [success=2 default=ignore]  pam_sss.so          forward_pass"
+                    print lines[i]
+                } else {
+                    print lines[i]
+                }
+
+                if (session_sss_count == 0 && i == session_unix_index) print "session    optional                   pam_sss.so"
+            }
+            if (mkhomedir_count == 0) print "session    required                   pam_mkhomedir.so    skel=/etc/skel/ umask=0077"
+        }
+    ' "$pam_file"
+}
+
+configure_arch_pam() {
+    local pam_file="${1:-/etc/pam.d/system-auth}"
+    local pam_dir staged
+
+    if [ ! -f "$pam_file" ] || [ -L "$pam_file" ]; then
+        print_error "Arch PAM file is missing, not regular, or a symlink: $pam_file"
         return 1
     fi
-    backup_config_file "$pam_file"
-
-    # Add SSSD authentication after the native local-auth line. The SSSD
-    # account control explicitly ignores unknown/offline domain identities;
-    # pam_unix remains authoritative for local accounts.
-    if ! grep -qE '^[[:space:]]*auth[[:space:]].*pam_sss\.so' "$pam_file"; then
-        sed -i '/^[[:space:]]*auth[[:space:]].*pam_unix\.so/i auth       [success=1 default=ignore]  pam_sss.so          forward_pass' "$pam_file"
+    pam_dir="$(dirname "$pam_file")"
+    staged="$(mktemp "$pam_dir/.system-auth.dr-domain-join.XXXXXX")" || {
+        print_error "Could not create a staged Arch PAM file beside $pam_file"
+        return 1
+    }
+    if ! render_arch_pam_system_auth "$pam_file" > "$staged"; then
+        rm -f -- "$staged"
+        print_error "Arch PAM layout is not a supported native/managed system-auth structure; $pam_file is unchanged"
+        return 1
     fi
-    if ! grep -qE '^[[:space:]]*account[[:space:]].*pam_sss\.so' "$pam_file"; then
-        sed -i '/^[[:space:]]*account[[:space:]].*pam_unix\.so/i account    [success=1 default=ignore] pam_sss.so' "$pam_file"
+    if cmp -s -- "$pam_file" "$staged"; then
+        rm -f -- "$staged"
+        print_info "Arch PAM system-auth already has the managed SSSD jump layout"
+        return 0
     fi
-    if ! grep -qE '^[[:space:]]*session[[:space:]].*pam_sss\.so' "$pam_file"; then
-        sed -i '/^[[:space:]]*session[[:space:]].*pam_unix\.so/a session    optional                   pam_sss.so' "$pam_file"
+    if ! chmod --reference="$pam_file" "$staged"; then
+        rm -f -- "$staged"
+        print_error "Could not preserve the mode while staging $pam_file"
+        return 1
     fi
-    if ! grep -qF 'pam_mkhomedir.so' "$pam_file"; then
-        printf '\n%s\n' "$mkhomedir_line" >> "$pam_file"
+    if [ "$(stat -c '%u:%g' "$staged")" != "$(stat -c '%u:%g' "$pam_file")" ] &&
+       ! chown --reference="$pam_file" "$staged" 2>/dev/null; then
+        rm -f -- "$staged"
+        print_error "Could not preserve ownership while staging $pam_file"
+        return 1
     fi
-
-    if ! grep -qE 'pam_sss\.so|pam_mkhomedir\.so' "$pam_file"; then
-        print_error "Arch PAM adapter did not produce the expected SSSD/home-directory modules"
+    backup_config_file "$pam_file" || {
+        rm -f -- "$staged"
+        print_error "Could not back up $pam_file; refusing the Arch PAM update"
+        return 1
+    }
+    if ! mv -f -- "$staged" "$pam_file"; then
+        rm -f -- "$staged"
+        print_error "Could not atomically install the Arch PAM update"
         return 1
     fi
     print_info "Configured native Arch PAM stack in $pam_file"
@@ -4961,6 +5083,7 @@ cache_credentials = True
 fallback_homedir = /home/%u
 EOF
     if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        printf 'default_shell = %s\n' "$ARCH_SSSD_DEFAULT_SHELL"
         cat << 'EOF'
 # Arch uses the Samba renewal timer because the SSSD default realm/adcli
 # renewal helper is unavailable. Keeping this disabled avoids two competing
@@ -4971,11 +5094,40 @@ EOF
     fi
 }
 
+platform_login_shell_is_acceptable() {
+    local login_shell="${1:-}" supported_shells="${DR_SUPPORTED_SHELLS_FILE:-/etc/shells}"
+    case "$login_shell" in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    [ -f "$login_shell" ] && [ -x "$login_shell" ] || return 1
+    [ -r "$supported_shells" ] || return 1
+    awk -v expected="$login_shell" '
+        /^[[:space:]]*#/ { next }
+        {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            if (line == expected) found = 1
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$supported_shells"
+}
+
+platform_validate_arch_default_shell() {
+    [ "$PLATFORM_FAMILY" = arch ] || return 0
+    if ! platform_login_shell_is_acceptable "$ARCH_SSSD_DEFAULT_SHELL"; then
+        print_error "Configured Arch SSSD default shell '$ARCH_SSSD_DEFAULT_SHELL' is not an executable shell listed in $DR_SUPPORTED_SHELLS_FILE"
+        return 1
+    fi
+}
+
 configure_sssd_settings() {
     local sssd_conf="/etc/sssd/sssd.conf"
     print_info "Applying SSSD settings ($sssd_conf)..."
 
     if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        platform_validate_arch_default_shell || return 1
         mkdir -p "$(dirname "$sssd_conf")"
         backup_config_file "$sssd_conf"
         render_sssd_config > "$sssd_conf"
@@ -6651,7 +6803,7 @@ tools_automount_unit_name() {
 }
 
 resolve_domain_user_uid() {
-    local user="${1:-}" passwd_line resolved_name resolved_uid separators
+    local user="${1:-}" passwd_line resolved_name resolved_uid resolved_home resolved_shell separators
     local -a records
     [ -n "$user" ] || return 1
     mapfile -t records < <(getent passwd "$user" 2>/dev/null || true)
@@ -6659,7 +6811,7 @@ resolve_domain_user_uid() {
     passwd_line="${records[0]}"
     separators="${passwd_line//[^:]/}"
     [ "${#separators}" -eq 6 ] || return 1
-    IFS=: read -r resolved_name _ resolved_uid _ _ _ _ <<< "$passwd_line"
+    IFS=: read -r resolved_name _ resolved_uid _ _ resolved_home resolved_shell <<< "$passwd_line"
     [ -n "$resolved_name" ] || return 1
     case "$resolved_uid" in ''|*[!0-9]*) return 1 ;; esac
     [ "$(id -u "$resolved_name" 2>/dev/null || true)" = "$resolved_uid" ] || return 1
@@ -6668,7 +6820,36 @@ resolve_domain_user_uid() {
     if awk -F: -v user="$resolved_name" '$1 == user { found=1 } END { exit(found ? 0 : 1) }' /etc/passwd 2>/dev/null; then
         return 1
     fi
+    [ -n "$resolved_home" ] || return 1
+    platform_login_shell_is_acceptable "$resolved_shell" || return 1
     printf '%s\n' "$resolved_uid"
+}
+
+diagnose_selected_domain_user_login_identity() {
+    local user="${1:-}" passwd_line resolved_name resolved_uid resolved_home resolved_shell separators
+    local -a records
+    [ -n "$user" ] || return 1
+    mapfile -t records < <(getent passwd "$user" 2>/dev/null || true)
+    [ "${#records[@]}" -eq 1 ] || return 1
+    passwd_line="${records[0]}"
+    separators="${passwd_line//[^:]/}"
+    [ "${#separators}" -eq 6 ] || return 1
+    IFS=: read -r resolved_name _ resolved_uid _ _ resolved_home resolved_shell <<< "$passwd_line"
+    [ -n "$resolved_name" ] || return 1
+    case "$resolved_uid" in ''|*[!0-9]*) return 1 ;; esac
+    if [ -z "$resolved_home" ]; then
+        print_error "Selected domain user $user has an empty home directory in the normal NSS passwd record"
+        return 1
+    fi
+    if [ -z "$resolved_shell" ]; then
+        print_error "Selected domain user $user has an empty login shell in the normal NSS passwd record"
+        return 1
+    fi
+    if ! platform_login_shell_is_acceptable "$resolved_shell"; then
+        print_error "Selected domain user $user has an unavailable or unsupported login shell '$resolved_shell'"
+        return 1
+    fi
+    return 0
 }
 
 diagnose_sss_direct_user_uid() {
@@ -7717,7 +7898,8 @@ platform_validate_selected_domain_user() {
         return 0
     fi
     print_error "NSS/SSSD identity resolution failed for selected domain user $DOMAIN_SUDO_USER"
-    print_error "Normal getent passwd and id resolution must both succeed; no local UID will be substituted"
+    print_error "Normal getent passwd, id, home-directory, and login-shell validation must all succeed; no local UID will be substituted"
+    diagnose_selected_domain_user_login_identity "$DOMAIN_SUDO_USER" || true
     direct_sss_uid="$(diagnose_sss_direct_user_uid "$DOMAIN_SUDO_USER" || true)"
     if [ -n "$direct_sss_uid" ]; then
         print_error "SSSD's direct NSS service resolves $DOMAIN_SUDO_USER as UID $direct_sss_uid, but the normal libc/NSS path does not"
@@ -8634,16 +8816,16 @@ configure_desktop_integration() {
 }
 
 # ── Check display manager ─────────────────────────────────────────────────────
-# Do NOT restart the display manager automatically. Restarting GDM or LightDM
+# Do NOT restart the display manager automatically. Restarting a login manager
 # while the script is running inside a desktop session kills that session,
 # which terminates the terminal and aborts the script mid-execution — leaving
-# the machine in a partially configured state. Instead, note whether a display
-# manager is running so we can prompt the user to log out manually at the end.
+# the machine in a partially configured state. Use systemd's generic alias so
+# KDE Plasma Login Manager, GDM, LightDM, and future implementations are not
+# conflated with the desktop environment.
 
 check_display_manager() {
-    if systemctl is-active --quiet gdm3 2>/dev/null || \
-       systemctl is-active --quiet gdm 2>/dev/null || \
-       systemctl is-active --quiet lightdm 2>/dev/null; then
+    platform_detect_display_manager
+    if systemctl is-active --quiet display-manager.service 2>/dev/null; then
         DISPLAY_MANAGER_RUNNING=true
     else
         DISPLAY_MANAGER_RUNNING=false

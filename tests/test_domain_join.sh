@@ -790,6 +790,121 @@ test_arch_nss_configuration() {
     pass "SSSD startup, NSS configuration, normal identity validation, mount, and user sudo provisioning are correctly ordered"
 }
 
+test_arch_pam_sssd_and_display_manager() {
+    local case_dir pam_file original output rc case_name fake_bin shells_file su_file sul_file
+
+    case_dir="$TMP_DIR/arch-pam-native"
+    mkdir -p "$case_dir"
+    pam_file="$case_dir/system-auth"
+    cat > "$pam_file" << 'EOF'
+auth       required                    pam_faillock.so      preauth
+-auth      [success=2 default=ignore]  pam_systemd_home.so
+auth       [success=1 default=bad]     pam_unix.so          try_first_pass nullok
+auth       [default=die]               pam_faillock.so      authfail
+auth       optional                    pam_permit.so
+auth       required                    pam_env.so
+auth       required                    pam_faillock.so      authsucc
+account    required                    pam_unix.so
+session    required                    pam_unix.so
+EOF
+    DR_JOIN_STATE_DIR="$case_dir/state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; configure_arch_pam '$pam_file'" >/dev/null
+    assert_contains "$(<"$pam_file")" '-auth      [success=3 default=ignore]  pam_systemd_home.so' "Arch PAM increments the native systemd-home success jump"
+    assert_contains "$(<"$pam_file")" 'auth       [success=2 default=ignore]  pam_sss.so          forward_pass' "Arch PAM inserts pam_sss with the two-module success jump"
+    assert_contains "$(<"$pam_file")" 'auth       [success=1 default=bad]     pam_unix.so          try_first_pass nullok' "Arch PAM preserves native pam_unix local-auth control"
+    assert_contains "$(<"$pam_file")" 'auth       [default=die]               pam_faillock.so      authfail' "Arch PAM preserves pam_faillock authfail"
+    assert_contains "$(<"$pam_file")" 'auth       required                    pam_faillock.so      authsucc' "Arch PAM successful paths retain the pam_faillock authsucc tail"
+    assert_contains "$(<"$pam_file")" 'account    [success=1 default=ignore] pam_sss.so' "Arch PAM retains account SSSD integration"
+    assert_contains "$(<"$pam_file")" 'session    optional                   pam_sss.so' "Arch PAM retains session SSSD integration"
+    assert_contains "$(<"$pam_file")" 'session    required                   pam_mkhomedir.so    skel=/etc/skel/ umask=0077' "Arch PAM retains home-directory creation"
+    pass "native CachyOS auth layout gains correct SSSD and systemd-home numeric jumps"
+
+    original="$case_dir/managed"
+    cp -- "$pam_file" "$original"
+    DR_JOIN_STATE_DIR="$case_dir/state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; configure_arch_pam '$pam_file'" >/dev/null
+    cmp -s "$original" "$pam_file" || fail "already-correct managed Arch PAM stack must be byte-for-byte idempotent"
+    pass "already-correct managed Arch PAM stack is idempotent"
+
+    sed -i 's/success=3 default=ignore/success=2 default=ignore/; s/success=2 default=ignore]  pam_sss/success=1 default=ignore]  pam_sss/' "$pam_file"
+    DR_JOIN_STATE_DIR="$case_dir/state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; configure_arch_pam '$pam_file'" >/dev/null
+    cmp -s "$original" "$pam_file" || fail "old managed PAM jump counts must be upgraded to the accepted layout"
+    pass "old managed pam_sss/systemd-home jump counts are upgraded only in the recognized layout"
+
+    for case_name in duplicate-sss duplicate-systemd-home duplicate-pam-unix duplicate-authfail malformed-sss; do
+        case_dir="$TMP_DIR/arch-pam-$case_name"
+        mkdir -p "$case_dir"
+        pam_file="$case_dir/system-auth"
+        cp -- "$original" "$pam_file"
+        case "$case_name" in
+            duplicate-sss) sed -i '/pam_sss\.so.*forward_pass/a auth       [success=2 default=ignore]  pam_sss.so          forward_pass' "$pam_file" ;;
+            duplicate-systemd-home) sed -i '/pam_systemd_home\.so/a -auth      [success=3 default=ignore]  pam_systemd_home.so' "$pam_file" ;;
+            duplicate-pam-unix) sed -i '/pam_unix\.so          try_first_pass/a auth       [success=1 default=bad]     pam_unix.so          try_first_pass nullok' "$pam_file" ;;
+            duplicate-authfail) sed -i '/pam_faillock\.so      authfail/a auth       [default=die]               pam_faillock.so      authfail' "$pam_file" ;;
+            malformed-sss) sed -i 's/pam_sss\.so          forward_pass/pam_sss.so use_first_pass/' "$pam_file" ;;
+        esac
+        cp -- "$pam_file" "$case_dir/original"
+        set +e
+        output="$(DR_JOIN_STATE_DIR="$case_dir/state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; configure_arch_pam '$pam_file'" 2>&1)"
+        rc=$?
+        set -e
+        [ "$rc" -ne 0 ] || fail "$case_name PAM layout must fail closed"
+        cmp -s "$case_dir/original" "$pam_file" || fail "$case_name PAM failure must leave system-auth unchanged"
+        assert_contains "$output" 'Arch PAM layout is not a supported native/managed system-auth structure' "$case_name PAM failure is explicit"
+    done
+    pass "ambiguous or malformed Arch PAM layouts fail closed without guessing"
+
+    case_dir="$TMP_DIR/arch-pam-su-untouched"
+    mkdir -p "$case_dir"
+    pam_file="$case_dir/system-auth"
+    cp -- "$original" "$pam_file"
+    su_file="$case_dir/su"
+    sul_file="$case_dir/su-l"
+    printf '%s\n' 'auth required pam_unix.so' > "$su_file"
+    printf '%s\n' 'auth required pam_unix.so' > "$sul_file"
+    cp -- "$su_file" "$su_file.original"
+    cp -- "$sul_file" "$sul_file.original"
+    DR_JOIN_STATE_DIR="$case_dir/state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; configure_arch_pam '$pam_file'" >/dev/null
+    cmp -s "$su_file.original" "$su_file" || fail "Arch PAM adapter must not modify su"
+    cmp -s "$sul_file.original" "$sul_file" || fail "Arch PAM adapter must not modify su-l"
+    pass "Arch PAM adapter only manages system-auth, never su or su-l"
+
+    output="$(DR_JOIN_STATE_DIR="$TMP_DIR/arch-sssd-shell" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; render_sssd_config")"
+    assert_contains "$output" 'fallback_homedir = /home/%u' "Arch SSSD preserves fallback home-directory behavior"
+    assert_contains "$output" 'default_shell = /bin/bash' "Arch SSSD supplies /bin/bash only as a default shell"
+    if printf '%s\n' "$output" | grep -Fq 'override_shell'; then
+        fail "Arch SSSD must not add override_shell"
+    fi
+    pass "Arch SSSD default shell does not override legitimate AD shell attributes"
+
+    shells_file="$TMP_DIR/arch-supported-shells"
+    printf '%s\n' '/bin/bash' > "$shells_file"
+    DR_JOIN_STATE_DIR="$TMP_DIR/shell-valid" DR_SUPPORTED_SHELLS_FILE="$shells_file" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_validate_arch_default_shell" || fail "listed executable /bin/bash must be a valid Arch fallback shell"
+    set +e
+    output="$(DR_JOIN_STATE_DIR="$TMP_DIR/shell-invalid" DR_SUPPORTED_SHELLS_FILE="$shells_file" ARCH_SSSD_DEFAULT_SHELL=/bin/not-a-shell bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_validate_arch_default_shell" 2>&1)"
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "unavailable Arch fallback shell must fail safely"
+    assert_contains "$output" 'not an executable shell listed' "unavailable Arch fallback shell is explicit"
+    pass "unavailable or non-login Arch fallback shells fail safely"
+
+    fake_bin="$TMP_DIR/display-manager-fake-bin"
+    mkdir -p "$fake_bin"
+    cat > "$fake_bin/systemctl" << 'EOF'
+#!/bin/bash
+if [ "${1:-}" = show ] && [ "${2:-}" = display-manager.service ]; then
+    printf '%s\n' plasmalogin.service
+    exit 0
+fi
+if [ "${1:-}" = is-active ] && [ "${3:-}" = display-manager.service ]; then
+    exit 0
+fi
+exit 1
+EOF
+    chmod 755 "$fake_bin/systemctl"
+    output="$(PATH="$fake_bin:$PATH" XDG_CURRENT_DESKTOP=KDE DR_JOIN_STATE_DIR="$TMP_DIR/display-manager" bash -c "source '$SCRIPT'; platform_detect_desktop; check_display_manager; printf '%s|%s|%s' \"\$PLATFORM_DESKTOP\" \"\$PLATFORM_DISPLAY_MANAGER\" \"\$DISPLAY_MANAGER_RUNNING\"")"
+    assert_eq 'KDE Plasma|plasmalogin.service|true' "$output" "display-manager.service detects active Plasma Login Manager independently of KDE"
+    pass "display-manager reporting uses the generic systemd alias without vendor PAM edits"
+}
+
 test_domain_uid_resolution_gate() {
     local fake_bin output rc unit
     fake_bin="$TMP_DIR/domain-uid-fake-bin"
@@ -797,9 +912,9 @@ test_domain_uid_resolution_gate() {
     cat > "$fake_bin/getent" << 'EOF'
 #!/bin/bash
 if [ "${1:-}" = -s ] && [ "${2:-}" = sss ] && [ "${3:-}" = passwd ] && [ "${4:-}" = martin.campetta ] && [ "${DIRECT_SSS_RESOLVES:-0}" = 1 ]; then
-    printf 'martin.campetta:*:%s:350000513:Campetta, Martin:/home/martin.campetta:\n' "${DOMAIN_UID:-350020586}"
+    printf 'martin.campetta:*:%s:350000513:Campetta, Martin:/home/martin.campetta:%s\n' "${DOMAIN_UID:-350020586}" "${DOMAIN_USER_SHELL-/bin/bash}"
 elif [ "${1:-}" = passwd ] && [ "${2:-}" = martin.campetta ] && [ "${DOMAIN_USER_RESOLVES:-0}" = 1 ]; then
-    printf 'martin.campetta:*:%s:350000513:Campetta, Martin:/home/martin.campetta:\n' "${DOMAIN_UID:-350020586}"
+    printf 'martin.campetta:*:%s:350000513:Campetta, Martin:/home/martin.campetta:%s\n' "${DOMAIN_UID:-350020586}" "${DOMAIN_USER_SHELL-/bin/bash}"
 fi
 EOF
     cat > "$fake_bin/id" << 'EOF'
@@ -836,6 +951,16 @@ EOF
     assert_contains "$output" "SSSD's direct NSS service resolves martin.campetta as UID 350020586" "direct SSSD-only resolution receives a focused nsswitch diagnostic"
     assert_contains "$output" 'normal libc/NSS path does not' "direct SSSD-only resolution remains blocked"
     pass "direct SSSD lookup cannot substitute for normal NSS identity resolution"
+
+    unit="$TMP_DIR/empty-shell-mnt-x.mount"
+    set +e
+    output="$(PATH="$fake_bin:$PATH" DOMAIN_USER_RESOLVES=1 DOMAIN_USER_SHELL='' DOMAIN_SUDO_USER=martin.campetta DR_JOIN_STATE_DIR="$TMP_DIR/empty-shell-state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; TOOLS_SERVER=dr-ep1-tools; platform_validate_selected_domain_user || exit 18; uid=\$(tools_mount_cruid); render_arch_tools_mount_unit /mnt/x \"\$TOOLS_SERVER\" \"\$uid\" > '$unit'" 2>&1)"
+    rc=$?
+    set -e
+    [ "$rc" -eq 18 ] || fail "empty domain login shell must stop at the Arch identity gate"
+    [ ! -e "$unit" ] || fail "empty domain login shell must not render /mnt/x"
+    assert_contains "$output" 'empty login shell' "empty domain login shell receives a focused diagnostic"
+    pass "empty domain login shell cannot produce a Tool Server cruid"
 }
 
 test_rebind_failure_rollback() {
@@ -2020,6 +2145,7 @@ test_office_argument_workflow
 test_hostname_collision_and_recovery
 test_cifs_kernel_and_mount_gates
 test_arch_nss_configuration
+test_arch_pam_sssd_and_display_manager
 test_domain_uid_resolution_gate
 test_rebind_failure_rollback
 test_drip_compatibility
