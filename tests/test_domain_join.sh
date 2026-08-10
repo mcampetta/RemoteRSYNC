@@ -2297,8 +2297,8 @@ test_arch_sentinel_deb_adapter() {
     fake_bin="$case_dir/bin"
     mkdir -p "$fake_bin" "$case_dir/runtime" "$case_dir/hasplm" "$case_dir/sbin" "$case_dir/systemd" "$case_dir/udev"
 
-    post_support="$(DR_JOIN_STATE_DIR="$case_dir/state" DR_KIT_ARCH_COMPAT_DIR="$case_dir/compat" DR_HASP_SOURCE_DIR="$case_dir/hasp" DR_HASP_DEB_PATH="$case_dir/aksusbd_10.21-1_amd64.deb" DR_HASP_CONFIG_DIR="$case_dir/hasplm" DR_HASP_UDEV_RULE="$case_dir/udev/80-haspopup" DR_HASP_SBIN_DIR="$case_dir/sbin" DR_HASP_INIT_DIR="$case_dir/init" DR_HASP_SYSTEMD_DIR="$case_dir/systemd" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; render_arch_kit_post_mount_support")"
-    launcher_support="$(DR_JOIN_STATE_DIR="$case_dir/state" DR_KIT_ARCH_COMPAT_DIR="$case_dir/compat" DR_HASP_CONFIG_DIR="$case_dir/hasplm" DR_HASP_UDEV_RULE="$case_dir/udev/80-haspopup" DR_HASP_SBIN_DIR="$case_dir/sbin" DR_HASP_SYSTEMD_DIR="$case_dir/systemd" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; render_arch_kit_launcher_support")"
+    post_support="$(DR_JOIN_STATE_DIR="$case_dir/state" DR_KIT_ARCH_COMPAT_DIR="$case_dir/compat" DR_HASP_SOURCE_DIR="$case_dir/hasp" DR_HASP_DEB_PATH="$case_dir/aksusbd_10.21-1_amd64.deb" DR_HASP_CONFIG_DIR="$case_dir/hasplm" DR_HASP_UDEV_RULE="$case_dir/udev/80-hasp.rules" DR_HASP_SBIN_DIR="$case_dir/sbin" DR_HASP_INIT_DIR="$case_dir/init" DR_HASP_SYSTEMD_DIR="$case_dir/systemd" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; render_arch_kit_post_mount_support")"
+    launcher_support="$(DR_JOIN_STATE_DIR="$case_dir/state" DR_KIT_ARCH_COMPAT_DIR="$case_dir/compat" DR_HASP_CONFIG_DIR="$case_dir/hasplm" DR_HASP_UDEV_RULE="$case_dir/udev/80-hasp.rules" DR_HASP_SBIN_DIR="$case_dir/sbin" DR_HASP_SYSTEMD_DIR="$case_dir/systemd" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; render_arch_kit_launcher_support")"
     printf '%s\n' "$post_support" > "$case_dir/post-support.sh"
     printf '%s\n' "$launcher_support" > "$case_dir/launcher-support.sh"
     bash -n "$case_dir/post-support.sh" || fail "generated Arch Sentinel .deb adapter syntax"
@@ -2315,9 +2315,13 @@ test_arch_sentinel_deb_adapter() {
     fi
     pass "Arch cpprest runtime remains a pinned private payload without global package tooling"
 
-    for token in 'ar t' 'debian-binary' 'control.tar.gz' 'data.tar.gz' '"$package" = aksusbd' '"$version" = 10.21-1' '"$architecture" = amd64' '80-haspopup' 'aksusbd_x86_64.service' 'hasplmd_x86_64.service' 'udevadm control --reload-rules' 'systemctl enable aksusbd.service hasplmd.service' 'systemctl restart aksusbd.service hasplmd.service'; do
+    for token in 'ar t' 'debian-binary' 'control.tar.gz' 'data.tar.gz' '"$package" = aksusbd' '"$version" = 10.21-1' '"$architecture" = amd64' '80-hasp.rules' 'aksusbd_x86_64.service' 'hasplmd_x86_64.service' 'udevadm control --reload-rules' 'systemctl enable aksusbd.service hasplmd.service' 'systemctl restart aksusbd.service hasplmd.service'; do
         assert_contains "$post_support" "$token" "Arch Sentinel adapter contains approved .deb contract: $token"
     done
+    if printf '%s\n' "$post_support" | grep -Fq '80-haspopup'; then
+        fail "generated Arch Sentinel adapter must not contain the obsolete 80-haspopup spelling"
+    fi
+    pass "generated Arch Sentinel adapter uses only the actual 80-hasp.rules member spelling"
     assert_contains "$post_support" './etc/hasplm/help/*' "Sentinel documentation is recognized but excluded from the extraction list"
     assert_contains "$post_support" 'tar -xzf "$archive" -C "$payload"' "Sentinel payload is staged privately instead of unpacked over root"
     assert_contains "$post_support" 'find "$payload"' "staged Sentinel payload rejects links and special files"
@@ -2357,7 +2361,7 @@ exit 0
 EOF
     chmod 755 "$fake_bin"/*
     : > "$case_dir/hasplm/hasplm.ini"
-    : > "$case_dir/udev/80-haspopup"
+    : > "$case_dir/udev/80-hasp.rules"
     : > "$case_dir/systemd/aksusbd.service"
     : > "$case_dir/systemd/hasplmd.service"
     for file in aksusbd aksusbd_x86_64 hasplmd hasplmd_x86_64; do
@@ -2381,10 +2385,10 @@ EOF
     set -e
     [ "$rc" -ne 0 ] || fail "unsupported compatibility-shim arguments must fail closed"
     pass "compatibility shim remains limited to KIT.sh read-only query form"
-    output="$(PATH="$fake_bin:$PATH" DR_KIT_HASP_CONFIG_DIR="$case_dir/hasplm" DR_KIT_HASP_UDEV_RULE="$case_dir/udev/80-haspopup" DR_KIT_HASP_SBIN_DIR="$case_dir/sbin" DR_KIT_HASP_SYSTEMD_DIR="$case_dir/systemd" "$case_dir/dpkg-query" -W '-f=${Status}' aksusbd)"
+    output="$(PATH="$fake_bin:$PATH" DR_KIT_HASP_CONFIG_DIR="$case_dir/hasplm" DR_KIT_HASP_UDEV_RULE="$case_dir/udev/80-hasp.rules" DR_KIT_HASP_SBIN_DIR="$case_dir/sbin" DR_KIT_HASP_SYSTEMD_DIR="$case_dir/systemd" "$case_dir/dpkg-query" -W '-f=${Status}' aksusbd)"
     assert_eq 'install ok installed' "$output" "Sentinel shim requires vendor runtime files, units, udev rule, and both services"
     set +e
-    PATH="$fake_bin:$PATH" SYSTEMCTL_INACTIVE_UNIT=hasplmd.service DR_KIT_HASP_CONFIG_DIR="$case_dir/hasplm" DR_KIT_HASP_UDEV_RULE="$case_dir/udev/80-haspopup" DR_KIT_HASP_SBIN_DIR="$case_dir/sbin" DR_KIT_HASP_SYSTEMD_DIR="$case_dir/systemd" "$case_dir/dpkg-query" -W '-f=${Status}' aksusbd >/dev/null 2>&1
+    PATH="$fake_bin:$PATH" SYSTEMCTL_INACTIVE_UNIT=hasplmd.service DR_KIT_HASP_CONFIG_DIR="$case_dir/hasplm" DR_KIT_HASP_UDEV_RULE="$case_dir/udev/80-hasp.rules" DR_KIT_HASP_SBIN_DIR="$case_dir/sbin" DR_KIT_HASP_SYSTEMD_DIR="$case_dir/systemd" "$case_dir/dpkg-query" -W '-f=${Status}' aksusbd >/dev/null 2>&1
     rc=$?
     set -e
     [ "$rc" -ne 0 ] || fail "inactive hasplmd must fail the Sentinel runtime predicate"
@@ -2460,7 +2464,7 @@ case "$*" in
     *'./control'*) printf '%s\n' "${DEB_CONTROL:-Package: aksusbd
 Version: 10.21-1
 Architecture: amd64}" ;;
-    *'-tzf -'*) printf '%s\n' ${DEB_MEMBERS:-./ ./usr/ ./usr/sbin/ ./usr/sbin/aksusbd ./usr/sbin/aksusbd_x86_64 ./usr/sbin/hasplmd ./usr/sbin/hasplmd_x86_64 ./var/ ./var/hasplm/ ./var/hasplm/init/ ./var/hasplm/init/aksusbd.service ./var/hasplm/init/aksusbd_x86_64.service ./var/hasplm/init/hasplmd.service ./var/hasplm/init/hasplmd_x86_64.service ./etc/ ./etc/udev/ ./etc/udev/rules.d/ ./etc/udev/rules.d/80-haspopup ./etc/hasplm/ ./etc/hasplm/templates/ ./etc/hasplm/templates/en.21.0.alp ./etc/hasplm/help/ ./etc/hasplm/help/en/readme.htm} ;;
+    *'-tzf -'*) printf '%s\n' ${DEB_MEMBERS:-./ ./usr/ ./usr/sbin/ ./usr/sbin/aksusbd ./usr/sbin/aksusbd_x86_64 ./usr/sbin/hasplmd ./usr/sbin/hasplmd_x86_64 ./var/ ./var/hasplm/ ./var/hasplm/init/ ./var/hasplm/init/aksusbd.service ./var/hasplm/init/aksusbd_x86_64.service ./var/hasplm/init/hasplmd.service ./var/hasplm/init/hasplmd_x86_64.service ./etc/ ./etc/udev/ ./etc/udev/rules.d/ ./etc/udev/rules.d/80-hasp.rules ./etc/hasplm/ ./etc/hasplm/templates/ ./etc/hasplm/templates/en.21.0.alp ./etc/hasplm/help/ ./etc/hasplm/help/en/readme.htm} ;;
     *'-tvzf -'*) printf '%s\n' "${DEB_TYPES:--rw-r--r-- root/root 1 2025-01-01 ./usr/sbin/aksusbd}" ;;
     *) exit 0 ;;
 esac

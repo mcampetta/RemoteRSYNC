@@ -89,7 +89,7 @@ DR_KIT_CPPREST_DEB_SHA256="a100a5feac0d96b86c423bf0c11f8f8a3a8b7d05243edce2484a9
 DR_HASP_SOURCE_DIR="${DR_HASP_SOURCE_DIR:-/mnt/x/DRTools/frozen/Generic/HASP/V10.21}"
 DR_HASP_DEB_PATH="${DR_HASP_DEB_PATH:-/mnt/x/DRTools/frozen/Generic/HASP/V10.21/Sentinel_LDK_Ubuntu_DEB_Run-time_Installer/aksusbd_10.21-1_amd64.deb}"
 DR_HASP_CONFIG_DIR="${DR_HASP_CONFIG_DIR:-/etc/hasplm}"
-DR_HASP_UDEV_RULE="${DR_HASP_UDEV_RULE:-/etc/udev/rules.d/80-haspopup}"
+DR_HASP_UDEV_RULE="${DR_HASP_UDEV_RULE:-/etc/udev/rules.d/80-hasp.rules}"
 DR_HASP_SBIN_DIR="${DR_HASP_SBIN_DIR:-/usr/sbin}"
 DR_HASP_INIT_DIR="${DR_HASP_INIT_DIR:-/var/hasplm/init}"
 DR_HASP_SYSTEMD_DIR="${DR_HASP_SYSTEMD_DIR:-/etc/systemd/system}"
@@ -6104,7 +6104,7 @@ have_sentinel() {
     [ -f "$sbin_dir/hasplmd_x86_64" ] && [ ! -L "$sbin_dir/hasplmd_x86_64" ] && [ -x "$sbin_dir/hasplmd_x86_64" ] || return 1
     [ -f "$systemd_dir/aksusbd.service" ] && [ ! -L "$systemd_dir/aksusbd.service" ] || return 1
     [ -f "$systemd_dir/hasplmd.service" ] && [ ! -L "$systemd_dir/hasplmd.service" ] || return 1
-    [ -f "${DR_KIT_HASP_UDEV_RULE:-/etc/udev/rules.d/80-haspopup}" ] && [ ! -L "${DR_KIT_HASP_UDEV_RULE:-/etc/udev/rules.d/80-haspopup}" ] || return 1
+    [ -f "${DR_KIT_HASP_UDEV_RULE:-/etc/udev/rules.d/80-hasp.rules}" ] && [ ! -L "${DR_KIT_HASP_UDEV_RULE:-/etc/udev/rules.d/80-hasp.rules}" ] || return 1
     ldd "$sbin_dir/aksusbd_x86_64" "$sbin_dir/hasplmd_x86_64" >/dev/null 2>&1 || return 1
     ldd "$sbin_dir/aksusbd_x86_64" "$sbin_dir/hasplmd_x86_64" 2>/dev/null | grep -Fq 'not found' && return 1
     [ "$(systemctl show aksusbd.service -p LoadState --value 2>/dev/null)" = loaded ] || return 1
@@ -6429,7 +6429,7 @@ arch_kit_validate_sentinel_deb() {
     [ "\$package" = aksusbd ] && [ "\$version" = 10.21-1 ] && [ "\$architecture" = amd64 ] || return 1
     while IFS= read -r member; do
         case "\$member" in
-            ./|./usr/|./usr/sbin/|./usr/sbin/aksusbd|./usr/sbin/aksusbd_x86_64|./usr/sbin/hasplmd|./usr/sbin/hasplmd_x86_64|./usr/share/|./usr/share/doc/|./usr/share/doc/aksusbd/|./usr/share/doc/aksusbd/copyright|./var/|./var/hasplm/|./var/hasplm/init/|./var/hasplm/init/aksusbd.rc|./var/hasplm/init/aksusbd.service|./var/hasplm/init/aksusbd_x86_64.service|./var/hasplm/init/hasplmd.service|./var/hasplm/init/hasplmd_x86_64.service|./etc/|./etc/udev/|./etc/udev/rules.d/|./etc/udev/rules.d/80-haspopup|./etc/hasplm/|./etc/hasplm/templates/|./etc/hasplm/templates/*.alp|./etc/hasplm/help/|./etc/hasplm/help/*) ;;
+            ./|./usr/|./usr/sbin/|./usr/sbin/aksusbd|./usr/sbin/aksusbd_x86_64|./usr/sbin/hasplmd|./usr/sbin/hasplmd_x86_64|./usr/share/|./usr/share/doc/|./usr/share/doc/aksusbd/|./usr/share/doc/aksusbd/copyright|./var/|./var/hasplm/|./var/hasplm/init/|./var/hasplm/init/aksusbd.rc|./var/hasplm/init/aksusbd.service|./var/hasplm/init/aksusbd_x86_64.service|./var/hasplm/init/hasplmd.service|./var/hasplm/init/hasplmd_x86_64.service|./etc/|./etc/udev/|./etc/udev/rules.d/|./etc/udev/rules.d/80-hasp.rules|./etc/hasplm/|./etc/hasplm/templates/|./etc/hasplm/templates/*.alp|./etc/hasplm/help/|./etc/hasplm/help/*) ;;
             *) return 1 ;;
         esac
         case "\$member" in /*|*'..'*|*[[:cntrl:]]*) return 1 ;; esac
@@ -6462,7 +6462,7 @@ arch_kit_extract_allowlisted_sentinel_payload() {
         ./usr/sbin/aksusbd ./usr/sbin/aksusbd_x86_64 ./usr/sbin/hasplmd ./usr/sbin/hasplmd_x86_64 \
         ./var/hasplm/init/aksusbd.service ./var/hasplm/init/aksusbd_x86_64.service \
         ./var/hasplm/init/hasplmd.service ./var/hasplm/init/hasplmd_x86_64.service \
-        ./etc/udev/rules.d/80-haspopup ./etc/hasplm/templates
+        ./etc/udev/rules.d/80-hasp.rules ./etc/hasplm/templates
     find "\$payload" \( -type l -o -type b -o -type c -o -type p -o -type s \) -print -quit | grep -q . && return 1
 }
 
@@ -6483,7 +6483,7 @@ arch_kit_install_vendor_sentinel_payload() {
         install -D -o root -g root -m 0644 "\$unit" "\$HASP_CONFIG_DIR/templates/\${unit##*/}"
     done < <(find "\$payload/etc/hasplm/templates" -type f -print0)
     arch_kit_backup_if_present "\$HASP_UDEV_RULE"
-    install -o root -g root -m 0644 "\$payload/etc/udev/rules.d/80-haspopup" "\$HASP_UDEV_RULE"
+    install -o root -g root -m 0644 "\$payload/etc/udev/rules.d/80-hasp.rules" "\$HASP_UDEV_RULE"
     suffix="\$(arch_kit_selected_sentinel_suffix)"
     for unit in aksusbd hasplmd; do
         arch_kit_backup_if_present "\$HASP_SYSTEMD_DIR/\$unit.service"
@@ -6507,7 +6507,7 @@ arch_kit_verify_sentinel() {
     ldd "\$HASP_SBIN_DIR/aksusbd_x86_64" "\$HASP_SBIN_DIR/hasplmd_x86_64" >/dev/null 2>&1 || return 1
     ldd "\$HASP_SBIN_DIR/aksusbd_x86_64" "\$HASP_SBIN_DIR/hasplmd_x86_64" 2>/dev/null | grep -Fq 'not found' && return 1
     suffix="\$(arch_kit_selected_sentinel_suffix)"
-    arch_kit_vendor_member_matches ./etc/udev/rules.d/80-haspopup "\$HASP_UDEV_RULE" || return 1
+    arch_kit_vendor_member_matches ./etc/udev/rules.d/80-hasp.rules "\$HASP_UDEV_RULE" || return 1
     cmp -s "\$HASP_INIT_DIR/aksusbd\$suffix.service" "\$HASP_SYSTEMD_DIR/aksusbd.service" || return 1
     cmp -s "\$HASP_INIT_DIR/hasplmd\$suffix.service" "\$HASP_SYSTEMD_DIR/hasplmd.service" || return 1
     [ "\$(systemctl show aksusbd.service -p LoadState --value 2>/dev/null)" = loaded ] || return 1
