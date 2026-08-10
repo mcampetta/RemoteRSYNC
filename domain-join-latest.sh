@@ -83,10 +83,13 @@ KIT_PROCESS_PATTERN="${KIT_PROCESS_PATTERN:-KIT}"
 KIT_INSTALLER_PATH="${KIT_INSTALLER_PATH:-/mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/KIT-installer-modified.sh}"
 DR_KIT_ARCH_COMPAT_DIR="${DR_KIT_ARCH_COMPAT_DIR:-/usr/local/libexec/dr-kit-arch}"
 DR_KIT_CPPREST_LIBRARY_PATH="${DR_KIT_CPPREST_LIBRARY_PATH:-}"
+DR_KIT_CPPREST_DEB_PATH="${DR_KIT_CPPREST_DEB_PATH:-}"
+DR_KIT_CPPREST_DEB_URL="https://archive.ubuntu.com/ubuntu/pool/universe/c/cpprest/libcpprest2.10_2.10.19-2build2_amd64.deb"
+DR_KIT_CPPREST_DEB_SHA256="a100a5feac0d96b86c423bf0c11f8f8a3a8b7d05243edce2484a993ade9f5bbd"
 DR_HASP_SOURCE_DIR="${DR_HASP_SOURCE_DIR:-/mnt/x/DRTools/frozen/Generic/HASP/V10.21}"
 DR_HASP_DEB_PATH="${DR_HASP_DEB_PATH:-/mnt/x/DRTools/frozen/Generic/HASP/V10.21/Sentinel_LDK_Ubuntu_DEB_Run-time_Installer/aksusbd_10.21-1_amd64.deb}"
 DR_HASP_CONFIG_DIR="${DR_HASP_CONFIG_DIR:-/etc/hasplm}"
-DR_HASP_UDEV_RULE="${DR_HASP_UDEV_RULE:-/etc/udev/rules.d/80-hasp.rules}"
+DR_HASP_UDEV_RULE="${DR_HASP_UDEV_RULE:-/etc/udev/rules.d/80-haspopup}"
 DR_HASP_SBIN_DIR="${DR_HASP_SBIN_DIR:-/usr/sbin}"
 DR_HASP_INIT_DIR="${DR_HASP_INIT_DIR:-/var/hasplm/init}"
 DR_HASP_SYSTEMD_DIR="${DR_HASP_SYSTEMD_DIR:-/etc/systemd/system}"
@@ -6078,15 +6081,17 @@ have_soname() {
 }
 
 have_cpprest() {
-    local candidate
-    if [ -n "${DR_KIT_CPPREST_LIBRARY_PATH:-}" ]; then
-        candidate="$DR_KIT_CPPREST_LIBRARY_PATH"
-        [ -f "$candidate" ] && [ ! -L "$candidate" ] && return 0
-    fi
-    have_soname libcpprest.so.2.10 && return 0
-    find "${DR_KIT_RUNTIME_DIR:-/nonexistent}" \
-        /mnt/x/DRTools/Frozen/DLL /mnt/x/DRTools/UA/DLL \
-        -xdev -type f -name 'libcpprest.so.2.10' -print -quit 2>/dev/null | grep -q .
+    local candidate metadata output
+    candidate="${DR_KIT_CPPREST_LIBRARY_PATH:-}"
+    [ -n "$candidate" ] && [ -f "$candidate" ] && [ ! -L "$candidate" ] || return 1
+    metadata="$(stat -c '%u:%a' "$candidate" 2>/dev/null || true)"
+    case "$metadata" in 0:4[04][04]|0:6[04][04]) ;; *) return 1 ;; esac
+    readelf -h "$candidate" 2>/dev/null | grep -Fq 'ELF64' || return 1
+    readelf -h "$candidate" 2>/dev/null | grep -Fq 'X86-64' || return 1
+    readelf -d "$candidate" 2>/dev/null | grep -Eq 'SONAME.*libcpprest\.so\.2\.10' || return 1
+    output="$(ldd "$candidate" 2>&1)" || return 1
+    printf '%s\n' "$output" | grep -Eiq 'not found|version .+ not found|not a dynamic executable|error' && return 1
+    return 0
 }
 
 have_sentinel() {
@@ -6099,7 +6104,7 @@ have_sentinel() {
     [ -f "$sbin_dir/hasplmd_x86_64" ] && [ ! -L "$sbin_dir/hasplmd_x86_64" ] && [ -x "$sbin_dir/hasplmd_x86_64" ] || return 1
     [ -f "$systemd_dir/aksusbd.service" ] && [ ! -L "$systemd_dir/aksusbd.service" ] || return 1
     [ -f "$systemd_dir/hasplmd.service" ] && [ ! -L "$systemd_dir/hasplmd.service" ] || return 1
-    [ -f "${DR_KIT_HASP_UDEV_RULE:-/etc/udev/rules.d/80-hasp.rules}" ] && [ ! -L "${DR_KIT_HASP_UDEV_RULE:-/etc/udev/rules.d/80-hasp.rules}" ] || return 1
+    [ -f "${DR_KIT_HASP_UDEV_RULE:-/etc/udev/rules.d/80-haspopup}" ] && [ ! -L "${DR_KIT_HASP_UDEV_RULE:-/etc/udev/rules.d/80-haspopup}" ] || return 1
     ldd "$sbin_dir/aksusbd_x86_64" "$sbin_dir/hasplmd_x86_64" >/dev/null 2>&1 || return 1
     ldd "$sbin_dir/aksusbd_x86_64" "$sbin_dir/hasplmd_x86_64" 2>/dev/null | grep -Fq 'not found' && return 1
     [ "$(systemctl show aksusbd.service -p LoadState --value 2>/dev/null)" = loaded ] || return 1
@@ -6149,7 +6154,53 @@ ARCH_KIT_HASP_CONFIG_DIR="$DR_HASP_CONFIG_DIR"
 ARCH_KIT_HASP_UDEV_RULE="$DR_HASP_UDEV_RULE"
 ARCH_KIT_HASP_SBIN_DIR="$DR_HASP_SBIN_DIR"
 ARCH_KIT_HASP_SYSTEMD_DIR="$DR_HASP_SYSTEMD_DIR"
-ARCH_KIT_CPPREST_LIBRARY_PATH="$DR_KIT_CPPREST_LIBRARY_PATH"
+ARCH_KIT_CPPREST_LIBRARY_PATH="${DR_KIT_CPPREST_LIBRARY_PATH:-$DR_KIT_ARCH_COMPAT_DIR/lib/libcpprest.so.2.10}"
+ARCH_KIT_CPPREST_LIB_DIR="\$(dirname "\$ARCH_KIT_CPPREST_LIBRARY_PATH")"
+ARCH_KIT_RUNTIME_WRAPPER="\$ARCH_KIT_COMPAT_DIR/KIT.cpprest.sh"
+
+arch_kit_validate_private_cpprest() {
+    local candidate="\$ARCH_KIT_CPPREST_LIBRARY_PATH" metadata output
+    [ -f "\$candidate" ] && [ ! -L "\$candidate" ] || { echo "Private Arch cpprest runtime is missing or unsafe: \$candidate" >&2; return 1; }
+    metadata="\$(stat -c '%u:%a' "\$candidate" 2>/dev/null || true)"
+    case "\$metadata" in 0:4[04][04]|0:6[04][04]) ;; *) echo "Private Arch cpprest runtime must be root-owned and not group/other writable: \$candidate" >&2; return 1 ;; esac
+    readelf -h "\$candidate" 2>/dev/null | grep -Fq 'ELF64' || { echo "Private Arch cpprest runtime is not ELF64: \$candidate" >&2; return 1; }
+    readelf -h "\$candidate" 2>/dev/null | grep -Fq 'X86-64' || { echo "Private Arch cpprest runtime is not x86-64: \$candidate" >&2; return 1; }
+    readelf -d "\$candidate" 2>/dev/null | grep -Eq 'SONAME.*libcpprest\\.so\\.2\\.10' || { echo "Private Arch cpprest SONAME is unexpected: \$candidate" >&2; return 1; }
+    output="\$(ldd "\$candidate" 2>&1)" || { printf '%s\\n' "\$output" >&2; return 1; }
+    printf '%s\\n' "\$output" | grep -Eiq 'not found|version .+ not found|not a dynamic executable|error' && { printf '%s\\n' "\$output" >&2; return 1; }
+}
+
+arch_kit_validate_drip_cpprest() {
+    local client="/mnt/x/DRTools/UA/Imaging/DRIP/Drip.WebApi.Backend.UnmanagedClient-Linux/V12.00/x64/libDrip.WebApi.Backend.UnmanagedClient.so" output
+    [ -f "\$client" ] && [ ! -L "\$client" ] || { echo "DRIP WebAPI client is missing or unsafe: \$client" >&2; return 1; }
+    output="\$(LD_LIBRARY_PATH="\$ARCH_KIT_CPPREST_LIB_DIR\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" ldd -r "\$client" 2>&1)" || { printf '%s\\n' "\$output" >&2; return 1; }
+    printf '%s\\n' "\$output" | grep -Eiq 'not found|undefined symbol|version .+ not found|not a dynamic executable|error' && { printf '%s\\n' "\$output" >&2; return 1; }
+}
+
+prepare_arch_kit_runtime_wrapper() {
+    local source="\$KIT_DIR/KIT.sh" stage
+    [ -r "\$source" ] && [ ! -L "\$source" ] || { echo "Shared KIT.sh is missing or unsafe: \$source" >&2; return 1; }
+    install -d -o root -g root -m 0755 "\$ARCH_KIT_COMPAT_DIR" || return 1
+    stage="\$(mktemp "\$ARCH_KIT_COMPAT_DIR/.KIT.cpprest.XXXXXXXX")" || return 1
+    if ! awk -v kit_dir="\$KIT_DIR" -v cpprest_dir="\$ARCH_KIT_CPPREST_LIB_DIR" '
+        function quote(value) { gsub(/\\\\/, "\\\\\\\\", value); gsub(/\"/, "\\\\\"", value); return value }
+        \$0 == "SCRIPT_DIR=\"\$(cd \"\$(dirname \"\${BASH_SOURCE[0]}\")\" && pwd)\"" { print "SCRIPT_DIR=\"" quote(kit_dir) "\""; script_dir_count++; next }
+        \$0 == "export LD_LIBRARY_PATH=\"\$SCRIPT_DIR\"" { print "export LD_LIBRARY_PATH=\"\$SCRIPT_DIR:" quote(cpprest_dir) "\""; ld_path_count++; next }
+        { print }
+        END { exit(script_dir_count == 1 && ld_path_count == 1 ? 0 : 1) }
+    ' "\$source" > "\$stage"; then
+        rm -f -- "\$stage"
+        echo "Shared KIT.sh no longer has the expected library-path layout; refusing to generate a local Arch wrapper." >&2
+        return 1
+    fi
+    chown root:root "\$stage" && chmod 0700 "\$stage" || { rm -f -- "\$stage"; return 1; }
+    if [ -f "\$ARCH_KIT_RUNTIME_WRAPPER" ] && cmp -s "\$stage" "\$ARCH_KIT_RUNTIME_WRAPPER"; then
+        rm -f -- "\$stage"
+    else
+        mv -f -- "\$stage" "\$ARCH_KIT_RUNTIME_WRAPPER"
+    fi
+    [ -f "\$ARCH_KIT_RUNTIME_WRAPPER" ] && [ ! -L "\$ARCH_KIT_RUNTIME_WRAPPER" ] && [ "\$(stat -c '%u:%a' "\$ARCH_KIT_RUNTIME_WRAPPER" 2>/dev/null || true)" = 0:700 ]
+}
 
 validate_arch_kit_runtime() {
     local adapter expected package kit_ld_library_path
@@ -6163,12 +6214,14 @@ validate_arch_kit_runtime() {
     for package in libgtk-3-0 libgl1 libglu1-mesa libx11-6 libxext6 libxrender1 libxrandr2 libpango-1.0-0 libpangocairo-1.0-0 libcairo2 libpng16-16 libnotify4 libsm6 libexpat1 libstdc++6 libglib2.0-0 libpcre2-32-0 libglibmm-2.4-1 libcpprest2.10 libudev1 libxml++2.6-2v5 gedit cifs-utils winbind libjpeg62-turbo libtiff6 aksusbd; do
         if ! DR_KIT_RUNTIME_DIR="\$KIT_DIR" DR_KIT_CPPREST_LIBRARY_PATH="\$ARCH_KIT_CPPREST_LIBRARY_PATH" DR_KIT_HASP_CONFIG_DIR="\$ARCH_KIT_HASP_CONFIG_DIR" DR_KIT_HASP_UDEV_RULE="\$ARCH_KIT_HASP_UDEV_RULE" DR_KIT_HASP_SBIN_DIR="\$ARCH_KIT_HASP_SBIN_DIR" DR_KIT_HASP_SYSTEMD_DIR="\$ARCH_KIT_HASP_SYSTEMD_DIR" "\$adapter" -W '-f=\${Status}' "\$package" >/dev/null; then
             echo "Arch KIT runtime prerequisite is not satisfied: \$package" >&2
-            [ "\$package" != libcpprest2.10 ] || echo "No matching official Arch cpprest package was characterized; provide the exact libcpprest.so.2.10 through an approved vendor/runtime source before launching KIT." >&2
+            [ "\$package" != libcpprest2.10 ] || echo "Private approved libcpprest.so.2.10 runtime is not valid for KIT/DRIP." >&2
             return 1
         fi
     done
     [ -r "\$KIT_DIR/KIT" ] && [ -r "\$KIT_DIR/KIT.sh" ] || { echo "KIT runtime files are not readable." >&2; return 1; }
-    kit_ld_library_path="\$KIT_DIR:/mnt/x/DRTools/Frozen/DLL/AsyncIO-Linux/V2.00/x64:/mnt/x/DRTools/Frozen/DLL/FileIO-Linux/V6.00/x64:/mnt/x/DRTools/UA/DLL/IO-Linux/V6.00/x64:/mnt/x/DRTools/UA/DLL/Secure-Linux/V2.01/x64:/mnt/x/DRTools/UA/Imaging/DRIP/Drip.Lib-Linux/V12.00/x64:/mnt/x/DRTools/UA/Imaging/DRIP/Drip.WebApi.Backend.UnmanagedClient-Linux/V12.00/x64:/mnt/x/DRTools/Frozen/DLL/3rd/wxWidgets/V3.3.1/x64"
+    arch_kit_validate_private_cpprest || return 1
+    arch_kit_validate_drip_cpprest || return 1
+    kit_ld_library_path="\$ARCH_KIT_CPPREST_LIB_DIR:\$KIT_DIR:/mnt/x/DRTools/Frozen/DLL/AsyncIO-Linux/V2.00/x64:/mnt/x/DRTools/Frozen/DLL/FileIO-Linux/V6.00/x64:/mnt/x/DRTools/UA/DLL/IO-Linux/V6.00/x64:/mnt/x/DRTools/UA/DLL/Secure-Linux/V2.01/x64:/mnt/x/DRTools/UA/Imaging/DRIP/Drip.Lib-Linux/V12.00/x64:/mnt/x/DRTools/UA/Imaging/DRIP/Drip.WebApi.Backend.UnmanagedClient-Linux/V12.00/x64:/mnt/x/DRTools/Frozen/DLL/3rd/wxWidgets/V3.3.1/x64"
     if LD_LIBRARY_PATH="\$kit_ld_library_path\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" ldd "\$KIT_DIR/KIT" 2>/dev/null | grep -Fq 'not found'; then
         echo "Arch KIT runtime still has unresolved ELF dependencies; see ldd output for \$KIT_DIR/KIT." >&2
         return 1
@@ -6181,6 +6234,12 @@ render_arch_kit_post_mount_support() {
     [ "$PLATFORM_FAMILY" = arch ] || return 0
     cat <<EOF
 ARCH_KIT_COMPAT_DIR="$DR_KIT_ARCH_COMPAT_DIR"
+CPPREST_DEB_PATH="$DR_KIT_CPPREST_DEB_PATH"
+CPPREST_DEB_URL="$DR_KIT_CPPREST_DEB_URL"
+CPPREST_DEB_SHA256="$DR_KIT_CPPREST_DEB_SHA256"
+CPPREST_LIBRARY_OVERRIDE="$DR_KIT_CPPREST_LIBRARY_PATH"
+CPPREST_DEFAULT_LIBRARY="$DR_KIT_ARCH_COMPAT_DIR/lib/libcpprest.so.2.10"
+CPPREST_LIBRARY_PATH="${DR_KIT_CPPREST_LIBRARY_PATH:-$DR_KIT_ARCH_COMPAT_DIR/lib/libcpprest.so.2.10}"
 HASP_SOURCE_DIR="$DR_HASP_SOURCE_DIR"
 HASP_DEB_PATH="$DR_HASP_DEB_PATH"
 HASP_CONFIG_DIR="$DR_HASP_CONFIG_DIR"
@@ -6190,15 +6249,113 @@ HASP_INIT_DIR="$DR_HASP_INIT_DIR"
 HASP_SYSTEMD_DIR="$DR_HASP_SYSTEMD_DIR"
 HASP_CONTROL_ARCHIVE=""
 HASP_DATA_ARCHIVE=""
+CPPREST_CONTROL_ARCHIVE=""
+CPPREST_DATA_ARCHIVE=""
+
+arch_kit_cpprest_validate_library() {
+    local candidate="\${1:-}" metadata output
+    [ -n "\$candidate" ] && [ -f "\$candidate" ] && [ ! -L "\$candidate" ] || return 1
+    metadata="\$(stat -c '%u:%a' "\$candidate" 2>/dev/null || true)"
+    case "\$metadata" in 0:4[04][04]|0:6[04][04]) ;; *) return 1 ;; esac
+    readelf -h "\$candidate" 2>/dev/null | grep -Fq 'ELF64' || return 1
+    readelf -h "\$candidate" 2>/dev/null | grep -Fq 'X86-64' || return 1
+    readelf -d "\$candidate" 2>/dev/null | grep -Eq 'SONAME.*libcpprest\\.so\\.2\\.10' || return 1
+    output="\$(ldd "\$candidate" 2>&1)" || return 1
+    printf '%s\\n' "\$output" | grep -Eiq 'not found|version .+ not found|not a dynamic executable|error' && return 1
+}
+
+arch_kit_validate_drip_cpprest() {
+    local client="/mnt/x/DRTools/UA/Imaging/DRIP/Drip.WebApi.Backend.UnmanagedClient-Linux/V12.00/x64/libDrip.WebApi.Backend.UnmanagedClient.so" output
+    [ -f "\$client" ] && [ ! -L "\$client" ] || return 1
+    output="\$(LD_LIBRARY_PATH="\$(dirname "\$CPPREST_LIBRARY_PATH")\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" ldd -r "\$client" 2>&1)" || return 1
+    printf '%s\\n' "\$output" | grep -Eiq 'not found|undefined symbol|version .+ not found|not a dynamic executable|error' && return 1
+}
 
 arch_kit_cpprest_available() {
-    local candidate
-    if [ -n "\${DR_KIT_CPPREST_LIBRARY_PATH:-}" ]; then
-        candidate="\$DR_KIT_CPPREST_LIBRARY_PATH"
-        [ -f "\$candidate" ] && [ ! -L "\$candidate" ] && return 0
+    arch_kit_cpprest_validate_library "\$CPPREST_LIBRARY_PATH" && arch_kit_validate_drip_cpprest
+}
+
+arch_kit_cpprest_archive_list() {
+    tar --zstd -tf -
+}
+
+arch_kit_cpprest_control_field() {
+    local field="\$1" metadata="\$2"
+    printf '%s\\n' "\$metadata" | awk -F ': ' -v wanted="\$field" '
+        \$1 == wanted { count++; value=substr(\$0, length(wanted) + 3) }
+        END { if (count == 1 && value != "") print value; else exit 1 }
+    '
+}
+
+arch_kit_validate_cpprest_deb() {
+    local deb="\$1" member metadata package version architecture
+    local -a members=()
+    [ -f "\$deb" ] && [ ! -L "\$deb" ] || return 1
+    [ "\$(sha256sum "\$deb" | awk '{print \$1}')" = "\$CPPREST_DEB_SHA256" ] || return 1
+    mapfile -t members < <(ar t "\$deb" 2>/dev/null) || return 1
+    [ "\${#members[@]}" -eq 3 ] || return 1
+    [ "\${members[0]}" = debian-binary ] || return 1
+    [ "\${members[1]}" = control.tar.zst ] || return 1
+    [ "\${members[2]}" = data.tar.zst ] || return 1
+    [ "\$(ar p "\$deb" debian-binary 2>/dev/null)" = 2.0 ] || return 1
+    CPPREST_CONTROL_ARCHIVE="\${members[1]}"
+    CPPREST_DATA_ARCHIVE="\${members[2]}"
+    while IFS= read -r member; do
+        case "\$member" in /*|*'..'*|*[[:cntrl:]]*) return 1 ;; esac
+    done < <(ar p "\$deb" "\$CPPREST_CONTROL_ARCHIVE" | tar --zstd -tf -)
+    ar p "\$deb" "\$CPPREST_CONTROL_ARCHIVE" | tar --zstd -tvf - | awk 'substr(\$1, 1, 1) !~ /^[d-]\$/ { bad=1 } END { exit(bad ? 1 : 0) }' || return 1
+    metadata="\$(ar p "\$deb" "\$CPPREST_CONTROL_ARCHIVE" | tar --zstd -xOf - ./control 2>/dev/null)" || return 1
+    package="\$(arch_kit_cpprest_control_field Package "\$metadata")" || return 1
+    version="\$(arch_kit_cpprest_control_field Version "\$metadata")" || return 1
+    architecture="\$(arch_kit_cpprest_control_field Architecture "\$metadata")" || return 1
+    [ "\$package" = libcpprest2.10 ] && [ "\$version" = 2.10.19-2build2 ] && [ "\$architecture" = amd64 ] || return 1
+    while IFS= read -r member; do
+        case "\$member" in
+            ./|./usr/|./usr/lib/|./usr/lib/x86_64-linux-gnu/|./usr/lib/x86_64-linux-gnu/libcpprest.so.2.10) ;;
+            *) return 1 ;;
+        esac
+        case "\$member" in /*|*'..'*|*[[:cntrl:]]*) return 1 ;; esac
+    done < <(ar p "\$deb" "\$CPPREST_DATA_ARCHIVE" | arch_kit_cpprest_archive_list)
+    ar p "\$deb" "\$CPPREST_DATA_ARCHIVE" | tar --zstd -tvf - | awk 'substr(\$1, 1, 1) !~ /^[d-]\$/ { bad=1 } END { exit(bad ? 1 : 0) }'
+}
+
+arch_kit_fetch_cpprest_deb() {
+    local destination="\$1"
+    if [ -n "\$CPPREST_DEB_PATH" ]; then
+        [ -f "\$CPPREST_DEB_PATH" ] && [ ! -L "\$CPPREST_DEB_PATH" ] || return 1
+        cp -- "\$CPPREST_DEB_PATH" "\$destination"
+    elif command -v curl >/dev/null 2>&1; then
+        curl --fail --location --proto '=https' --tlsv1.2 --output "\$destination" "\$CPPREST_DEB_URL"
+    elif command -v wget >/dev/null 2>&1; then
+        wget --https-only -O "\$destination" "\$CPPREST_DEB_URL"
+    else
+        return 1
     fi
-    [ -e /usr/lib/libcpprest.so.2.10 ] && return 0
-    find "\$(dirname "\$KIT_INSTALLER_PATH")" /mnt/x/DRTools/Frozen/DLL /mnt/x/DRTools/UA/DLL -xdev -type f -name 'libcpprest.so.2.10' -print -quit 2>/dev/null | grep -q .
+}
+
+install_arch_private_cpprest() {
+    local work deb archive payload source rc=1
+    if [ -n "\$CPPREST_LIBRARY_OVERRIDE" ]; then
+        arch_kit_cpprest_available || { log "Arch KIT blocker: explicit DR_KIT_CPPREST_LIBRARY_PATH is not a valid KIT/DRIP cpprest runtime."; return 1; }
+        return 0
+    fi
+    arch_kit_cpprest_available && return 0
+    work="\$(mktemp -d /var/tmp/dr-kit-cpprest.XXXXXXXX)" || return 1
+    deb="\$work/libcpprest2.10.deb"
+    archive="\$work/data.tar.zst"
+    payload="\$work/payload"
+    if arch_kit_fetch_cpprest_deb "\$deb" && arch_kit_validate_cpprest_deb "\$deb"; then
+        ar p "\$deb" "\$CPPREST_DATA_ARCHIVE" > "\$archive" && mkdir -p "\$payload" \
+            && tar --zstd -xf "\$archive" -C "\$payload" --no-same-owner --no-same-permissions ./usr/lib/x86_64-linux-gnu/libcpprest.so.2.10 \
+            && ! find "\$payload" \( -type l -o -type b -o -type c -o -type p -o -type s \) -print -quit | grep -q . \
+            && source="\$payload/usr/lib/x86_64-linux-gnu/libcpprest.so.2.10" \
+            && [ -f "\$source" ] && [ ! -L "\$source" ] \
+            && install -D -o root -g root -m 0644 "\$source" "\$CPPREST_DEFAULT_LIBRARY" \
+            && arch_kit_cpprest_available && rc=0
+    fi
+    rm -rf -- "\$work"
+    [ "\$rc" -eq 0 ] || log "Arch KIT blocker: approved private libcpprest.so.2.10 deployment or DRIP ABI validation failed."
+    return "\$rc"
 }
 
 install_arch_kit_compatibility_adapter() {
@@ -6218,10 +6375,6 @@ arch_kit_install_native_dependencies() {
     local -a required=(gtk3 libglvnd glu libx11 libxext libxrender libxrandr pango cairo libpng libnotify libsm expat gcc-libs glib2 pcre2 glibmm systemd-libs libxml++2.6 libjpeg-turbo libtiff cifs-utils samba gedit)
     local -a missing=()
 
-    if ! arch_kit_cpprest_available; then
-        log "Arch KIT blocker: libcpprest.so.2.10 is neither supplied by the Tool Server runtime nor available through a configured approved source. No AUR/source-build fallback will be used."
-        return 1
-    fi
     for package in "\${required[@]}"; do pacman -Q "\$package" >/dev/null 2>&1 || missing+=("\$package"); done
     if [ "\${#missing[@]}" -gt 0 ]; then
         log "Installing missing native Arch KIT dependencies: \${missing[*]}"
@@ -6276,7 +6429,7 @@ arch_kit_validate_sentinel_deb() {
     [ "\$package" = aksusbd ] && [ "\$version" = 10.21-1 ] && [ "\$architecture" = amd64 ] || return 1
     while IFS= read -r member; do
         case "\$member" in
-            ./|./usr/|./usr/sbin/|./usr/sbin/aksusbd|./usr/sbin/aksusbd_x86_64|./usr/sbin/hasplmd|./usr/sbin/hasplmd_x86_64|./usr/share/|./usr/share/doc/|./usr/share/doc/aksusbd/|./usr/share/doc/aksusbd/copyright|./var/|./var/hasplm/|./var/hasplm/init/|./var/hasplm/init/aksusbd.rc|./var/hasplm/init/aksusbd.service|./var/hasplm/init/aksusbd_x86_64.service|./var/hasplm/init/hasplmd.service|./var/hasplm/init/hasplmd_x86_64.service|./etc/|./etc/udev/|./etc/udev/rules.d/|./etc/udev/rules.d/80-hasp.rules|./etc/hasplm/|./etc/hasplm/templates/|./etc/hasplm/templates/*.alp|./etc/hasplm/help/|./etc/hasplm/help/*) ;;
+            ./|./usr/|./usr/sbin/|./usr/sbin/aksusbd|./usr/sbin/aksusbd_x86_64|./usr/sbin/hasplmd|./usr/sbin/hasplmd_x86_64|./usr/share/|./usr/share/doc/|./usr/share/doc/aksusbd/|./usr/share/doc/aksusbd/copyright|./var/|./var/hasplm/|./var/hasplm/init/|./var/hasplm/init/aksusbd.rc|./var/hasplm/init/aksusbd.service|./var/hasplm/init/aksusbd_x86_64.service|./var/hasplm/init/hasplmd.service|./var/hasplm/init/hasplmd_x86_64.service|./etc/|./etc/udev/|./etc/udev/rules.d/|./etc/udev/rules.d/80-haspopup|./etc/hasplm/|./etc/hasplm/templates/|./etc/hasplm/templates/*.alp|./etc/hasplm/help/|./etc/hasplm/help/*) ;;
             *) return 1 ;;
         esac
         case "\$member" in /*|*'..'*|*[[:cntrl:]]*) return 1 ;; esac
@@ -6309,7 +6462,7 @@ arch_kit_extract_allowlisted_sentinel_payload() {
         ./usr/sbin/aksusbd ./usr/sbin/aksusbd_x86_64 ./usr/sbin/hasplmd ./usr/sbin/hasplmd_x86_64 \
         ./var/hasplm/init/aksusbd.service ./var/hasplm/init/aksusbd_x86_64.service \
         ./var/hasplm/init/hasplmd.service ./var/hasplm/init/hasplmd_x86_64.service \
-        ./etc/udev/rules.d/80-hasp.rules ./etc/hasplm/templates
+        ./etc/udev/rules.d/80-haspopup ./etc/hasplm/templates
     find "\$payload" \( -type l -o -type b -o -type c -o -type p -o -type s \) -print -quit | grep -q . && return 1
 }
 
@@ -6330,7 +6483,7 @@ arch_kit_install_vendor_sentinel_payload() {
         install -D -o root -g root -m 0644 "\$unit" "\$HASP_CONFIG_DIR/templates/\${unit##*/}"
     done < <(find "\$payload/etc/hasplm/templates" -type f -print0)
     arch_kit_backup_if_present "\$HASP_UDEV_RULE"
-    install -o root -g root -m 0644 "\$payload/etc/udev/rules.d/80-hasp.rules" "\$HASP_UDEV_RULE"
+    install -o root -g root -m 0644 "\$payload/etc/udev/rules.d/80-haspopup" "\$HASP_UDEV_RULE"
     suffix="\$(arch_kit_selected_sentinel_suffix)"
     for unit in aksusbd hasplmd; do
         arch_kit_backup_if_present "\$HASP_SYSTEMD_DIR/\$unit.service"
@@ -6354,7 +6507,7 @@ arch_kit_verify_sentinel() {
     ldd "\$HASP_SBIN_DIR/aksusbd_x86_64" "\$HASP_SBIN_DIR/hasplmd_x86_64" >/dev/null 2>&1 || return 1
     ldd "\$HASP_SBIN_DIR/aksusbd_x86_64" "\$HASP_SBIN_DIR/hasplmd_x86_64" 2>/dev/null | grep -Fq 'not found' && return 1
     suffix="\$(arch_kit_selected_sentinel_suffix)"
-    arch_kit_vendor_member_matches ./etc/udev/rules.d/80-hasp.rules "\$HASP_UDEV_RULE" || return 1
+    arch_kit_vendor_member_matches ./etc/udev/rules.d/80-haspopup "\$HASP_UDEV_RULE" || return 1
     cmp -s "\$HASP_INIT_DIR/aksusbd\$suffix.service" "\$HASP_SYSTEMD_DIR/aksusbd.service" || return 1
     cmp -s "\$HASP_INIT_DIR/hasplmd\$suffix.service" "\$HASP_SYSTEMD_DIR/hasplmd.service" || return 1
     [ "\$(systemctl show aksusbd.service -p LoadState --value 2>/dev/null)" = loaded ] || return 1
@@ -6373,6 +6526,7 @@ install_arch_sentinel_runtime() {
     arch_kit_install_vendor_sentinel_payload "\$work" || { log "Arch KIT blocker: Sentinel runtime payload installation failed."; return 1; }
     arch_kit_backup_if_present "\$HASP_CONFIG_DIR/hasplm.ini"
     install -o root -g root -m 0644 "\$config_source" "\$HASP_CONFIG_DIR/hasplm.ini"
+    udevadm control --reload-rules
     systemctl daemon-reload
     systemctl enable aksusbd.service hasplmd.service
     systemctl restart aksusbd.service hasplmd.service
@@ -6391,7 +6545,7 @@ arch_kit_verify_local_preflight() {
     [ -f "\$ARCH_KIT_COMPAT_DIR/dpkg-query" ] && [ ! -L "\$ARCH_KIT_COMPAT_DIR/dpkg-query" ] && [ -x "\$ARCH_KIT_COMPAT_DIR/dpkg-query" ] || return 1
     [ -r "\$kit_dir/KIT" ] && [ -r "\$kit_dir/KIT.sh" ] || return 1
     for package in libgtk-3-0 libgl1 libglu1-mesa libx11-6 libxext6 libxrender1 libxrandr2 libpango-1.0-0 libpangocairo-1.0-0 libcairo2 libpng16-16 libnotify4 libsm6 libexpat1 libstdc++6 libglib2.0-0 libpcre2-32-0 libglibmm-2.4-1 libcpprest2.10 libudev1 libxml++2.6-2v5 gedit cifs-utils winbind libjpeg62-turbo libtiff6 aksusbd; do
-        DR_KIT_RUNTIME_DIR="\$kit_dir" DR_KIT_CPPREST_LIBRARY_PATH="\${DR_KIT_CPPREST_LIBRARY_PATH:-}" DR_KIT_HASP_CONFIG_DIR="\$HASP_CONFIG_DIR" DR_KIT_HASP_UDEV_RULE="\$HASP_UDEV_RULE" DR_KIT_HASP_SBIN_DIR="\$HASP_SBIN_DIR" DR_KIT_HASP_SYSTEMD_DIR="\$HASP_SYSTEMD_DIR" "\$ARCH_KIT_COMPAT_DIR/dpkg-query" -W '-f=\${Status}' "\$package" >/dev/null || return 1
+        DR_KIT_RUNTIME_DIR="\$kit_dir" DR_KIT_CPPREST_LIBRARY_PATH="\$CPPREST_LIBRARY_PATH" DR_KIT_HASP_CONFIG_DIR="\$HASP_CONFIG_DIR" DR_KIT_HASP_UDEV_RULE="\$HASP_UDEV_RULE" DR_KIT_HASP_SBIN_DIR="\$HASP_SBIN_DIR" DR_KIT_HASP_SYSTEMD_DIR="\$HASP_SYSTEMD_DIR" "\$ARCH_KIT_COMPAT_DIR/dpkg-query" -W '-f=\${Status}' "\$package" >/dev/null || return 1
     done
 }
 
@@ -6399,6 +6553,7 @@ install_kit_arch() {
     [ -n "\${OFFICE_CODE:-}" ] || { log "No office code is available for Arch KIT installation."; return 1; }
     if state_has "KIT_INSTALL_COMPLETE"; then
         log "Arch KIT installation marker exists; validating current native runtime before reusing it."
+        install_arch_private_cpprest || { log "Arch private cpprest runtime is no longer valid; marker is not trusted."; return 1; }
         install_arch_kit_compatibility_adapter
         arch_kit_verify_native_dependencies || { log "Arch KIT runtime dependencies are no longer valid; marker is not trusted."; return 1; }
         arch_kit_verify_sentinel || { log "Arch Sentinel runtime is no longer valid; marker is not trusted."; return 1; }
@@ -6406,6 +6561,7 @@ install_kit_arch() {
         log "Existing Arch KIT installation remains valid; no package or Sentinel reinstall was performed."
         return 0
     fi
+    install_arch_private_cpprest || return 1
     arch_kit_install_native_dependencies || return 1
     install_arch_sentinel_runtime || return 1
     install_arch_kit_compatibility_adapter
@@ -6507,7 +6663,8 @@ cd "$KIT_DIR" || exit 1
 #   sudo bash ./KIT.sh
 if [ -n "${ARCH_KIT_COMPAT_DIR:-}" ]; then
     validate_arch_kit_runtime || exit 1
-    PATH="$ARCH_KIT_COMPAT_DIR:$PATH" bash "$KIT_SCRIPT"
+    prepare_arch_kit_runtime_wrapper || exit 1
+    PATH="$ARCH_KIT_COMPAT_DIR:$PATH" LD_LIBRARY_PATH="$ARCH_KIT_CPPREST_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" bash "$ARCH_KIT_RUNTIME_WRAPPER"
 else
     bash "$KIT_SCRIPT"
 fi
@@ -6622,7 +6779,8 @@ cd "\$KIT_DIR" || exit 1
 #   sudo bash ./KIT.sh
 if [ -n "\${ARCH_KIT_COMPAT_DIR:-}" ]; then
     validate_arch_kit_runtime || exit 1
-    PATH="\$ARCH_KIT_COMPAT_DIR:\$PATH" bash "\$KIT_SCRIPT"
+    prepare_arch_kit_runtime_wrapper || exit 1
+    PATH="\$ARCH_KIT_COMPAT_DIR:\$PATH" LD_LIBRARY_PATH="\$ARCH_KIT_CPPREST_LIB_DIR\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" bash "\$ARCH_KIT_RUNTIME_WRAPPER"
 else
     bash "\$KIT_SCRIPT"
 fi

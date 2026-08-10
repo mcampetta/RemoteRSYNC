@@ -2297,15 +2297,25 @@ test_arch_sentinel_deb_adapter() {
     fake_bin="$case_dir/bin"
     mkdir -p "$fake_bin" "$case_dir/runtime" "$case_dir/hasplm" "$case_dir/sbin" "$case_dir/systemd" "$case_dir/udev"
 
-    post_support="$(DR_JOIN_STATE_DIR="$case_dir/state" DR_KIT_ARCH_COMPAT_DIR="$case_dir/compat" DR_HASP_SOURCE_DIR="$case_dir/hasp" DR_HASP_DEB_PATH="$case_dir/aksusbd_10.21-1_amd64.deb" DR_HASP_CONFIG_DIR="$case_dir/hasplm" DR_HASP_UDEV_RULE="$case_dir/udev/80-hasp.rules" DR_HASP_SBIN_DIR="$case_dir/sbin" DR_HASP_INIT_DIR="$case_dir/init" DR_HASP_SYSTEMD_DIR="$case_dir/systemd" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; render_arch_kit_post_mount_support")"
-    launcher_support="$(DR_JOIN_STATE_DIR="$case_dir/state" DR_KIT_ARCH_COMPAT_DIR="$case_dir/compat" DR_HASP_CONFIG_DIR="$case_dir/hasplm" DR_HASP_UDEV_RULE="$case_dir/udev/80-hasp.rules" DR_HASP_SBIN_DIR="$case_dir/sbin" DR_HASP_SYSTEMD_DIR="$case_dir/systemd" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; render_arch_kit_launcher_support")"
+    post_support="$(DR_JOIN_STATE_DIR="$case_dir/state" DR_KIT_ARCH_COMPAT_DIR="$case_dir/compat" DR_HASP_SOURCE_DIR="$case_dir/hasp" DR_HASP_DEB_PATH="$case_dir/aksusbd_10.21-1_amd64.deb" DR_HASP_CONFIG_DIR="$case_dir/hasplm" DR_HASP_UDEV_RULE="$case_dir/udev/80-haspopup" DR_HASP_SBIN_DIR="$case_dir/sbin" DR_HASP_INIT_DIR="$case_dir/init" DR_HASP_SYSTEMD_DIR="$case_dir/systemd" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; render_arch_kit_post_mount_support")"
+    launcher_support="$(DR_JOIN_STATE_DIR="$case_dir/state" DR_KIT_ARCH_COMPAT_DIR="$case_dir/compat" DR_HASP_CONFIG_DIR="$case_dir/hasplm" DR_HASP_UDEV_RULE="$case_dir/udev/80-haspopup" DR_HASP_SBIN_DIR="$case_dir/sbin" DR_HASP_SYSTEMD_DIR="$case_dir/systemd" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; render_arch_kit_launcher_support")"
     printf '%s\n' "$post_support" > "$case_dir/post-support.sh"
     printf '%s\n' "$launcher_support" > "$case_dir/launcher-support.sh"
     bash -n "$case_dir/post-support.sh" || fail "generated Arch Sentinel .deb adapter syntax"
     bash -n "$case_dir/launcher-support.sh" || fail "generated Arch Sentinel launcher support syntax"
     pass "generated Arch Sentinel .deb adapter has valid shell syntax"
 
-    for token in 'ar t' 'debian-binary' 'control.tar.gz' 'data.tar.gz' '"$package" = aksusbd' '"$version" = 10.21-1' '"$architecture" = amd64' '80-hasp.rules' 'aksusbd_x86_64.service' 'hasplmd_x86_64.service' 'systemctl enable aksusbd.service hasplmd.service' 'systemctl restart aksusbd.service hasplmd.service'; do
+    for token in 'a100a5feac0d96b86c423bf0c11f8f8a3a8b7d05243edce2484a993ade9f5bbd' 'libcpprest2.10_2.10.19-2build2_amd64.deb' 'control.tar.zst' 'data.tar.zst' '"$package" = libcpprest2.10' '"$version" = 2.10.19-2build2' '"$architecture" = amd64' './usr/lib/x86_64-linux-gnu/libcpprest.so.2.10' 'tar --zstd -xf' 'LD_LIBRARY_PATH="$(dirname "$CPPREST_LIBRARY_PATH")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ldd -r' 'udevadm control --reload-rules'; do
+        assert_contains "$post_support" "$token" "Arch cpprest/Sentinel adapter contains required contract: $token"
+    done
+    assert_contains "$launcher_support" 'prepare_arch_kit_runtime_wrapper' "Arch launcher prepares a private local KIT wrapper"
+    assert_contains "$launcher_support" 'print "export LD_LIBRARY_PATH=\"$SCRIPT_DIR:' "private KIT wrapper retains cpprest before Tool Server paths"
+    if printf '%s\n' "$post_support" | grep -Eq '(^|[[:space:]])(dpkg|apt|apt-get|debtap|yay|paru|make|cmake)([[:space:]]|$)'; then
+        fail "Arch cpprest adapter must not use package-manager, AUR, or source-build tooling"
+    fi
+    pass "Arch cpprest runtime remains a pinned private payload without global package tooling"
+
+    for token in 'ar t' 'debian-binary' 'control.tar.gz' 'data.tar.gz' '"$package" = aksusbd' '"$version" = 10.21-1' '"$architecture" = amd64' '80-haspopup' 'aksusbd_x86_64.service' 'hasplmd_x86_64.service' 'udevadm control --reload-rules' 'systemctl enable aksusbd.service hasplmd.service' 'systemctl restart aksusbd.service hasplmd.service'; do
         assert_contains "$post_support" "$token" "Arch Sentinel adapter contains approved .deb contract: $token"
     done
     assert_contains "$post_support" './etc/hasplm/help/*' "Sentinel documentation is recognized but excluded from the extraction list"
@@ -2347,7 +2357,7 @@ exit 0
 EOF
     chmod 755 "$fake_bin"/*
     : > "$case_dir/hasplm/hasplm.ini"
-    : > "$case_dir/udev/80-hasp.rules"
+    : > "$case_dir/udev/80-haspopup"
     : > "$case_dir/systemd/aksusbd.service"
     : > "$case_dir/systemd/hasplmd.service"
     for file in aksusbd aksusbd_x86_64 hasplmd hasplmd_x86_64; do
@@ -2371,10 +2381,10 @@ EOF
     set -e
     [ "$rc" -ne 0 ] || fail "unsupported compatibility-shim arguments must fail closed"
     pass "compatibility shim remains limited to KIT.sh read-only query form"
-    output="$(PATH="$fake_bin:$PATH" DR_KIT_HASP_CONFIG_DIR="$case_dir/hasplm" DR_KIT_HASP_UDEV_RULE="$case_dir/udev/80-hasp.rules" DR_KIT_HASP_SBIN_DIR="$case_dir/sbin" DR_KIT_HASP_SYSTEMD_DIR="$case_dir/systemd" "$case_dir/dpkg-query" -W '-f=${Status}' aksusbd)"
+    output="$(PATH="$fake_bin:$PATH" DR_KIT_HASP_CONFIG_DIR="$case_dir/hasplm" DR_KIT_HASP_UDEV_RULE="$case_dir/udev/80-haspopup" DR_KIT_HASP_SBIN_DIR="$case_dir/sbin" DR_KIT_HASP_SYSTEMD_DIR="$case_dir/systemd" "$case_dir/dpkg-query" -W '-f=${Status}' aksusbd)"
     assert_eq 'install ok installed' "$output" "Sentinel shim requires vendor runtime files, units, udev rule, and both services"
     set +e
-    PATH="$fake_bin:$PATH" SYSTEMCTL_INACTIVE_UNIT=hasplmd.service DR_KIT_HASP_CONFIG_DIR="$case_dir/hasplm" DR_KIT_HASP_UDEV_RULE="$case_dir/udev/80-hasp.rules" DR_KIT_HASP_SBIN_DIR="$case_dir/sbin" DR_KIT_HASP_SYSTEMD_DIR="$case_dir/systemd" "$case_dir/dpkg-query" -W '-f=${Status}' aksusbd >/dev/null 2>&1
+    PATH="$fake_bin:$PATH" SYSTEMCTL_INACTIVE_UNIT=hasplmd.service DR_KIT_HASP_CONFIG_DIR="$case_dir/hasplm" DR_KIT_HASP_UDEV_RULE="$case_dir/udev/80-haspopup" DR_KIT_HASP_SBIN_DIR="$case_dir/sbin" DR_KIT_HASP_SYSTEMD_DIR="$case_dir/systemd" "$case_dir/dpkg-query" -W '-f=${Status}' aksusbd >/dev/null 2>&1
     rc=$?
     set -e
     [ "$rc" -ne 0 ] || fail "inactive hasplmd must fail the Sentinel runtime predicate"
@@ -2385,6 +2395,55 @@ EOF
     set -e
     [ "$rc" -ne 0 ] || fail "cpprest must remain fail-closed"
     pass "cpprest remains fail-closed in the refined Arch adapter"
+
+    mkdir -p "$case_dir/cpprest-bin"
+    cat > "$case_dir/cpprest-bin/sha256sum" <<'EOF'
+#!/bin/bash
+printf '%s  %s\n' "${CPPREST_HASH:-a100a5feac0d96b86c423bf0c11f8f8a3a8b7d05243edce2484a993ade9f5bbd}" "$1"
+EOF
+    cat > "$case_dir/cpprest-bin/ar" <<'EOF'
+#!/bin/bash
+if [ "${1:-}" = t ]; then printf '%s\n' ${CPPREST_AR_MEMBERS:-debian-binary control.tar.zst data.tar.zst}; exit 0; fi
+if [ "${1:-}" = p ]; then
+    case "${3:-}" in debian-binary) printf '2.0\n' ;; control.tar.zst) printf CONTROL ;; data.tar.zst) printf DATA ;; *) exit 1 ;; esac
+    exit 0
+fi
+exit 1
+EOF
+    cat > "$case_dir/cpprest-bin/tar" <<'EOF'
+#!/bin/bash
+case "$*" in
+    *'./control'*) printf '%s\n' "${CPPREST_CONTROL:-Package: libcpprest2.10
+Version: 2.10.19-2build2
+Architecture: amd64}" ;;
+    *' -tf -'*) printf '%s\n' ${CPPREST_MEMBERS:-./ ./usr/ ./usr/lib/ ./usr/lib/x86_64-linux-gnu/ ./usr/lib/x86_64-linux-gnu/libcpprest.so.2.10} ;;
+    *' -tvf -'*) printf '%s\n' "${CPPREST_TYPES:--rw-r--r-- root/root 1 2026-01-01 ./usr/lib/x86_64-linux-gnu/libcpprest.so.2.10}" ;;
+    *) exit 0 ;;
+esac
+EOF
+    chmod 755 "$case_dir/cpprest-bin"/*
+    : > "$case_dir/libcpprest2.10_2.10.19-2build2_amd64.deb"
+    PATH="$case_dir/cpprest-bin:$PATH" bash -c "source '$case_dir/post-support.sh'; arch_kit_validate_cpprest_deb '$case_dir/libcpprest2.10_2.10.19-2build2_amd64.deb'" || fail "pinned cpprest .deb fixture validates"
+    pass "pinned cpprest SHA, metadata, Debian format, and allowlisted payload validate"
+    for bad_case in hash metadata path member_type; do
+        case "$bad_case" in
+            hash) env_spec="CPPREST_HASH=bad" ;;
+            metadata) env_spec="CPPREST_CONTROL=Package:_wrong" ;;
+            path) env_spec="CPPREST_MEMBERS=../escape" ;;
+            member_type) env_spec="CPPREST_TYPES=lrwxrwxrwx_root/root_1_2026-01-01_./usr/lib/x86_64-linux-gnu/libcpprest.so.2.10" ;;
+        esac
+        set +e
+        env PATH="$case_dir/cpprest-bin:$PATH" $env_spec bash -c "source '$case_dir/post-support.sh'; arch_kit_validate_cpprest_deb '$case_dir/libcpprest2.10_2.10.19-2build2_amd64.deb'" >/dev/null 2>&1
+        rc=$?
+        set -e
+        [ "$rc" -ne 0 ] || fail "unsafe cpprest $bad_case fixture must fail closed"
+        pass "unsafe cpprest $bad_case fixture is rejected"
+    done
+    assert_contains "$post_support" 'install -D -o root -g root -m 0644 "$source" "$CPPREST_DEFAULT_LIBRARY"' "only cpprest SONAME is installed privately root-owned"
+    if printf '%s\n' "$post_support" | grep -Fq 'install -D -o root -g root -m 0644 "$source" "/usr/lib'; then
+        fail "cpprest must not be installed globally under /usr/lib"
+    fi
+    pass "cpprest payload never installs a global Ubuntu library"
 
     cat > "$fake_bin/ar" << 'EOF'
 #!/bin/bash
@@ -2401,7 +2460,7 @@ case "$*" in
     *'./control'*) printf '%s\n' "${DEB_CONTROL:-Package: aksusbd
 Version: 10.21-1
 Architecture: amd64}" ;;
-    *'-tzf -'*) printf '%s\n' ${DEB_MEMBERS:-./ ./usr/ ./usr/sbin/ ./usr/sbin/aksusbd ./usr/sbin/aksusbd_x86_64 ./usr/sbin/hasplmd ./usr/sbin/hasplmd_x86_64 ./var/ ./var/hasplm/ ./var/hasplm/init/ ./var/hasplm/init/aksusbd.service ./var/hasplm/init/aksusbd_x86_64.service ./var/hasplm/init/hasplmd.service ./var/hasplm/init/hasplmd_x86_64.service ./etc/ ./etc/udev/ ./etc/udev/rules.d/ ./etc/udev/rules.d/80-hasp.rules ./etc/hasplm/ ./etc/hasplm/templates/ ./etc/hasplm/templates/en.21.0.alp ./etc/hasplm/help/ ./etc/hasplm/help/en/readme.htm} ;;
+    *'-tzf -'*) printf '%s\n' ${DEB_MEMBERS:-./ ./usr/ ./usr/sbin/ ./usr/sbin/aksusbd ./usr/sbin/aksusbd_x86_64 ./usr/sbin/hasplmd ./usr/sbin/hasplmd_x86_64 ./var/ ./var/hasplm/ ./var/hasplm/init/ ./var/hasplm/init/aksusbd.service ./var/hasplm/init/aksusbd_x86_64.service ./var/hasplm/init/hasplmd.service ./var/hasplm/init/hasplmd_x86_64.service ./etc/ ./etc/udev/ ./etc/udev/rules.d/ ./etc/udev/rules.d/80-haspopup ./etc/hasplm/ ./etc/hasplm/templates/ ./etc/hasplm/templates/en.21.0.alp ./etc/hasplm/help/ ./etc/hasplm/help/en/readme.htm} ;;
     *'-tvzf -'*) printf '%s\n' "${DEB_TYPES:--rw-r--r-- root/root 1 2025-01-01 ./usr/sbin/aksusbd}" ;;
     *) exit 0 ;;
 esac
@@ -2435,23 +2494,30 @@ EOF
     pass "Sentinel office configuration and x86_64 service-selection rules are explicit"
 
     set +e
-    output="$(bash -c "source '$case_dir/post-support.sh'; OFFICE_CODE=EP1; log(){ printf '%s' \"\$*\"; }; state_has(){ return 0; }; install_arch_kit_compatibility_adapter(){ :; }; arch_kit_verify_native_dependencies(){ return 1; }; arch_kit_verify_sentinel(){ echo unexpected >&2; return 0; }; arch_kit_verify_local_preflight(){ return 0; }; install_kit_arch" 2>&1)"
+    output="$(bash -c "source '$case_dir/post-support.sh'; OFFICE_CODE=EP1; log(){ printf '%s' \"\$*\"; }; state_has(){ return 0; }; install_arch_private_cpprest(){ return 0; }; install_arch_kit_compatibility_adapter(){ :; }; arch_kit_verify_native_dependencies(){ return 1; }; arch_kit_verify_sentinel(){ echo unexpected >&2; return 0; }; arch_kit_verify_local_preflight(){ return 0; }; install_kit_arch" 2>&1)"
     rc=$?
     set -e
     [ "$rc" -ne 0 ] || fail "stale KIT_INSTALL_COMPLETE must not bypass current validation"
     assert_contains "$output" 'marker is not trusted' "stale KIT marker reports its failed revalidation"
     pass "stale KIT_INSTALL_COMPLETE does not permit a bypass"
-    output="$(bash -c "source '$case_dir/post-support.sh'; OFFICE_CODE=EP1; log(){ :; }; state_has(){ return 0; }; install_arch_kit_compatibility_adapter(){ :; }; arch_kit_verify_native_dependencies(){ return 0; }; arch_kit_verify_sentinel(){ return 0; }; arch_kit_verify_local_preflight(){ return 0; }; install_arch_sentinel_runtime(){ echo reinstall; return 1; }; install_kit_arch")"
-    assert_eq '' "$output" "valid completed Arch rerun does not reinstall Sentinel"
+    set +e
+    output="$(bash -c "source '$case_dir/post-support.sh'; OFFICE_CODE=EP1; log(){ printf '%s' \"\$*\"; }; state_has(){ return 0; }; install_arch_private_cpprest(){ return 1; }; install_arch_kit_compatibility_adapter(){ echo unexpected >&2; }; install_kit_arch" 2>&1)"
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "stale KIT_INSTALL_COMPLETE must not bypass missing private cpprest"
+    assert_contains "$output" 'private cpprest runtime is no longer valid; marker is not trusted' "stale KIT marker reports missing private cpprest"
+    pass "stale KIT_INSTALL_COMPLETE cannot hide a missing private cpprest runtime"
+    output="$(bash -c "source '$case_dir/post-support.sh'; OFFICE_CODE=EP1; log(){ :; }; state_has(){ return 0; }; install_arch_private_cpprest(){ echo cpprest-validated; return 0; }; install_arch_kit_compatibility_adapter(){ :; }; arch_kit_verify_native_dependencies(){ return 0; }; arch_kit_verify_sentinel(){ return 0; }; arch_kit_verify_local_preflight(){ return 0; }; install_arch_sentinel_runtime(){ echo reinstall; return 1; }; install_kit_arch")"
+    assert_eq 'cpprest-validated' "$output" "valid completed Arch rerun validates cpprest without reinstalling Sentinel"
     pass "valid completed Arch rerun is idempotent after full revalidation"
     set +e
-    output="$(bash -c "source '$case_dir/post-support.sh'; OFFICE_CODE=EP1; log(){ :; }; state_has(){ return 1; }; state_mark(){ echo marked; }; arch_kit_install_native_dependencies(){ return 0; }; install_arch_sentinel_runtime(){ return 1; }; install_arch_kit_compatibility_adapter(){ echo unexpected >&2; }; arch_kit_verify_native_dependencies(){ return 0; }; arch_kit_verify_sentinel(){ return 0; }; arch_kit_verify_local_preflight(){ return 0; }; install_kit_arch" 2>&1)"
+    output="$(bash -c "source '$case_dir/post-support.sh'; OFFICE_CODE=EP1; log(){ :; }; state_has(){ return 1; }; state_mark(){ echo marked; }; install_arch_private_cpprest(){ return 0; }; arch_kit_install_native_dependencies(){ return 0; }; install_arch_sentinel_runtime(){ return 1; }; install_arch_kit_compatibility_adapter(){ echo unexpected >&2; }; arch_kit_verify_native_dependencies(){ return 0; }; arch_kit_verify_sentinel(){ return 0; }; arch_kit_verify_local_preflight(){ return 0; }; install_kit_arch" 2>&1)"
     rc=$?
     set -e
     [ "$rc" -ne 0 ] || fail "failed Sentinel deployment must stop initial Arch KIT installation"
     [[ "$output" != *marked* ]] || fail "failed Sentinel deployment must leave KIT_INSTALL_COMPLETE absent"
     pass "failed Sentinel deployment cannot create KIT_INSTALL_COMPLETE"
-    assert_contains "$(<"$SCRIPT")" 'PATH="$ARCH_KIT_COMPAT_DIR:$PATH" bash "$KIT_SCRIPT"' "Arch compatibility PATH remains scoped to the KIT child"
+    assert_contains "$(<"$SCRIPT")" 'PATH="$ARCH_KIT_COMPAT_DIR:$PATH" LD_LIBRARY_PATH="$ARCH_KIT_CPPREST_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" bash "$ARCH_KIT_RUNTIME_WRAPPER"' "Arch compatibility PATH and private cpprest remain scoped to the KIT child"
     pass "Debian remains isolated and shared Tool Server scripts remain render-only inputs"
 }
 
