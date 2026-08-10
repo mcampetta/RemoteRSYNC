@@ -382,6 +382,12 @@ EOF
     cat > "$fake_bin/ldapsearch" << 'EOF'
 #!/bin/bash
 candidate=""
+for ((index = 1; index <= $#; index++)); do
+    if [ "${!index}" = -H ]; then
+        next_index=$((index + 1))
+        printf '%s\n' "${!next_index}" >> "${LDAP_QUERY_LOG:?}"
+    fi
+done
 for arg in "$@"; do
     if [[ "$arg" == *sAMAccountName=* ]]; then
         candidate="${arg#*sAMAccountName=}"
@@ -394,6 +400,10 @@ count=0
 if [ -f "$counter_file" ]; then count="$(<"$counter_file")"; fi
 count=$((count + 1))
 printf '%s\n' "$count" > "$counter_file"
+if [ "${LDAP_FAIL_FINAL:-0}" = 1 ] && [ "$candidate" = EP-CR-KIT-05 ] && [ "$count" -ge 2 ]; then
+    printf 'simulated pinned DC became unreachable\n' >&2
+    exit 1
+fi
 if [[ " ${AD_OCCUPIED:-} " == *" $candidate "* ]] || { [ "$candidate" = "${RACE_HOST:-}" ] && [ "$count" -ge 2 ]; }; then
     printf 'dn: CN=%s,OU=Computers,DC=dr,DC=kodr,DC=local\nsAMAccountName: %s$\ndNSHostName: %s.dr.kodr.local\ndescription: Existing fixture object\nwhenCreated: 20260706160422.0Z\n' "$candidate" "$candidate" "${candidate,,}"
 fi
@@ -420,11 +430,47 @@ exit 0
 EOF
     cat > "$fake_bin/net" << 'EOF'
 #!/bin/bash
+if [[ "$*" == *"ads info"* ]]; then
+    printf '%s\n' \
+        'LDAP server: 10.25.1.121' \
+        'LDAP server name: US1P1OINFMAD004.dr.kodr.local' \
+        'Realm: DR.KODR.LOCAL' \
+        'LDAP port: 389' \
+        'KDC server: 10.25.1.121'
+    exit 0
+fi
+if [[ "$*" == *"ads lookup"* ]]; then
+    if [ "${NET_DC_MODE:-good}" = unusable ]; then
+        printf '%s\n' \
+            'Domain Controller: US1P1OINFMAD004.dr.kodr.local' \
+            'Server Site Name: EP' \
+            'Client Site Name: EP' \
+            'Is the closest DC: yes' \
+            'Is writable: no' \
+            'Is an LDAP server: yes'
+    else
+        printf '%s\n' \
+            'Domain Controller: US1P1OINFMAD004.dr.kodr.local' \
+            'Server Site Name: EP' \
+            'Client Site Name: EP' \
+            'Is the closest DC: yes' \
+            'Is writable: yes' \
+            'Is an LDAP server: yes'
+    fi
+    exit 0
+fi
 if [[ "$*" == *"ads join"* ]]; then
     printf '%s\n' "$*" >> "${NET_JOIN_LOG:?}"
     exit 0
 fi
-if [[ "$*" == *"ads testjoin"* ]]; then exit 1; fi
+if [[ "$*" == *"ads keytab create"* ]]; then
+    : > "${FAKE_KEYTAB:?}"
+    exit 0
+fi
+if [[ "$*" == *"ads testjoin"* ]]; then
+    [ "${NET_TESTJOIN_OK:-0}" = 1 ]
+    exit $?
+fi
 exit 0
 EOF
     chmod 755 "$fake_bin"/*
@@ -433,6 +479,10 @@ EOF
     DR_JOIN_STATE_DIR="$TMP_DIR/admin-render" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; OFFICE_CODE=EP1; render_arch_domain_admin_join_helper" > "$helper"
     chmod 755 "$helper"
     bash -n "$helper" || fail "generated Arch admin helper syntax"
+    if grep -Eq 'discover_ldap_dcs|_ldap[.]_tcp|dig[[:space:]]|host[[:space:]]+-t[[:space:]]+SRV' "$helper"; then
+        fail "Arch admin helper must not enumerate global LDAP SRV records"
+    fi
+    pass "Arch admin helper uses Samba site-aware DC selection instead of global LDAP SRV enumeration"
 
     for case_name in contiguous sparse; do
         case_dir="$TMP_DIR/hostname-$case_name"
@@ -448,7 +498,7 @@ EOF
             race_host='EP-CR-KIT-03'
         fi
         set +e
-        output="$(printf 'admin\n' | PATH="$fake_bin:$PATH" FAKE_HOSTNAME=ep-cr-kit-01 HOSTNAMECTL_LOG="$case_dir/hostname.log" NET_JOIN_LOG="$case_dir/join.log" LDAP_COUNTER_DIR="$case_dir/counters" AD_OCCUPIED="$occupied" RACE_HOST="$race_host" DR_ADMIN_STATE_DIR="$case_dir/state" DR_ADMIN_HOSTS_FILE="$case_dir/hosts" DR_ADMIN_SMB_CONF="$case_dir/smb.conf" DR_ADMIN_KEYTAB="$case_dir/krb5.keytab" DR_ADMIN_SECRETS_TDB="$case_dir/secrets.tdb" "$helper" 2>&1)"
+        output="$(printf 'admin\n' | PATH="$fake_bin:$PATH" FAKE_HOSTNAME=ep-cr-kit-01 HOSTNAMECTL_LOG="$case_dir/hostname.log" NET_JOIN_LOG="$case_dir/join.log" LDAP_COUNTER_DIR="$case_dir/counters" LDAP_QUERY_LOG="$case_dir/ldap.log" AD_OCCUPIED="$occupied" RACE_HOST="$race_host" DR_ADMIN_STATE_DIR="$case_dir/state" DR_ADMIN_HOSTS_FILE="$case_dir/hosts" DR_ADMIN_SMB_CONF="$case_dir/smb.conf" DR_ADMIN_KEYTAB="$case_dir/krb5.keytab" DR_ADMIN_SECRETS_TDB="$case_dir/secrets.tdb" "$helper" 2>&1)"
         rc=$?
         set -e
         [ "$rc" -ne 0 ] || fail "$case_name hostname race must block the join"
@@ -457,6 +507,51 @@ EOF
         assert_contains "$output" 'No domain join was attempted' "$case_name final collision gate blocks safely"
         pass "$case_name sparse/contiguous AD allocation race is fail-closed"
     done
+
+    case_dir="$TMP_DIR/hostname-pinned-success"
+    mkdir -p "$case_dir/counters"
+    printf '127.0.1.1 ep-cr-kit-01\n' > "$case_dir/hosts"
+    : > "$case_dir/smb.conf" "$case_dir/join.log" "$case_dir/ldap.log"
+    set +e
+    output="$(printf 'admin\n' | PATH="$fake_bin:$PATH" FAKE_HOSTNAME=ep-cr-kit-01 HOSTNAMECTL_LOG="$case_dir/hostname.log" NET_JOIN_LOG="$case_dir/join.log" LDAP_COUNTER_DIR="$case_dir/counters" LDAP_QUERY_LOG="$case_dir/ldap.log" FAKE_KEYTAB="$case_dir/krb5.keytab" AD_OCCUPIED='EP-CR-KIT-01 EP-CR-KIT-02 EP-CR-KIT-03 EP-CR-KIT-04' NET_TESTJOIN_OK=1 DR_ADMIN_STATE_DIR="$case_dir/state" DR_ADMIN_HOSTS_FILE="$case_dir/hosts" DR_ADMIN_SMB_CONF="$case_dir/smb.conf" DR_ADMIN_KEYTAB="$case_dir/krb5.keytab" DR_ADMIN_SECRETS_TDB="$case_dir/secrets.tdb" "$helper" 2>&1)"
+    rc=$?
+    set -e
+    [ "$rc" -eq 0 ] || fail "pinned absent candidate should complete the fixture join"
+    assert_contains "$output" 'Pinned site-aware writable LDAP DC' "Samba site-aware DC selection is reported"
+    grep -Fq 'ldap://US1P1OINFMAD004.dr.kodr.local' "$case_dir/ldap.log" || fail "all LDAP checks use the pinned EP DC"
+    if grep -Eq 'auap1oinfmad001|caap1oinfmad001|us4p1oinfmad001' "$case_dir/ldap.log"; then
+        fail "unreachable global DCs must not be queried"
+    fi
+    grep -Fq 'ads join -S US1P1OINFMAD004.dr.kodr.local --use-kerberos=required' "$case_dir/join.log" || fail "net ads join must target the exact selected DC"
+    grep -Fq 'set-hostname ep-cr-kit-05' "$case_dir/hostname.log" || fail "occupied NEW_JOIN object must not be reused"
+    assert_contains "$output" 'ep-cr-kit-05' "pinned absent candidate proceeds to join"
+    pass "pinned writable EP DC is used for LDAP checks and net ads join"
+
+    case_dir="$TMP_DIR/hostname-pinned-final-unreachable"
+    mkdir -p "$case_dir/counters"
+    printf '127.0.1.1 ep-cr-kit-01\n' > "$case_dir/hosts"
+    : > "$case_dir/smb.conf" "$case_dir/join.log" "$case_dir/ldap.log"
+    set +e
+    output="$(printf 'admin\n' | PATH="$fake_bin:$PATH" FAKE_HOSTNAME=ep-cr-kit-01 HOSTNAMECTL_LOG="$case_dir/hostname.log" NET_JOIN_LOG="$case_dir/join.log" LDAP_COUNTER_DIR="$case_dir/counters" LDAP_QUERY_LOG="$case_dir/ldap.log" AD_OCCUPIED='EP-CR-KIT-01 EP-CR-KIT-02 EP-CR-KIT-03 EP-CR-KIT-04' LDAP_FAIL_FINAL=1 DR_ADMIN_STATE_DIR="$case_dir/state" DR_ADMIN_HOSTS_FILE="$case_dir/hosts" DR_ADMIN_SMB_CONF="$case_dir/smb.conf" DR_ADMIN_KEYTAB="$case_dir/krb5.keytab" DR_ADMIN_SECRETS_TDB="$case_dir/secrets.tdb" "$helper" 2>&1)"
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "pinned DC failure before final collision check must block"
+    [ ! -s "$case_dir/join.log" ] || fail "pinned DC failure must prevent net ads join"
+    assert_contains "$output" 'AD query on pinned DC' "pinned DC failure is explicit"
+    pass "pinned DC becoming unreachable fails closed before join"
+
+    case_dir="$TMP_DIR/hostname-no-writable-dc"
+    mkdir -p "$case_dir/counters"
+    printf '127.0.1.1 ep-cr-kit-01\n' > "$case_dir/hosts"
+    : > "$case_dir/smb.conf" "$case_dir/join.log" "$case_dir/ldap.log"
+    set +e
+    output="$(printf 'admin\n' | PATH="$fake_bin:$PATH" FAKE_HOSTNAME=ep-cr-kit-01 HOSTNAMECTL_LOG="$case_dir/hostname.log" NET_JOIN_LOG="$case_dir/join.log" LDAP_COUNTER_DIR="$case_dir/counters" LDAP_QUERY_LOG="$case_dir/ldap.log" NET_DC_MODE=unusable DR_ADMIN_STATE_DIR="$case_dir/state" DR_ADMIN_HOSTS_FILE="$case_dir/hosts" DR_ADMIN_SMB_CONF="$case_dir/smb.conf" DR_ADMIN_KEYTAB="$case_dir/krb5.keytab" DR_ADMIN_SECRETS_TDB="$case_dir/secrets.tdb" "$helper" 2>&1)"
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "no writable DC must block the helper"
+    [ ! -s "$case_dir/join.log" ] || fail "no writable DC must prevent net ads join"
+    assert_contains "$output" 'not confirmed writable' "no suitable writable DC is a hard blocker"
+    pass "absence of a suitable writable LDAP DC fails closed"
 
     case_dir="$TMP_DIR/stale-state"
     mkdir -p "$case_dir"
@@ -1602,7 +1697,7 @@ test_missing_capability() {
 test_arch_backend_and_break_glass() {
     local plan current_user output
     plan="$(DR_JOIN_STATE_DIR="$TMP_DIR/arch-plan" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_domain_join_plan")"
-    assert_contains "$plan" "net ads join --use-kerberos=required" "Arch Samba join command"
+    assert_contains "$plan" "net ads join -S PINNED_DC --use-kerberos=required" "Arch Samba join command is explicitly DC-pinned"
     assert_contains "$plan" "net ads keytab create" "Arch Samba keytab command"
     if printf '%s\n' "$plan" | grep -Eq 'realm join|adcli testjoin|autofs'; then
         fail "Arch backend plan contains a removed dependency"

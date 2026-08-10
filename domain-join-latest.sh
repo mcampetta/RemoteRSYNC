@@ -1335,7 +1335,7 @@ platform_dry_run() {
             echo "  WOULD ENABLE/RESTART time provider: $(platform_service_name time-sync)"
         fi
         echo "  WOULD ENABLE/RESTART services: sssd, $(platform_service_name ssh-server), mnt-x.automount, dr-domain-machine-password-renew.timer"
-        echo "  WOULD JOIN with Samba: kinit (interactive), net ads join --use-kerberos=required, net ads testjoin, net ads keytab create"
+        echo "  WOULD JOIN with Samba: kinit (interactive), site-aware DC pinning, net ads join -S PINNED_DC --use-kerberos=required, net ads testjoin, net ads keytab create"
     else
         echo "  WOULD CHANGE /etc/auto.master.d/*, /etc/auto.net.cifs, /usr/local/bin/*, /usr/local/sbin/*, desktop integration files"
         echo "  WOULD ENABLE/RESTART services: $(platform_service_name time-sync), sssd, winbind, autofs, $(platform_service_name ssh-server)"
@@ -2548,7 +2548,7 @@ EOF
 kdestroy
 kinit ADMIN_USER@REALM                 # human enters password at Kerberos prompt
 dr-domain-admin-join                     # authoritative AD allocation and collision gate
-net ads join --use-kerberos=required      # only after the final AD availability check
+net ads join -S PINNED_DC --use-kerberos=required  # same DC as both LDAP checks
 net ads testjoin                         # validates local machine membership
 net ads keytab create                    # materializes /etc/krb5.keytab from smb.conf
 klist -k /etc/krb5.keytab
@@ -2703,26 +2703,67 @@ domain_to_base_dn() {
     }'
 }
 
-discover_ldap_dcs() {
-    local dc_hosts=""
-    if command -v dig >/dev/null 2>&1; then
-        dc_hosts="\$(dig +short _ldap._tcp.\$DOMAIN SRV 2>/dev/null \
-            | sort -n -k1,1 -k2,2 \
-            | awk '{print \$4}' \
-            | sed 's/[.]\$//' \
-            | awk 'NF && !seen[\$0]++' || true)"
-    fi
-    if [ -z "\$dc_hosts" ] && command -v host >/dev/null 2>&1; then
-        dc_hosts="\$(host -t SRV _ldap._tcp.\$DOMAIN 2>/dev/null \
-            | awk '{print \$NF}' \
-            | sed 's/[.]\$//' \
-            | awk 'NF && !seen[\$0]++' || true)"
-    fi
-    [ -n "\$dc_hosts" ] || {
-        print_error "Unable to discover LDAP domain controllers from _ldap._tcp.\$DOMAIN."
+select_pinned_dc() {
+    local info_output lookup_output selected_dc lookup_dc
+    [ -z "\${PINNED_DC:-}" ] || {
+        print_error "The admin-join transaction already has a pinned DC: \$PINNED_DC"
         return 1
     }
-    echo "\$dc_hosts"
+
+    # Samba's resolver applies AD site awareness and chooses the closest
+    # usable server. Do not replace this with a global _ldap._tcp lookup:
+    # that record can contain unreachable worldwide DCs.
+    info_output="\$(net ads info 2>&1)" || {
+        print_error "Samba could not select a site-aware domain controller."
+        echo "\$info_output" | sed 's/^/  /' >&2
+        return 1
+    }
+    selected_dc="\$(echo "\$info_output" | awk -F: 'tolower(\$1) ~ /^[[:space:]]*ldap server name[[:space:]]*$/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", \$2); print \$2; exit}')"
+    case "\$selected_dc" in
+        *[!A-Za-z0-9.-]*|*[!A-Za-z0-9])
+            print_error "Samba returned an invalid LDAP server name: \${selected_dc:-<empty>}"
+            return 1
+            ;;
+    esac
+    [ -n "\$selected_dc" ] || {
+        print_error "Samba did not return an LDAP server FQDN."
+        return 1
+    }
+    [[ "\$selected_dc" == *.* ]] || {
+        print_error "Samba returned a non-FQDN LDAP server name: \$selected_dc"
+        return 1
+    }
+
+    # Confirm the selected server itself is the closest, writable, LDAP-capable
+    # DC. This is a single-server validation transaction; no remote/global DCs
+    # are enumerated or required to respond.
+    lookup_output="\$(net ads lookup -S "\$selected_dc" 2>&1)" || {
+        print_error "Samba could not validate selected DC \$selected_dc."
+        echo "\$lookup_output" | sed 's/^/  /' >&2
+        return 1
+    }
+    lookup_dc="\$(echo "\$lookup_output" | awk -F: 'tolower(\$1) ~ /^[[:space:]]*domain controller[[:space:]]*$/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", \$2); print \$2; exit}')"
+    [ -n "\$lookup_dc" ] && [[ "\${lookup_dc,,}" = "\${selected_dc,,}" ]] || {
+        print_error "Samba lookup did not confirm the selected DC identity: \$selected_dc"
+        return 1
+    }
+    echo "\$lookup_output" | grep -Eiq '^[[:space:]]*Is the closest DC:[[:space:]]*yes[[:space:]]*$' || {
+        print_error "Selected DC \$selected_dc is not confirmed as the closest DC."
+        return 1
+    }
+    echo "\$lookup_output" | grep -Eiq '^[[:space:]]*Is writable:[[:space:]]*yes[[:space:]]*$' || {
+        print_error "Selected DC \$selected_dc is not confirmed writable."
+        return 1
+    }
+    echo "\$lookup_output" | grep -Eiq '^[[:space:]]*Is an LDAP server:[[:space:]]*yes[[:space:]]*$' || {
+        print_error "Selected DC \$selected_dc is not confirmed as an LDAP server."
+        return 1
+    }
+
+    # Preserve Samba's exact FQDN spelling so the LDAP endpoint and the final
+    # net ads join -S argument are visibly identical in diagnostics.
+    PINNED_DC="\$selected_dc"
+    print_info "Pinned site-aware writable LDAP DC for this transaction: \$PINNED_DC"
 }
 
 ldap_search_computer_object() {
@@ -2736,34 +2777,26 @@ ldap_search_computer_object() {
 }
 
 ad_computer_exists() {
-    local candidate="\$1" sam base_dn output rc dc
-    local successful_queries=0 failed_queries=0
+    local candidate="\$1" sam base_dn output rc
+    [ -n "\${PINNED_DC:-}" ] || return 2
     sam="\$(echo "\$candidate" | tr '[:lower:]' '[:upper:]')\$"
     base_dn="\$(domain_to_base_dn)"
-
-    for dc in \$LDAP_DCS; do
-        if output="\$(ldap_search_computer_object "\$dc" "\$base_dn" "\$sam" 2>&1)"; then
-            rc=0
-        else
-            rc=\$?
-        fi
-        if [ "\$rc" -ne 0 ]; then
-            failed_queries=\$((failed_queries + 1))
-            print_error "AD query failed on \$dc while checking \$candidate"
-            echo "\$output" | sed 's/^/  /' >&2
-            continue
-        fi
-        successful_queries=\$((successful_queries + 1))
-        if echo "\$output" | grep -qi '^dn:'; then
-            print_error "Computer account \$candidate already exists in Active Directory."
-            print_error "Existing object:"
-            echo "\$output" | sed 's/^/  /' >&2
-            return 0
-        fi
-    done
-
-    [ "\$successful_queries" -gt 0 ] || return 2
-    [ "\$failed_queries" -eq 0 ] || return 2
+    if output="\$(ldap_search_computer_object "\$PINNED_DC" "\$base_dn" "\$sam" 2>&1)"; then
+        rc=0
+    else
+        rc=\$?
+    fi
+    if [ "\$rc" -ne 0 ]; then
+        print_error "AD query on pinned DC \$PINNED_DC failed while checking \$candidate"
+        echo "\$output" | sed 's/^/  /' >&2
+        return 2
+    fi
+    if echo "\$output" | grep -qi '^dn:'; then
+        print_error "Computer account \$candidate already exists in Active Directory."
+        print_error "Existing object on pinned DC \$PINNED_DC:"
+        echo "\$output" | sed 's/^/  /' >&2
+        return 0
+    fi
     return 1
 }
 
@@ -2834,13 +2867,12 @@ print_info "Enter the password directly at the kinit prompt; it is not captured 
 kdestroy >/dev/null 2>&1 || true
 kinit "\$kerberos_principal"
 
-LDAP_DCS="\$(discover_ldap_dcs)"
-[ -n "\$LDAP_DCS" ] || {
-    print_error "Cannot query AD authoritatively without discovered LDAP domain controllers."
+PINNED_DC=""
+if ! select_pinned_dc; then
+    print_error "Cannot query AD authoritatively without a suitable site-aware writable LDAP DC."
     exit 1
-}
-print_info "Using LDAP domain controller(s) for authoritative hostname checks:"
-echo "\$LDAP_DCS" | sed 's/^/  /'
+fi
+print_info "All hostname checks and the final Samba join will use pinned DC \$PINNED_DC."
 
 selected_host=""
 if is_valid_ad_hostname "\$current_host" && hostname_matches_managed_policy "\$current_host"; then
@@ -2885,7 +2917,7 @@ fi
 }
 
 print_info "Joining the AD domain with Samba's Kerberos ticket."
-net ads join --use-kerberos=required
+net ads join -S "\$PINNED_DC" --use-kerberos=required
 print_info "Validating the local machine membership."
 if ! net ads testjoin; then
     print_error "Samba joined, but net ads testjoin failed."
@@ -4450,7 +4482,7 @@ join_domain() {
     echo "    sudo /usr/local/sbin/dr-domain-admin-join"
     echo ""
     if [ "$PLATFORM_FAMILY" = "arch" ]; then
-        echo "  The helper will obtain a Kerberos ticket interactively, join with net ads join --use-kerberos=required, validate with net ads testjoin, and create /etc/krb5.keytab with net ads keytab create."
+        echo "  The helper will obtain a Kerberos ticket interactively, pin a site-aware writable LDAP DC, join with net ads join -S PINNED_DC --use-kerberos=required, validate with net ads testjoin, and create /etc/krb5.keytab with net ads keytab create."
     else
         echo "  The helper will allocate the final hostname from Active Directory, rename the workstation, join the domain, and validate with adcli testjoin."
     fi
