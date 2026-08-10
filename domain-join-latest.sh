@@ -2711,8 +2711,8 @@ select_pinned_dc() {
     }
 
     # Samba's resolver applies AD site awareness and chooses the closest
-    # usable server. Do not replace this with a global _ldap._tcp lookup:
-    # that record can contain unreachable worldwide DCs.
+    # usable server. Do not replace this with a global LDAP SRV lookup:
+    # global records can contain unreachable worldwide DCs.
     info_output="\$(net ads info 2>&1)" || {
         print_error "Samba could not select a site-aware domain controller."
         echo "\$info_output" | sed 's/^/  /' >&2
