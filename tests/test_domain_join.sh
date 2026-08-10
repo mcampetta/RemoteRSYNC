@@ -737,6 +737,90 @@ EOF
     pass "exact stale persisted-state contradiction is detected and recovered"
 }
 
+test_arch_helper_refresh_deployment() {
+    local fake_bin case_dir helper motd profile static_motd state marker output backup_count repeat_backup_count
+    fake_bin="$TMP_DIR/helper-refresh-fake-bin"
+    mkdir -p "$fake_bin"
+    cat > "$fake_bin/chown" << 'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "${HELPER_REFRESH_CHOWN_LOG:?}"
+EOF
+    cat > "$fake_bin/kinit" << 'EOF'
+#!/bin/bash
+printf 'kinit\n' >> "${HELPER_REFRESH_COMMAND_LOG:?}"
+exit 1
+EOF
+    cat > "$fake_bin/net" << 'EOF'
+#!/bin/bash
+printf 'net %s\n' "$*" >> "${HELPER_REFRESH_COMMAND_LOG:?}"
+exit 1
+EOF
+    cat > "$fake_bin/ldapsearch" << 'EOF'
+#!/bin/bash
+printf 'ldapsearch\n' >> "${HELPER_REFRESH_COMMAND_LOG:?}"
+exit 1
+EOF
+    chmod 755 "$fake_bin"/*
+
+    case_dir="$TMP_DIR/arch-helper-prejoin"
+    mkdir -p "$case_dir"
+    helper="$case_dir/dr-domain-admin-join"
+    motd="$case_dir/99-dr-domain-join"
+    profile="$case_dir/dr-domain-join.sh"
+    static_motd="$case_dir/motd"
+    : > "$case_dir/commands.log" "$case_dir/chown.log"
+    PATH="$fake_bin:$PATH" HELPER_REFRESH_COMMAND_LOG="$case_dir/commands.log" HELPER_REFRESH_CHOWN_LOG="$case_dir/chown.log" DR_JOIN_STATE_DIR="$case_dir/state" DR_ARCH_ADMIN_HELPER_PATH="$helper" DR_ARCH_PENDING_MOTD_PATH="$motd" DR_ARCH_PENDING_PROFILE_PATH="$profile" DR_ARCH_PENDING_STATIC_MOTD_PATH="$static_motd" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; OFFICE_CODE=EP1; install_arch_domain_admin_join_helper" >/dev/null
+    [ -x "$helper" ] || fail "pre-join Arch flow must install an executable current admin helper"
+    assert_contains "$(<"$helper")" 'JOIN_CCACHE=""' "pre-join installed helper contains the private administrator cache lifecycle"
+    assert_contains "$(<"$helper")" 'mktemp -p /tmp dr-domain-admin-krb5cc.XXXXXXXX' "pre-join installed helper retains private cache allocation"
+    assert_contains "$(<"$motd")" 'DR Domain Join Pending' "pre-join Arch flow installs pending MOTD notification"
+    assert_contains "$(<"$profile")" 'DR Domain Join Pending' "pre-join Arch flow installs pending profile notification"
+    assert_contains "$(<"$static_motd")" 'DR Domain Join Pending' "pre-join Arch flow installs static pending MOTD"
+    [ ! -s "$case_dir/commands.log" ] || fail "installing the pre-join helper and notices must not execute an administrator transaction"
+    pass "pre-join Arch flow installs the current helper and pending-domain-join notices without executing it"
+
+    case_dir="$TMP_DIR/arch-helper-postjoin"
+    mkdir -p "$case_dir/live-validation"
+    helper="$case_dir/dr-domain-admin-join"
+    motd="$case_dir/99-dr-domain-join"
+    profile="$case_dir/dr-domain-join.sh"
+    static_motd="$case_dir/motd"
+    state="$case_dir/state"
+    marker="$case_dir/live-validation/IDENTITY_VALIDATED"
+    printf '%s\n' '#!/bin/bash' 'kdestroy >/dev/null 2>&1 || true' > "$helper"
+    chmod 755 "$helper"
+    printf '%s\n' 'STAGE="POSTJOIN_AWAITING_LIVE_VALIDATION"' 'TARGET_HOSTNAME="ep-cr-kit-05"' > "$state"
+    printf '%s\n' 'existing live validation evidence' > "$marker"
+    cp -- "$state" "$case_dir/state.before"
+    cp -- "$marker" "$case_dir/marker.before"
+    : > "$case_dir/commands.log" "$case_dir/chown.log"
+    output="$(PATH="$fake_bin:$PATH" HELPER_REFRESH_COMMAND_LOG="$case_dir/commands.log" HELPER_REFRESH_CHOWN_LOG="$case_dir/chown.log" DR_JOIN_STATE_DIR="$case_dir" DR_ARCH_ADMIN_HELPER_PATH="$helper" DR_ARCH_PENDING_MOTD_PATH="$motd" DR_ARCH_PENDING_PROFILE_PATH="$profile" DR_ARCH_PENDING_STATIC_MOTD_PATH="$static_motd" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; OFFICE_CODE=EP1; platform_domain_is_joined(){ return 0; }; join_domain")"
+    assert_contains "$output" 'Machine is already joined' "joined Arch workflow refreshes helper before skipping the join"
+    assert_contains "$(<"$helper")" 'JOIN_CCACHE=""' "post-join refresh replaces stale helper with current private-cache implementation"
+    assert_contains "$(<"$helper")" 'kdestroy -q -c "FILE:$cache_path"' "post-join refreshed helper destroys only its private cache"
+    if grep -Fq 'kdestroy >/dev/null 2>&1 || true' "$helper" || grep -Fq '/tmp/krb5cc_0' "$helper"; then
+        fail "post-join refreshed Arch helper must not use default cache cleanup or the KIT root cache"
+    fi
+    [ ! -e "$motd" ] && [ ! -e "$profile" ] && [ ! -e "$static_motd" ] || fail "post-join helper refresh must not recreate pending-domain-join notices"
+    [ ! -s "$case_dir/commands.log" ] || fail "post-join helper refresh must not execute kinit, net ads, or LDAP queries"
+    cmp -s "$case_dir/state.before" "$state" || fail "post-join helper refresh must not regress the provisioning state"
+    cmp -s "$case_dir/marker.before" "$marker" || fail "post-join helper refresh must not alter live-validation markers"
+    compgen -G "$helper.domain-join.bak.*" >/dev/null || fail "stale post-join helper refresh must retain a timestamped backup"
+    assert_contains "$(<"$case_dir/chown.log")" "root:root $helper" "post-join refreshed helper preserves root ownership"
+    pass "joined Arch workflow refreshes only the inert helper and preserves notices, state, and live-validation evidence"
+
+    backup_count="$(compgen -G "$helper.domain-join.bak.*" | wc -l)"
+    PATH="$fake_bin:$PATH" HELPER_REFRESH_COMMAND_LOG="$case_dir/commands.log" HELPER_REFRESH_CHOWN_LOG="$case_dir/chown.log" DR_JOIN_STATE_DIR="$case_dir" DR_ARCH_ADMIN_HELPER_PATH="$helper" DR_ARCH_PENDING_MOTD_PATH="$motd" DR_ARCH_PENDING_PROFILE_PATH="$profile" DR_ARCH_PENDING_STATIC_MOTD_PATH="$static_motd" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; OFFICE_CODE=EP1; platform_domain_is_joined(){ return 0; }; join_domain" >/dev/null
+    repeat_backup_count="$(compgen -G "$helper.domain-join.bak.*" | wc -l)"
+    [ "$backup_count" -eq "$repeat_backup_count" ] || fail "already-current post-join helper refresh must avoid backup churn"
+    [ ! -s "$case_dir/commands.log" ] || fail "repeated post-join helper refresh must remain inert"
+    pass "repeated joined Arch helper refresh is idempotent and does not recreate notices or execute a transaction"
+
+    output="$(DR_JOIN_STATE_DIR="$TMP_DIR/prejoin-combined-path" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_domain_is_joined(){ return 1; }; platform_domain_discover(){ return 0; }; configure_samba(){ :; }; print_ssh_handoff(){ :; }; install_domain_admin_join_helper(){ echo combined-helper-and-notices; }; save_state(){ :; }; join_domain" 2>&1)"
+    assert_contains "$output" 'combined-helper-and-notices' "pre-join handoff continues to call the combined helper-and-notice installation path"
+    pass "pre-join handoff and post-join helper refresh use deliberately separate installation responsibilities"
+}
+
 test_cifs_kernel_and_mount_gates() {
     local fake_bin case_dir output helper
     fake_bin="$TMP_DIR/cifs-fake-bin"
@@ -2256,6 +2340,7 @@ test_time_provider_and_timesyncd
 test_dns_preservation_and_fallback
 test_office_argument_workflow
 test_hostname_collision_and_recovery
+test_arch_helper_refresh_deployment
 test_cifs_kernel_and_mount_gates
 test_arch_nss_configuration
 test_arch_pam_sssd_and_display_manager

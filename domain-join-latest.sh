@@ -2997,48 +2997,93 @@ echo "Rerun the candidate provisioning script locally to configure SSSD, PAM, su
 EOF
 }
 
-install_arch_domain_admin_join_helper() {
-    local helper="/usr/local/sbin/dr-domain-admin-join"
-    local motd="/etc/update-motd.d/99-dr-domain-join"
-    local profiled="/etc/profile.d/dr-domain-join.sh"
+install_arch_domain_admin_join_helper_binary() {
+    local helper="${DR_ARCH_ADMIN_HELPER_PATH:-/usr/local/sbin/dr-domain-admin-join}"
+    local helper_dir staged
 
-    mkdir -p /usr/local/sbin /etc/update-motd.d /etc/profile.d
-    backup_config_file "$helper"
-    backup_config_file "$motd"
-    backup_config_file "$profiled"
+    helper_dir="$(dirname "$helper")"
+    mkdir -p "$helper_dir"
+    staged="$(mktemp "$helper_dir/.dr-domain-admin-join.XXXXXX")" || {
+        print_error "Could not stage the Arch domain-admin helper beside $helper"
+        return 1
+    }
+    if ! render_arch_domain_admin_join_helper > "$staged"; then
+        rm -f -- "$staged"
+        print_error "Could not render the Arch domain-admin helper"
+        return 1
+    fi
+    chmod 755 "$staged"
+    chown root:root "$staged"
 
-    render_arch_domain_admin_join_helper > "$helper"
+    if [ -f "$helper" ] && cmp -s -- "$staged" "$helper"; then
+        rm -f -- "$staged"
+        chmod 755 "$helper"
+        chown root:root "$helper"
+        print_info "Arch Samba domain-admin join helper is already current: $helper"
+        return 0
+    fi
+
+    backup_config_file "$helper" || {
+        rm -f -- "$staged"
+        print_error "Could not back up the existing Arch domain-admin helper"
+        return 1
+    }
+    if ! mv -f -- "$staged" "$helper"; then
+        rm -f -- "$staged"
+        print_error "Could not install the current Arch domain-admin helper"
+        return 1
+    fi
     chmod 755 "$helper"
     chown root:root "$helper"
+    print_info "Installed current Arch Samba domain-admin join helper: $helper"
+}
 
-    cat > "$motd" << 'EOF'
+install_arch_domain_join_pending_notices() {
+    local helper="${DR_ARCH_ADMIN_HELPER_PATH:-/usr/local/sbin/dr-domain-admin-join}"
+    local motd="${DR_ARCH_PENDING_MOTD_PATH:-/etc/update-motd.d/99-dr-domain-join}"
+    local profiled="${DR_ARCH_PENDING_PROFILE_PATH:-/etc/profile.d/dr-domain-join.sh}"
+    local static_motd="${DR_ARCH_PENDING_STATIC_MOTD_PATH:-/etc/motd}"
+
+    mkdir -p "$(dirname "$motd")" "$(dirname "$profiled")" "$(dirname "$static_motd")"
+    backup_config_file "$motd"
+    backup_config_file "$profiled"
+    backup_config_file "$static_motd"
+
+    cat > "$motd" << EOF
 #!/bin/sh
 if command -v net >/dev/null 2>&1 && net ads testjoin >/dev/null 2>&1; then
     exit 0
 fi
-if [ -x /usr/local/sbin/dr-domain-admin-join ]; then
-    echo "DR Domain Join Pending: sudo /usr/local/sbin/dr-domain-admin-join"
+if [ -x "$helper" ]; then
+    echo "DR Domain Join Pending: sudo $helper"
 fi
 EOF
     chmod 755 "$motd"
     chown root:root "$motd"
 
-    cat > "$profiled" << 'EOF'
+    cat > "$profiled" << EOF
 #!/bin/sh
-case "$-" in *i*) ;; *) return 0 2>/dev/null || exit 0 ;; esac
-if [ -x /usr/local/sbin/dr-domain-admin-join ] && ! net ads testjoin >/dev/null 2>&1; then
-    echo "DR Domain Join Pending: sudo /usr/local/sbin/dr-domain-admin-join"
+case "\$-" in *i*) ;; *) return 0 2>/dev/null || exit 0 ;; esac
+if [ -x "$helper" ] && ! net ads testjoin >/dev/null 2>&1; then
+    echo "DR Domain Join Pending: sudo $helper"
 fi
 EOF
     chmod 644 "$profiled"
     chown root:root "$profiled"
 
-    cat > /etc/motd << 'EOF'
+    cat > "$static_motd" << EOF
 DR Domain Join Pending
-Run: sudo /usr/local/sbin/dr-domain-admin-join
+Run: sudo $helper
 EOF
+    chmod 644 "$static_motd"
+    chown root:root "$static_motd"
 
-    print_info "Installed Arch Samba domain-admin join helper: $helper"
+    print_info "Installed Arch pending-domain-join notices: $motd, $profiled, $static_motd"
+}
+
+install_arch_domain_admin_join_helper() {
+    install_arch_domain_admin_join_helper_binary || return 1
+    install_arch_domain_join_pending_notices
 }
 
 
@@ -4509,6 +4554,11 @@ print_ssh_handoff() {
 
 join_domain() {
     if platform_domain_is_joined; then
+        if [ "$PLATFORM_FAMILY" = "arch" ]; then
+            # Refresh only the inert generated helper. Pending-join notices are
+            # deliberately pre-join-only and are not recreated on members.
+            install_arch_domain_admin_join_helper_binary || return 1
+        fi
         print_info "Machine is already joined to $DOMAIN — skipping join"
         return 0
     fi
