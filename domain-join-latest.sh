@@ -7248,6 +7248,34 @@ platform_install_drip_search() {
     print_info "Installed configured Arch DRIP search units without enabling them at boot"
 }
 
+platform_verify_drip_automount_unit_file_state() {
+    local automount_unit="${1:-}" unit_file_state
+    [ -n "$automount_unit" ] || return 1
+    if ! unit_file_state="$(systemctl show "$automount_unit" -p UnitFileState --value 2>/dev/null)"; then
+        print_error "Could not determine UnitFileState for DRIP search automount $automount_unit"
+        return 1
+    fi
+
+    # Managed Arch DRIP automounts intentionally omit [Install], so systemd
+    # reports `static` (and `is-enabled` exits 0). Static is exactly what lets
+    # the KIT lifecycle start/stop the units explicitly without a boot target.
+    case "$unit_file_state" in
+        static) return 0 ;;
+        enabled|enabled-runtime)
+            print_error "DRIP search automount must not be enabled globally: $automount_unit (UnitFileState=$unit_file_state)"
+            return 1
+            ;;
+        masked|masked-runtime)
+            print_error "DRIP search automount is masked and unusable: $automount_unit (UnitFileState=$unit_file_state)"
+            return 1
+            ;;
+        *)
+            print_error "DRIP search automount has unexpected UnitFileState '${unit_file_state:-<empty>}': $automount_unit"
+            return 1
+            ;;
+    esac
+}
+
 platform_verify_drip_search() {
     [ "$PLATFORM_FAMILY" = "arch" ] || return 0
     [ -r "$DR_DRIP_MANIFEST" ] && [ ! -L "$DR_DRIP_MANIFEST" ] || return 1
@@ -7267,10 +7295,7 @@ platform_verify_drip_search() {
         grep -Fxq 'Options=_netdev,nofail,sec=krb5,cruid=0,vers=3.0' "$DR_DRIP_UNIT_DIR/$mount_unit" || return 1
         grep -Fxq "Where=/smb/$entry" "$DR_DRIP_UNIT_DIR/$automount_unit" || return 1
         systemd-analyze verify "$DR_DRIP_UNIT_DIR/$mount_unit" "$DR_DRIP_UNIT_DIR/$automount_unit" >/dev/null 2>&1 || return 1
-        if systemctl is-enabled --quiet "$automount_unit" 2>/dev/null; then
-            print_error "DRIP search automount must not be enabled globally: $automount_unit"
-            return 1
-        fi
+        platform_verify_drip_automount_unit_file_state "$automount_unit" || return 1
         count=$((count + 1))
     done < "$DR_DRIP_MANIFEST"
     [ "$count" -gt 0 ]

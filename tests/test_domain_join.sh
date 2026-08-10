@@ -1176,7 +1176,7 @@ test_drip_compatibility() {
     [[ "$nested_mount_unit" != 'smb-dr-ep-drip04-Image-Folders.mount' ]] || fail "DRIP validator must not use ad-hoc hyphen escaping"
     assert_contains "$(<"$unit_dir/$nested_mount_unit")" 'Where=/smb/dr-ep-drip04/Image-Folders' "nested DRIP target preserves the configured path"
     printf '%s\t%s\t%s\n' "$nested_entry" "$nested_mount_unit" "$nested_automount_unit" > "$TMP_DIR/drip-nested.manifest"
-    DR_DRIP_SEARCH_ROOTS="$nested_entry" DR_DRIP_MANIFEST="$TMP_DIR/drip-nested.manifest" DR_DRIP_UNIT_DIR="$unit_dir" DR_JOIN_STATE_DIR="$TMP_DIR/drip-nested-verify" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_verify_drip_search"
+    DR_DRIP_SEARCH_ROOTS="$nested_entry" DR_DRIP_MANIFEST="$TMP_DIR/drip-nested.manifest" DR_DRIP_UNIT_DIR="$unit_dir" DR_JOIN_STATE_DIR="$TMP_DIR/drip-nested-verify" bash -c "source '$SCRIPT'; systemctl(){ [ \"\${1:-}\" = show ] && { printf 'static\\n'; return 0; }; return 1; }; PLATFORM_FAMILY=arch; platform_verify_drip_search"
     pass "DRIP generation, manifest, validator, and cleanup share canonical systemd escaping"
 
     helper="$(DR_DRIP_MANIFEST="$TMP_DIR/drip.manifest" DR_DRIP_UNIT_DIR="$unit_dir" DR_JOIN_STATE_DIR="$TMP_DIR/drip-helper" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; render_drip_search_mount_helper")"
@@ -1186,6 +1186,125 @@ test_drip_compatibility() {
         fail "Arch DRIP helper must not own /mnt/p or /tmp/krb5cc_0"
     fi
     pass "Arch DRIP helper has no /mnt/p or root-cache ownership"
+}
+
+test_drip_automount_unit_file_state() {
+    local case_dir fake_bin unit_dir manifest helper mount_unit automount_unit output rc state enabled_output
+    case_dir="$TMP_DIR/drip-unit-file-state"
+    fake_bin="$case_dir/bin"
+    unit_dir="$case_dir/units"
+    manifest="$case_dir/drip.manifest"
+    helper="$case_dir/dr-drip-search"
+    mkdir -p "$fake_bin" "$unit_dir"
+
+    cat > "$fake_bin/systemctl" << 'EOF'
+#!/bin/bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${DRIP_SYSTEMCTL_LOG:?}"
+case "${1:-}" in
+    show)
+        [ "${DRIP_SHOW_FAIL:-0}" != 1 ] || exit 1
+        printf '%s\n' "${DRIP_UNIT_STATE-static}"
+        ;;
+    is-enabled)
+        # This mirrors systemd's intentionally counterintuitive static-unit
+        # behavior: text is static but the command returns success.
+        printf 'static\n'
+        ;;
+    start|stop|daemon-reload) exit 0 ;;
+    is-active) exit 0 ;;
+    *) exit 0 ;;
+esac
+EOF
+    cat > "$fake_bin/systemd-analyze" << 'EOF'
+#!/bin/bash
+exit 0
+EOF
+    cat > "$fake_bin/id" << 'EOF'
+#!/bin/bash
+if [ "${1:-}" = -u ]; then
+    printf '0\n'
+    exit 0
+fi
+exec /usr/bin/id "$@"
+EOF
+    chmod 755 "$fake_bin/systemctl" "$fake_bin/systemd-analyze" "$fake_bin/id"
+
+    mount_unit="$(systemd-escape --path --suffix=mount /smb/dr-ep-drip04/Images)"
+    automount_unit="$(systemd-escape --path --suffix=automount /smb/dr-ep-drip04/Images)"
+    assert_eq 'smb-dr\x2dep\x2ddrip04-Images.automount' "$automount_unit" "DRIP automount uses the canonical escaped unit name"
+    DR_DRIP_MANIFEST="$manifest" DR_DRIP_UNIT_DIR="$unit_dir" DR_JOIN_STATE_DIR="$case_dir/render" bash -c "source '$SCRIPT'; render_arch_drip_mount_unit dr-ep-drip04/Images > '$unit_dir/$mount_unit'; render_arch_drip_automount_unit dr-ep-drip04/Images > '$unit_dir/$automount_unit'; render_drip_search_mount_helper > '$helper'"
+    chmod 755 "$helper"
+    printf 'dr-ep-drip04/Images\t%s\t%s\n' "$mount_unit" "$automount_unit" > "$manifest"
+    chmod 600 "$manifest"
+    if grep -Eq '^\[Install\]|WantedBy=' "$unit_dir/$automount_unit"; then
+        fail "managed DRIP automount must not gain an Install target"
+    fi
+    pass "managed DRIP automount remains static by rendering without Install metadata"
+
+    set +e
+    enabled_output="$(PATH="$fake_bin:$PATH" DRIP_SYSTEMCTL_LOG="$case_dir/systemctl.log" systemctl is-enabled "$automount_unit" 2>&1)"
+    rc=$?
+    set -e
+    [ "$rc" -eq 0 ] || fail "fixture must model systemctl is-enabled static success"
+    assert_eq static "$enabled_output" "systemctl is-enabled reports static with exit status zero"
+    : > "$case_dir/systemctl.log"
+    PATH="$fake_bin:$PATH" DRIP_SYSTEMCTL_LOG="$case_dir/systemctl.log" DR_DRIP_SEARCH_ROOTS='dr-ep-drip04/Images' DR_DRIP_MANIFEST="$manifest" DR_DRIP_UNIT_DIR="$unit_dir" DR_JOIN_STATE_DIR="$case_dir/state-static" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_verify_drip_search" || fail "static DRIP automount must pass verification"
+    grep -Fq "show $automount_unit -p UnitFileState --value" "$case_dir/systemctl.log" || fail "DRIP verifier must inspect UnitFileState"
+    if grep -Fq "is-enabled $automount_unit" "$case_dir/systemctl.log"; then
+        fail "DRIP verifier must not treat is-enabled exit status as enablement"
+    fi
+    pass "static DRIP automount is accepted despite is-enabled success"
+
+    for state in enabled enabled-runtime; do
+        set +e
+        output="$(PATH="$fake_bin:$PATH" DRIP_SYSTEMCTL_LOG="$case_dir/systemctl.log" DRIP_UNIT_STATE="$state" DR_DRIP_SEARCH_ROOTS='dr-ep-drip04/Images' DR_DRIP_MANIFEST="$manifest" DR_DRIP_UNIT_DIR="$unit_dir" DR_JOIN_STATE_DIR="$case_dir/state-$state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_verify_drip_search" 2>&1)"
+        rc=$?
+        set -e
+        [ "$rc" -ne 0 ] || fail "$state DRIP automount must fail verification"
+        assert_contains "$output" 'must not be enabled globally' "$state DRIP automount is rejected as globally enabled"
+    done
+
+    for state in masked masked-runtime; do
+        set +e
+        output="$(PATH="$fake_bin:$PATH" DRIP_SYSTEMCTL_LOG="$case_dir/systemctl.log" DRIP_UNIT_STATE="$state" DR_DRIP_SEARCH_ROOTS='dr-ep-drip04/Images' DR_DRIP_MANIFEST="$manifest" DR_DRIP_UNIT_DIR="$unit_dir" DR_JOIN_STATE_DIR="$case_dir/state-$state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_verify_drip_search" 2>&1)"
+        rc=$?
+        set -e
+        [ "$rc" -ne 0 ] || fail "$state DRIP automount must fail verification"
+        assert_contains "$output" 'masked and unusable' "$state DRIP automount is rejected as unusable"
+    done
+
+    for state in linked linked-runtime alias generated transient not-found unknown ''; do
+        set +e
+        output="$(PATH="$fake_bin:$PATH" DRIP_SYSTEMCTL_LOG="$case_dir/systemctl.log" DRIP_UNIT_STATE="$state" DR_DRIP_SEARCH_ROOTS='dr-ep-drip04/Images' DR_DRIP_MANIFEST="$manifest" DR_DRIP_UNIT_DIR="$unit_dir" DR_JOIN_STATE_DIR="$case_dir/state-unknown" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_verify_drip_search" 2>&1)"
+        rc=$?
+        set -e
+        [ "$rc" -ne 0 ] || fail "$state DRIP automount must fail closed"
+        assert_contains "$output" 'unexpected UnitFileState' "$state DRIP automount failure is explicit"
+    done
+
+    set +e
+    output="$(PATH="$fake_bin:$PATH" DRIP_SYSTEMCTL_LOG="$case_dir/systemctl.log" DRIP_UNIT_STATE=$'static\nmalformed' DR_DRIP_SEARCH_ROOTS='dr-ep-drip04/Images' DR_DRIP_MANIFEST="$manifest" DR_DRIP_UNIT_DIR="$unit_dir" DR_JOIN_STATE_DIR="$case_dir/state-malformed" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_verify_drip_search" 2>&1)"
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "malformed UnitFileState output must fail closed"
+    assert_contains "$output" 'unexpected UnitFileState' "malformed UnitFileState output is explicit"
+
+    set +e
+    output="$(PATH="$fake_bin:$PATH" DRIP_SYSTEMCTL_LOG="$case_dir/systemctl.log" DRIP_SHOW_FAIL=1 DR_DRIP_SEARCH_ROOTS='dr-ep-drip04/Images' DR_DRIP_MANIFEST="$manifest" DR_DRIP_UNIT_DIR="$unit_dir" DR_JOIN_STATE_DIR="$case_dir/state-show-fail" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; platform_verify_drip_search" 2>&1)"
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "failed UnitFileState lookup must fail closed"
+    assert_contains "$output" 'Could not determine UnitFileState' "systemctl UnitFileState failure is explicit"
+    pass "masked, missing, unknown, and failed DRIP unit-file states fail closed"
+
+    : > "$case_dir/systemctl.log"
+    PATH="$fake_bin:$PATH" DRIP_SYSTEMCTL_LOG="$case_dir/systemctl.log" DR_DRIP_MANIFEST="$manifest" DR_DRIP_UNIT_DIR="$unit_dir" "$helper" start || fail "DRIP helper can explicitly start a static automount"
+    PATH="$fake_bin:$PATH" DRIP_SYSTEMCTL_LOG="$case_dir/systemctl.log" DR_DRIP_MANIFEST="$manifest" DR_DRIP_UNIT_DIR="$unit_dir" "$helper" cleanup || fail "DRIP helper cleanup remains intact"
+    grep -Fq "start $automount_unit" "$case_dir/systemctl.log" || fail "DRIP helper must explicitly start the static automount"
+    grep -Fq "stop $automount_unit" "$case_dir/systemctl.log" || fail "DRIP helper must stop the automount during cleanup"
+    grep -Fq "stop $mount_unit" "$case_dir/systemctl.log" || fail "DRIP helper must stop the mount during cleanup"
+    pass "DRIP helper explicitly starts and safely cleans up static automounts"
 }
 
 test_machine_account_renewal() {
@@ -1725,8 +1844,8 @@ EOF
     [ "$(stat -c '%a' "$manifest")" = 600 ] || fail "successful DRIP install keeps manifest mode 0600"
     [ "$(stat -c '%a' "$helper")" = 755 ] || fail "successful DRIP install keeps helper executable mode"
     [ "$(stat -c '%a' "$unit_dir/$new_mount")" = 644 ] || fail "successful DRIP install keeps mount unit mode"
-    if grep -Eq 'enable|is-enabled' "$case_dir/systemctl.log"; then
-        fail "successful DRIP install must not enable units globally"
+    if grep -Eq '(^|[[:space:]])(enable|is-enabled|start)([[:space:]]|$)' "$case_dir/systemctl.log"; then
+        fail "successful DRIP install must not enable or start units globally"
     fi
     assert_contains "$(<"$case_dir/chown.log")" 'root:root' "successful DRIP install requests root ownership"
     pass "successful DRIP install commits configured roots and removes inactive stale units"
@@ -1904,6 +2023,7 @@ test_arch_nss_configuration
 test_domain_uid_resolution_gate
 test_rebind_failure_rollback
 test_drip_compatibility
+test_drip_automount_unit_file_state
 test_machine_account_renewal
 test_machine_account_renewal_behavior
 test_kit_root_access_and_helpers
