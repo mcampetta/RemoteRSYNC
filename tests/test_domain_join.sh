@@ -688,19 +688,123 @@ EOF
     pass "empty/local mountpoint is rejected as Tool Server mount success"
 }
 
+test_arch_nss_configuration() {
+    local case_dir nsswitch expected original output rc sss_count main_flow case_name
+    local enable_line nss_line identity_line manager_line mount_line sudo_line
+
+    case_dir="$TMP_DIR/arch-nss-default"
+    mkdir -p "$case_dir"
+    nsswitch="$case_dir/nsswitch.conf"
+    printf '%s\n' \
+        '# CachyOS NSS defaults; a comment mentioning sss is not a provider' \
+        'passwd: files systemd' \
+        'group: files [SUCCESS=merge] systemd' \
+        'shadow: files systemd' \
+        'hosts: mymachines resolve [!UNAVAIL=return] files myhostname dns' \
+        'networks: files' > "$nsswitch"
+    DR_JOIN_STATE_DIR="$case_dir/state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; configure_arch_nss_sss '$nsswitch'" >/dev/null
+    expected=$'# CachyOS NSS defaults; a comment mentioning sss is not a provider\npasswd: files systemd sss\ngroup: files [SUCCESS=merge] systemd sss\nshadow: files systemd sss\nhosts: mymachines resolve [!UNAVAIL=return] files myhostname dns\nnetworks: files'
+    assert_eq "$expected" "$(<"$nsswitch")" "CachyOS NSS databases append sss without replacing native providers"
+    assert_contains "$(<"$nsswitch")" 'group: files [SUCCESS=merge] systemd sss' "CachyOS group SUCCESS=merge action is preserved exactly"
+    assert_contains "$(<"$nsswitch")" 'hosts: mymachines resolve [!UNAVAIL=return] files myhostname dns' "unrelated NSS databases remain unchanged"
+    if grep -qE '^[[:space:]]*initgroups[[:space:]]*:' "$nsswitch"; then
+        fail "Arch NSS adapter must not invent an initgroups database"
+    fi
+    pass "absence of initgroups remains unchanged"
+    compgen -G "$nsswitch.domain-join.bak.*" >/dev/null || fail "Arch NSS update creates a timestamped backup"
+    pass "Arch NSS update uses the existing backup mechanism"
+
+    DR_JOIN_STATE_DIR="$case_dir/state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; configure_arch_nss_sss '$nsswitch'" >/dev/null
+    sss_count="$(awk '$1 ~ /^(passwd|group|shadow):$/ { for (i = 2; i <= NF; i++) if ($i == "sss") count++ } END { print count + 0 }' "$nsswitch")"
+    [ "$sss_count" -eq 3 ] || fail "idempotent Arch NSS update must retain one sss token per required database"
+    pass "running the Arch NSS adapter twice does not duplicate sss"
+
+    case_dir="$TMP_DIR/arch-nss-existing"
+    mkdir -p "$case_dir"
+    nsswitch="$case_dir/nsswitch.conf"
+    printf '%s\n' \
+        'passwd: files sss systemd # keep exact ordering' \
+        'group: files [SUCCESS=merge] systemd sss' \
+        'shadow: files systemd sss' \
+        'hosts: files dns' > "$nsswitch"
+    original="$case_dir/original"
+    cp -- "$nsswitch" "$original"
+    DR_JOIN_STATE_DIR="$case_dir/state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; configure_arch_nss_sss '$nsswitch'" >/dev/null
+    cmp -s "$original" "$nsswitch" || fail "existing standalone sss providers must remain byte-for-byte unchanged"
+    pass "existing sss providers and provider ordering remain unchanged"
+
+    case_dir="$TMP_DIR/arch-nss-initgroups"
+    mkdir -p "$case_dir"
+    nsswitch="$case_dir/nsswitch.conf"
+    printf '%s\n' \
+        'passwd: files systemd' \
+        'group: files [SUCCESS=merge] systemd' \
+        'shadow: files systemd' \
+        'initgroups: files [NOTFOUND=return] systemd # preserve this action' > "$nsswitch"
+    DR_JOIN_STATE_DIR="$case_dir/state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; configure_arch_nss_sss '$nsswitch'; configure_arch_nss_sss '$nsswitch'" >/dev/null
+    assert_contains "$(<"$nsswitch")" 'initgroups: files [NOTFOUND=return] systemd sss # preserve this action' "existing initgroups appends sss before its comment"
+    [ "$(awk '$1 == "initgroups:" { for (i = 2; i <= NF; i++) if ($i == "sss") count++ } END { print count + 0 }' "$nsswitch")" -eq 1 ] || fail "initgroups sss provider must be idempotent"
+    pass "existing initgroups receives one standalone sss provider"
+
+    for case_name in missing-passwd missing-group missing-shadow malformed-passwd duplicate-group; do
+        case_dir="$TMP_DIR/arch-nss-$case_name"
+        mkdir -p "$case_dir"
+        nsswitch="$case_dir/nsswitch.conf"
+        case "$case_name" in
+            missing-passwd) printf '%s\n' 'group: files systemd' 'shadow: files systemd' > "$nsswitch" ;;
+            missing-group) printf '%s\n' 'passwd: files systemd' 'shadow: files systemd' > "$nsswitch" ;;
+            missing-shadow) printf '%s\n' 'passwd: files systemd' 'group: files systemd' > "$nsswitch" ;;
+            malformed-passwd) printf '%s\n' 'passwd files systemd' 'group: files systemd' 'shadow: files systemd' > "$nsswitch" ;;
+            duplicate-group) printf '%s\n' 'passwd: files systemd' 'group: files systemd' 'group: files sss' 'shadow: files systemd' > "$nsswitch" ;;
+        esac
+        original="$case_dir/original"
+        cp -- "$nsswitch" "$original"
+        set +e
+        output="$(DR_JOIN_STATE_DIR="$case_dir/state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; configure_arch_nss_sss '$nsswitch'" 2>&1)"
+        rc=$?
+        set -e
+        [ "$rc" -ne 0 ] || fail "$case_name NSS fixture must fail safely"
+        cmp -s "$original" "$nsswitch" || fail "$case_name NSS failure must leave the source file unchanged"
+        assert_contains "$output" 'could not be updated safely' "$case_name NSS failure is explicit"
+    done
+    pass "missing, malformed, and duplicate required NSS databases fail without overwriting the file"
+
+    case_dir="$TMP_DIR/debian-nss-noop"
+    mkdir -p "$case_dir"
+    nsswitch="$case_dir/nsswitch.conf"
+    printf '%s\n' 'passwd: files' 'group: files' 'shadow: files' > "$nsswitch"
+    original="$case_dir/original"
+    cp -- "$nsswitch" "$original"
+    DR_JOIN_STATE_DIR="$case_dir/state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=debian; platform_configure_nss '$nsswitch'"
+    cmp -s "$original" "$nsswitch" || fail "Debian NSS adapter must remain a no-op"
+    pass "Debian NSS behavior remains unchanged"
+
+    main_flow="$(sed -n '/^main() {/,/^}/p' "$SCRIPT")"
+    enable_line="$(printf '%s\n' "$main_flow" | awk '/^[[:space:]]*enable_sssd[[:space:]]*$/ { print NR; exit }')"
+    nss_line="$(printf '%s\n' "$main_flow" | awk '/^[[:space:]]*platform_configure_nss[[:space:]]*$/ { print NR; exit }')"
+    identity_line="$(printf '%s\n' "$main_flow" | awk '/^[[:space:]]*platform_validate_selected_domain_user[[:space:]]*$/ { print NR; exit }')"
+    manager_line="$(printf '%s\n' "$main_flow" | awk '/^[[:space:]]*install_dr_workstation_manager[[:space:]]*$/ { print NR; exit }')"
+    mount_line="$(printf '%s\n' "$main_flow" | awk '/^[[:space:]]*configure_autofs_cifs[[:space:]]*$/ { print NR; exit }')"
+    sudo_line="$(printf '%s\n' "$main_flow" | awk '/^[[:space:]]*configure_sudoers[[:space:]]*$/ { print NR; exit }')"
+    [ -n "$enable_line" ] && [ "$enable_line" -lt "$nss_line" ] && [ "$nss_line" -lt "$identity_line" ] && [ "$identity_line" -lt "$manager_line" ] && [ "$manager_line" -lt "$mount_line" ] && [ "$mount_line" -lt "$sudo_line" ] || fail "Arch NSS and identity gates must precede workstation, mount, and user sudo provisioning"
+    pass "SSSD startup, NSS configuration, normal identity validation, mount, and user sudo provisioning are correctly ordered"
+}
+
 test_domain_uid_resolution_gate() {
-    local fake_bin output rc
+    local fake_bin output rc unit
     fake_bin="$TMP_DIR/domain-uid-fake-bin"
     mkdir -p "$fake_bin"
     cat > "$fake_bin/getent" << 'EOF'
 #!/bin/bash
-if [ "${1:-}" = passwd ] && [ "${2:-}" = martin.campetta ] && [ "${DOMAIN_USER_RESOLVES:-0}" = 1 ]; then
-    printf 'martin.campetta:x:2001:2001:Domain User:/home/martin.campetta:/bin/bash\n'
+if [ "${1:-}" = -s ] && [ "${2:-}" = sss ] && [ "${3:-}" = passwd ] && [ "${4:-}" = martin.campetta ] && [ "${DIRECT_SSS_RESOLVES:-0}" = 1 ]; then
+    printf 'martin.campetta:*:%s:350000513:Campetta, Martin:/home/martin.campetta:\n' "${DOMAIN_UID:-350020586}"
+elif [ "${1:-}" = passwd ] && [ "${2:-}" = martin.campetta ] && [ "${DOMAIN_USER_RESOLVES:-0}" = 1 ]; then
+    printf 'martin.campetta:*:%s:350000513:Campetta, Martin:/home/martin.campetta:\n' "${DOMAIN_UID:-350020586}"
 fi
 EOF
     cat > "$fake_bin/id" << 'EOF'
 #!/bin/bash
-if [ "${1:-}" = -u ] && [ "${2:-}" = martin.campetta ]; then printf '2001\n'; else /usr/bin/id "$@"; fi
+if [ "${1:-}" = -u ] && [ "${2:-}" = martin.campetta ]; then printf '%s\n' "${DOMAIN_UID:-350020586}"; else /usr/bin/id "$@"; fi
 EOF
     chmod 755 "$fake_bin"/*
 
@@ -715,8 +819,23 @@ EOF
     fi
     pass "unresolved domain user cannot generate a guessed/local cruid"
 
-    output="$(PATH="$fake_bin:$PATH" DOMAIN_USER_RESOLVES=1 DOMAIN_SUDO_USER=martin.campetta DR_TOOLS_MOUNT_CRUID=2001 bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; tools_mount_cruid")"
-    assert_eq '2001' "$output" "resolved domain user supplies the only Arch cruid"
+    output="$(PATH="$fake_bin:$PATH" DOMAIN_USER_RESOLVES=1 DOMAIN_SUDO_USER=martin.campetta DR_TOOLS_MOUNT_CRUID=350020586 bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; tools_mount_cruid")"
+    assert_eq '350020586' "$output" "resolved domain user supplies the only Arch cruid"
+
+    unit="$TMP_DIR/domain-user-mnt-x.mount"
+    PATH="$fake_bin:$PATH" DOMAIN_USER_RESOLVES=1 DOMAIN_SUDO_USER=martin.campetta DR_JOIN_STATE_DIR="$TMP_DIR/domain-user-mount-state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; TOOLS_SERVER=dr-ep1-tools; platform_validate_selected_domain_user; uid=\$(tools_mount_cruid); render_arch_tools_mount_unit /mnt/x \"\$TOOLS_SERVER\" \"\$uid\" > '$unit'"
+    assert_contains "$(<"$unit")" 'cruid=350020586' "normal NSS domain UID is used to render the Arch Tool Server mount"
+
+    unit="$TMP_DIR/direct-sss-only-mnt-x.mount"
+    set +e
+    output="$(PATH="$fake_bin:$PATH" DIRECT_SSS_RESOLVES=1 DOMAIN_SUDO_USER=martin.campetta DR_JOIN_STATE_DIR="$TMP_DIR/direct-sss-only-state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; TOOLS_SERVER=dr-ep1-tools; platform_validate_selected_domain_user || exit 17; uid=\$(tools_mount_cruid); render_arch_tools_mount_unit /mnt/x \"\$TOOLS_SERVER\" \"\$uid\" > '$unit'" 2>&1)"
+    rc=$?
+    set -e
+    [ "$rc" -eq 17 ] || fail "direct SSSD success without normal NSS must stop at the identity gate"
+    [ ! -e "$unit" ] || fail "direct SSSD success without normal NSS must not render /mnt/x"
+    assert_contains "$output" "SSSD's direct NSS service resolves martin.campetta as UID 350020586" "direct SSSD-only resolution receives a focused nsswitch diagnostic"
+    assert_contains "$output" 'normal libc/NSS path does not' "direct SSSD-only resolution remains blocked"
+    pass "direct SSSD lookup cannot substitute for normal NSS identity resolution"
 }
 
 test_rebind_failure_rollback() {
@@ -1781,6 +1900,7 @@ test_dns_preservation_and_fallback
 test_office_argument_workflow
 test_hostname_collision_and_recovery
 test_cifs_kernel_and_mount_gates
+test_arch_nss_configuration
 test_domain_uid_resolution_gate
 test_rebind_failure_rollback
 test_drip_compatibility

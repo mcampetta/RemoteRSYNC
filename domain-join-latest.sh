@@ -5049,6 +5049,196 @@ enable_sssd() {
     print_info "SSSD is running"
 }
 
+# ── Configure NSS for SSSD identity resolution ───────────────────────────────
+
+render_arch_nsswitch_with_sss() {
+    local nsswitch="${1:-}"
+    [ -f "$nsswitch" ] && [ ! -L "$nsswitch" ] || {
+        print_error "Arch NSS configuration is not a regular non-symlink file: ${nsswitch:-<empty>}" >&2
+        return 1
+    }
+
+    # Preserve each line byte-for-byte unless it is one of the supported NSS
+    # databases and lacks the standalone `sss` service token. Bracketed NSS
+    # actions are parsed separately so comments or action text cannot be
+    # mistaken for a provider.
+    awk '
+        BEGIN {
+            target["passwd"] = 1
+            target["group"] = 1
+            target["shadow"] = 1
+            target["initgroups"] = 1
+        }
+        {
+            original = $0
+            content = original
+            comment = ""
+            hash = index(content, "#")
+            if (hash > 0) {
+                comment = substr(content, hash)
+                content = substr(content, 1, hash - 1)
+            }
+
+            probe = content
+            sub(/^[[:space:]]*/, "", probe)
+            colon = index(probe, ":")
+            if (colon == 0) {
+                print original
+                next
+            }
+
+            header = substr(probe, 1, colon - 1)
+            sub(/^[[:space:]]*/, "", header)
+            sub(/[[:space:]]*$/, "", header)
+            if (!(header in target)) {
+                print original
+                next
+            }
+
+            seen[header]++
+            rest = substr(probe, colon + 1)
+            scan = rest
+            sub(/^[[:space:]]*/, "", scan)
+            sub(/[[:space:]]*$/, "", scan)
+            if (scan == "") {
+                printf "Unsafe %s NSS database line: no providers are configured.\n", header > "/dev/stderr"
+                errors = 1
+                print original
+                next
+            }
+
+            token_count = split(scan, token, /[[:space:]]+/)
+            bracket_depth = 0
+            provider_count = 0
+            sss_count = 0
+            line_error = 0
+            for (i = 1; i <= token_count; i++) {
+                value = token[i]
+                depth_before = bracket_depth
+                opens_text = value
+                closes_text = value
+                opens = gsub(/\[/, "", opens_text)
+                closes = gsub(/\]/, "", closes_text)
+
+                if (depth_before == 0 && substr(value, 1, 1) != "[") {
+                    if (value !~ /^[[:alnum:]_.-]+$/) {
+                        printf "Unsafe %s NSS database line: malformed provider token %s.\n", header, value > "/dev/stderr"
+                        line_error = 1
+                    } else {
+                        provider_count++
+                        if (value == "sss") sss_count++
+                    }
+                }
+
+                bracket_depth += opens - closes
+                if (bracket_depth < 0) line_error = 1
+            }
+            if (bracket_depth != 0) line_error = 1
+            if (provider_count == 0) line_error = 1
+            if (sss_count > 1) {
+                printf "Unsafe %s NSS database line: duplicate sss service tokens.\n", header > "/dev/stderr"
+                line_error = 1
+            }
+            if (line_error) {
+                printf "Unsafe %s NSS database line; refusing to rewrite it.\n", header > "/dev/stderr"
+                errors = 1
+                print original
+                next
+            }
+
+            if (sss_count == 1) {
+                print original
+                next
+            }
+
+            trimmed = content
+            sub(/[[:space:]]+$/, "", trimmed)
+            trailing = substr(content, length(trimmed) + 1)
+            print trimmed " sss" trailing comment
+            next
+        }
+        END {
+            required[1] = "passwd"
+            required[2] = "group"
+            required[3] = "shadow"
+            for (i = 1; i <= 3; i++) {
+                database = required[i]
+                if (seen[database] != 1) {
+                    printf "Required NSS database %s must have exactly one valid line; found %d.\n", database, seen[database] > "/dev/stderr"
+                    errors = 1
+                }
+            }
+            if (seen["initgroups"] > 1) {
+                printf "Optional NSS database initgroups has multiple lines; refusing an ambiguous update.\n" > "/dev/stderr"
+                errors = 1
+            }
+            if (errors) exit 2
+        }
+    ' "$nsswitch"
+}
+
+configure_arch_nss_sss() {
+    local nsswitch="${1:-/etc/nsswitch.conf}"
+    local directory temporary
+
+    [ -f "$nsswitch" ] && [ ! -L "$nsswitch" ] || {
+        print_error "Cannot configure Arch NSS: $nsswitch is missing, not regular, or a symlink"
+        return 1
+    }
+    directory="$(dirname "$nsswitch")"
+    temporary="$(mktemp "$directory/.nsswitch.conf.dr-domain-join.XXXXXX")" || {
+        print_error "Cannot create a staged Arch NSS configuration beside $nsswitch"
+        return 1
+    }
+
+    if ! render_arch_nsswitch_with_sss "$nsswitch" > "$temporary"; then
+        rm -f -- "$temporary"
+        print_error "Arch NSS configuration could not be updated safely; $nsswitch is unchanged"
+        return 1
+    fi
+
+    if cmp -s -- "$nsswitch" "$temporary"; then
+        rm -f -- "$temporary"
+        print_info "Arch NSS databases already include the sss provider"
+        return 0
+    fi
+
+    if ! chmod --reference="$nsswitch" "$temporary"; then
+        rm -f -- "$temporary"
+        print_error "Could not preserve the mode while staging $nsswitch"
+        return 1
+    fi
+    if [ "$(stat -c '%u:%g' "$temporary")" != "$(stat -c '%u:%g' "$nsswitch")" ] &&
+       ! chown --reference="$nsswitch" "$temporary" 2>/dev/null; then
+        rm -f -- "$temporary"
+        print_error "Could not preserve ownership while staging $nsswitch"
+        return 1
+    fi
+
+    backup_config_file "$nsswitch" || {
+        rm -f -- "$temporary"
+        print_error "Could not back up $nsswitch; refusing the Arch NSS update"
+        return 1
+    }
+    if ! mv -f -- "$temporary" "$nsswitch"; then
+        rm -f -- "$temporary"
+        print_error "Could not atomically install the Arch NSS configuration; the original file remains available in its timestamped backup"
+        return 1
+    fi
+    print_info "Configured passwd, group, shadow, and existing initgroups NSS databases to use SSSD"
+}
+
+platform_configure_nss() {
+    case "$PLATFORM_FAMILY" in
+        arch) configure_arch_nss_sss "${1:-/etc/nsswitch.conf}" ;;
+        debian) return 0 ;;
+        *)
+            print_error "No NSS adapter exists for platform family '$PLATFORM_FAMILY'"
+            return 1
+            ;;
+    esac
+}
+
 
 # ── Filesystem path helper ───────────────────────────────────────────────────
 
@@ -6461,23 +6651,37 @@ tools_automount_unit_name() {
 }
 
 resolve_domain_user_uid() {
-    local user="${1:-}" passwd_line resolved_uid
-    local -a records fields
+    local user="${1:-}" passwd_line resolved_name resolved_uid separators
+    local -a records
     [ -n "$user" ] || return 1
     mapfile -t records < <(getent passwd "$user" 2>/dev/null || true)
     [ "${#records[@]}" -eq 1 ] || return 1
     passwd_line="${records[0]}"
-    IFS=: read -r -a fields <<< "$passwd_line"
-    [ "${#fields[@]}" -eq 7 ] || return 1
-    [ -n "${fields[0]}" ] || return 1
-    resolved_uid="${fields[2]}"
+    separators="${passwd_line//[^:]/}"
+    [ "${#separators}" -eq 6 ] || return 1
+    IFS=: read -r resolved_name _ resolved_uid _ _ _ _ <<< "$passwd_line"
+    [ -n "$resolved_name" ] || return 1
     case "$resolved_uid" in ''|*[!0-9]*) return 1 ;; esac
-    [ "$(id -u "${fields[0]}" 2>/dev/null || true)" = "$resolved_uid" ] || return 1
+    [ "$(id -u "$resolved_name" 2>/dev/null || true)" = "$resolved_uid" ] || return 1
     # A local account with the same name is not proof of an SSSD/domain
     # identity. Never bind a Kerberos CIFS mount to that local UID.
-    if awk -F: -v user="${fields[0]}" '$1 == user { found=1 } END { exit(found ? 0 : 1) }' /etc/passwd 2>/dev/null; then
+    if awk -F: -v user="$resolved_name" '$1 == user { found=1 } END { exit(found ? 0 : 1) }' /etc/passwd 2>/dev/null; then
         return 1
     fi
+    printf '%s\n' "$resolved_uid"
+}
+
+diagnose_sss_direct_user_uid() {
+    local user="${1:-}" passwd_line resolved_uid separators
+    local -a records
+    [ -n "$user" ] || return 1
+    mapfile -t records < <(getent -s sss passwd "$user" 2>/dev/null || true)
+    [ "${#records[@]}" -eq 1 ] || return 1
+    passwd_line="${records[0]}"
+    separators="${passwd_line//[^:]/}"
+    [ "${#separators}" -eq 6 ] || return 1
+    IFS=: read -r _ _ resolved_uid _ _ _ _ <<< "$passwd_line"
+    case "$resolved_uid" in ''|*[!0-9]*) return 1 ;; esac
     printf '%s\n' "$resolved_uid"
 }
 
@@ -7477,7 +7681,7 @@ platform_remove_tools_mount() {
 
 platform_validate_selected_domain_user() {
     [ "$PLATFORM_FAMILY" = arch ] || return 0
-    local uid
+    local uid direct_sss_uid
     if [ -z "${DOMAIN_SUDO_USER:-}" ]; then
         print_error "No Arch domain user was selected for the Tool Server mount"
         print_error "Post-mount provisioning is blocked until a domain identity is selected and resolved"
@@ -7487,8 +7691,15 @@ platform_validate_selected_domain_user() {
         print_info "Selected domain user $DOMAIN_SUDO_USER resolves through NSS/SSSD as UID $uid"
         return 0
     fi
-    print_error "Selected domain user $DOMAIN_SUDO_USER does not resolve through NSS/SSSD"
-    print_error "SSSD may still be failing domain/site SRV discovery; no local UID will be substituted"
+    print_error "NSS/SSSD identity resolution failed for selected domain user $DOMAIN_SUDO_USER"
+    print_error "Normal getent passwd and id resolution must both succeed; no local UID will be substituted"
+    direct_sss_uid="$(diagnose_sss_direct_user_uid "$DOMAIN_SUDO_USER" || true)"
+    if [ -n "$direct_sss_uid" ]; then
+        print_error "SSSD's direct NSS service resolves $DOMAIN_SUDO_USER as UID $direct_sss_uid, but the normal libc/NSS path does not"
+        print_error "Check that the passwd, group, and shadow databases in /etc/nsswitch.conf include the standalone sss service"
+    else
+        print_error "SSSD may still be failing domain/site discovery; the workstation remains at a resumable post-join stage"
+    fi
     if command -v sssctl >/dev/null 2>&1; then
         sssctl domain-status "$DOMAIN" 2>&1 | sed 's/^/  /' || true
     fi
@@ -8757,6 +8968,8 @@ main() {
     configure_realm_permissions
     configure_sssd_settings
     enable_sssd
+    platform_configure_nss
+    platform_validate_selected_domain_user
     configure_desktop_integration
     install_dr_workstation_manager
     configure_autofs_cifs
