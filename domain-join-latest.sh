@@ -2873,6 +2873,33 @@ if machine_identity_trusted; then
     exit 0
 fi
 
+# This helper's administrator credentials are deliberately isolated from the
+# root default cache. The Tool Server KIT.sh root-cache lifecycle is separate
+# and must never be created, replaced, or destroyed here.
+JOIN_CCACHE=""
+cleanup_join_credentials() {
+    local cache_path="\${JOIN_CCACHE:-}"
+    [ -n "\$cache_path" ] || return 0
+    case "\$cache_path" in
+        /tmp/dr-domain-admin-krb5cc.*) ;;
+        *)
+            print_warn "Refusing to clean an unexpected administrator credential-cache path."
+            JOIN_CCACHE=""
+            return 0
+            ;;
+    esac
+    # -c names precisely this helper-owned FILE cache; never destroy root's
+    # default cache or another workflow's KRB5CCNAME.
+    kdestroy -q -c "FILE:\$cache_path" >/dev/null 2>&1 || true
+    rm -f -- "\$cache_path" 2>/dev/null || true
+    JOIN_CCACHE=""
+}
+
+trap cleanup_join_credentials EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 echo "Enter the domain admin username that may create or update the AD computer account."
 read -r -p "Domain admin username: " admin_user
 [ -n "\$admin_user" ] || { print_error "Domain admin username is required."; exit 1; }
@@ -2884,8 +2911,17 @@ esac
 echo ""
 print_info "Obtaining a Kerberos ticket for \$kerberos_principal."
 print_info "Enter the password directly at the kinit prompt; it is not captured by this helper."
-kdestroy >/dev/null 2>&1 || true
-kinit "\$kerberos_principal"
+JOIN_CCACHE="\$(mktemp -p /tmp dr-domain-admin-krb5cc.XXXXXXXX)" || {
+    print_error "Could not allocate the private administrator Kerberos credential cache."
+    exit 1
+}
+chmod 600 "\$JOIN_CCACHE"
+chown root:root "\$JOIN_CCACHE"
+export KRB5CCNAME="FILE:\$JOIN_CCACHE"
+if ! kinit "\$kerberos_principal"; then
+    print_error "Kerberos authentication failed; the private administrator credential cache will be removed."
+    exit 1
+fi
 
 PINNED_DC=""
 if ! select_pinned_dc; then

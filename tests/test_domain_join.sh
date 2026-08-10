@@ -360,7 +360,8 @@ test_office_argument_workflow() {
 }
 
 test_hostname_collision_and_recovery() {
-    local fake_bin helper case_dir output rc case_name occupied race_host
+    local fake_bin helper case_dir output rc case_name occupied race_host private_cache input helper_pid signal_name
+    local -a fixture_env
     fake_bin="$TMP_DIR/hostname-fake-bin"
     mkdir -p "$fake_bin"
     cat > "$fake_bin/hostnamectl" << 'EOF'
@@ -425,10 +426,29 @@ exec /usr/bin/timeout "$@"
 EOF
     cat > "$fake_bin/kinit" << 'EOF'
 #!/bin/bash
-exit 0
+if [ -n "${KINIT_ENV_LOG:-}" ]; then
+    printf '%s\n' "${KRB5CCNAME:-<unset>}" >> "$KINIT_ENV_LOG"
+fi
+if [ -n "${FAKE_KINIT_READY:-}" ]; then
+    : > "$FAKE_KINIT_READY"
+fi
+if [ -n "${FAKE_KINIT_SLEEP:-}" ]; then
+    sleep "$FAKE_KINIT_SLEEP"
+fi
+[ "${FAKE_KINIT_FAIL:-0}" != 1 ]
 EOF
     cat > "$fake_bin/kdestroy" << 'EOF'
 #!/bin/bash
+if [ -n "${KDESTROY_LOG:-}" ]; then
+    printf '%s|%s\n' "$*" "${KRB5CCNAME:-<unset>}" >> "$KDESTROY_LOG"
+fi
+exit 0
+EOF
+    cat > "$fake_bin/chown" << 'EOF'
+#!/bin/bash
+if [ -n "${CHOWN_LOG:-}" ]; then
+    printf '%s\n' "$*" >> "$CHOWN_LOG"
+fi
 exit 0
 EOF
     cat > "$fake_bin/klist" << 'EOF'
@@ -475,14 +495,22 @@ if [[ "$*" == *"ads lookup"* ]]; then
     exit 0
 fi
 if [[ "$*" == *"ads join"* ]]; then
+    if [ -n "${NET_ENV_LOG:-}" ]; then
+        printf '%s|%s\n' "$*" "${KRB5CCNAME:-<unset>}" >> "$NET_ENV_LOG"
+    fi
+    [ "${NET_JOIN_FAIL:-0}" != 1 ] || exit 1
     printf '%s\n' "$*" >> "${NET_JOIN_LOG:?}"
     exit 0
 fi
 if [[ "$*" == *"ads keytab create"* ]]; then
+    [ "${NET_KEYTAB_FAIL:-0}" != 1 ] || exit 1
     : > "${FAKE_KEYTAB:?}"
     exit 0
 fi
 if [[ "$*" == *"ads testjoin"* ]]; then
+    if [ "${NET_TESTJOIN_AFTER_JOIN_FAIL:-0}" = 1 ] && [ -n "${NET_JOIN_LOG:-}" ] && [ -s "$NET_JOIN_LOG" ]; then
+        exit 1
+    fi
     [ "${NET_TESTJOIN_OK:-0}" = 1 ]
     exit $?
 fi
@@ -504,6 +532,13 @@ EOF
     grep -Fq 'timeout 15s' "$helper" || fail "Arch LDAP collision queries retain the bounded timeout"
     grep -Fq 'ldapsearch -LLL -Q -Y GSSAPI -N' "$helper" || fail "Arch LDAP collision queries use GSSAPI ldapsearch"
     pass "Arch LDAP collision queries use the normal Kerberos environment"
+    grep -Fq 'mktemp -p /tmp dr-domain-admin-krb5cc.XXXXXXXX' "$helper" || fail "Arch admin helper must allocate a private temporary Kerberos cache"
+    grep -Fq 'export KRB5CCNAME="FILE:$JOIN_CCACHE"' "$helper" || fail "Arch admin helper must export its private FILE cache before kinit"
+    grep -Fq 'kdestroy -q -c "FILE:$cache_path"' "$helper" || fail "Arch admin helper must destroy only its explicit private cache"
+    if grep -Fq '/tmp/krb5cc_0' "$helper" || grep -Fq 'kdestroy >/dev/null' "$helper"; then
+        fail "Arch admin helper must not reference the KIT root cache or destroy an unscoped default cache"
+    fi
+    pass "Arch admin helper isolates and explicitly cleans only its private administrator cache"
 
     for case_name in contiguous sparse; do
         case_dir="$TMP_DIR/hostname-$case_name"
@@ -534,7 +569,7 @@ EOF
     printf '127.0.1.1 ep-cr-kit-01\n' > "$case_dir/hosts"
     : > "$case_dir/smb.conf" "$case_dir/join.log" "$case_dir/ldap.log"
     set +e
-    output="$(printf 'admin\n' | PATH="$fake_bin:$PATH" KRB5_CONFIG=/etc/krb5.conf KRB5CCNAME=FILE:/tmp/krb5cc_0 LDAP_ENV_LOG="$case_dir/ldap-env.log" FAKE_HOSTNAME=ep-cr-kit-01 HOSTNAMECTL_LOG="$case_dir/hostname.log" NET_JOIN_LOG="$case_dir/join.log" LDAP_COUNTER_DIR="$case_dir/counters" LDAP_QUERY_LOG="$case_dir/ldap.log" FAKE_KEYTAB="$case_dir/krb5.keytab" AD_OCCUPIED='EP-CR-KIT-01 EP-CR-KIT-02 EP-CR-KIT-03 EP-CR-KIT-04' NET_TESTJOIN_OK=1 DR_ADMIN_STATE_DIR="$case_dir/state" DR_ADMIN_HOSTS_FILE="$case_dir/hosts" DR_ADMIN_SMB_CONF="$case_dir/smb.conf" DR_ADMIN_KEYTAB="$case_dir/krb5.keytab" DR_ADMIN_SECRETS_TDB="$case_dir/secrets.tdb" "$helper" 2>&1)"
+    output="$(printf 'admin\n' | PATH="$fake_bin:$PATH" KRB5_CONFIG=/etc/krb5.conf KRB5CCNAME=FILE:/tmp/krb5cc_0 KINIT_ENV_LOG="$case_dir/kinit-env.log" KDESTROY_LOG="$case_dir/kdestroy.log" NET_ENV_LOG="$case_dir/net-env.log" CHOWN_LOG="$case_dir/chown.log" LDAP_ENV_LOG="$case_dir/ldap-env.log" FAKE_HOSTNAME=ep-cr-kit-01 HOSTNAMECTL_LOG="$case_dir/hostname.log" NET_JOIN_LOG="$case_dir/join.log" LDAP_COUNTER_DIR="$case_dir/counters" LDAP_QUERY_LOG="$case_dir/ldap.log" FAKE_KEYTAB="$case_dir/krb5.keytab" AD_OCCUPIED='EP-CR-KIT-01 EP-CR-KIT-02 EP-CR-KIT-03 EP-CR-KIT-04' NET_TESTJOIN_OK=1 DR_ADMIN_STATE_DIR="$case_dir/state" DR_ADMIN_HOSTS_FILE="$case_dir/hosts" DR_ADMIN_SMB_CONF="$case_dir/smb.conf" DR_ADMIN_KEYTAB="$case_dir/krb5.keytab" DR_ADMIN_SECRETS_TDB="$case_dir/secrets.tdb" "$helper" 2>&1)"
     rc=$?
     set -e
     [ "$rc" -eq 0 ] || fail "pinned absent candidate should complete the fixture join"
@@ -544,7 +579,16 @@ EOF
         fail "unreachable global DCs must not be queried"
     fi
     grep -Fq 'ads join -S US1P1OINFMAD004.dr.kodr.local --use-kerberos=required' "$case_dir/join.log" || fail "net ads join must target the exact selected DC"
-    grep -Fq '/etc/krb5.conf|FILE:/tmp/krb5cc_0' "$case_dir/ldap-env.log" || fail "LDAP query must inherit the existing Kerberos environment"
+    private_cache="$(<"$case_dir/kinit-env.log")"
+    [[ "$private_cache" =~ ^FILE:/tmp/dr-domain-admin-krb5cc\.[A-Za-z0-9]+$ ]] || fail "kinit must receive a private administrator FILE cache"
+    [ ! -e "${private_cache#FILE:}" ] || fail "successful Arch admin join must remove its private credential cache"
+    grep -Fq "/etc/krb5.conf|$private_cache" "$case_dir/ldap-env.log" || fail "LDAP query must inherit the private administrator Kerberos cache"
+    grep -Fq "ads join -S US1P1OINFMAD004.dr.kodr.local --use-kerberos=required|$private_cache" "$case_dir/net-env.log" || fail "Samba join must inherit the private administrator Kerberos cache"
+    grep -Fq -- "-q -c $private_cache|$private_cache" "$case_dir/kdestroy.log" || fail "successful Arch admin join must destroy its exact private cache"
+    if grep -Fq '/tmp/krb5cc_0' "$case_dir/kdestroy.log"; then
+        fail "successful Arch admin join must not destroy the inherited root default cache"
+    fi
+    assert_contains "$(<"$case_dir/chown.log")" "root:root ${private_cache#FILE:}" "private administrator cache is root-owned before kinit"
     grep -Fq 'set-hostname ep-cr-kit-05' "$case_dir/hostname.log" || fail "occupied NEW_JOIN object must not be reused"
     assert_contains "$output" 'ep-cr-kit-05' "pinned absent candidate proceeds to join"
     pass "pinned writable EP DC is used for LDAP checks and net ads join"
@@ -603,6 +647,75 @@ EOF
     assert_contains "$output" 'simulated ldap failure' "captured LDAP diagnostics are preserved"
     assert_contains "$output" 'No domain join was attempted' "non-timeout LDAP failure preserves the no-join diagnostic"
     pass "non-timeout LDAP failure blocks the pinned join with captured diagnostics"
+
+    for case_name in kinit pinned-dc ldap join testjoin keytab; do
+        case_dir="$TMP_DIR/admin-cache-$case_name"
+        mkdir -p "$case_dir/counters"
+        printf '127.0.1.1 ep-cr-kit-05\n' > "$case_dir/hosts"
+        : > "$case_dir/smb.conf" "$case_dir/join.log" "$case_dir/ldap.log"
+        input='admin\n'
+        fixture_env=()
+        case "$case_name" in
+            kinit) fixture_env=(FAKE_KINIT_FAIL=1) ;;
+            pinned-dc) fixture_env=(NET_DC_MODE=unusable) ;;
+            ldap) fixture_env=(LDAP_FAILURE_RC=68) ;;
+            join) fixture_env=(NET_JOIN_FAIL=1) ;;
+            testjoin) input='admin\nN\n' ;;
+            keytab) fixture_env=(NET_TESTJOIN_OK=1 NET_KEYTAB_FAIL=1) ;;
+        esac
+        set +e
+        output="$(printf '%b' "$input" | env PATH="$fake_bin:$PATH" KRB5CCNAME=FILE:/tmp/krb5cc_0 KINIT_ENV_LOG="$case_dir/kinit-env.log" KDESTROY_LOG="$case_dir/kdestroy.log" FAKE_HOSTNAME=ep-cr-kit-05 HOSTNAMECTL_LOG="$case_dir/hostname.log" NET_JOIN_LOG="$case_dir/join.log" LDAP_COUNTER_DIR="$case_dir/counters" LDAP_QUERY_LOG="$case_dir/ldap.log" FAKE_KEYTAB="$case_dir/krb5.keytab" DR_ADMIN_STATE_DIR="$case_dir/state" DR_ADMIN_HOSTS_FILE="$case_dir/hosts" DR_ADMIN_SMB_CONF="$case_dir/smb.conf" DR_ADMIN_KEYTAB="$case_dir/krb5.keytab" DR_ADMIN_SECRETS_TDB="$case_dir/secrets.tdb" "${fixture_env[@]}" "$helper" 2>&1)"
+        rc=$?
+        set -e
+        [ "$rc" -ne 0 ] || fail "$case_name admin-cache fixture must fail"
+        private_cache="$(<"$case_dir/kinit-env.log")"
+        [[ "$private_cache" =~ ^FILE:/tmp/dr-domain-admin-krb5cc\.[A-Za-z0-9]+$ ]] || fail "$case_name must allocate a private administrator cache before the transaction"
+        [ ! -e "${private_cache#FILE:}" ] || fail "$case_name failure must remove the private administrator cache"
+        grep -Fq -- "-q -c $private_cache|$private_cache" "$case_dir/kdestroy.log" || fail "$case_name failure must destroy its exact private administrator cache"
+        if grep -Fq '/tmp/krb5cc_0' "$case_dir/kdestroy.log"; then
+            fail "$case_name failure must not destroy an unrelated root default cache"
+        fi
+        if [ "$case_name" = kinit ] || [ "$case_name" = pinned-dc ] || [ "$case_name" = ldap ]; then
+            [ ! -s "$case_dir/join.log" ] || fail "$case_name failure must not invoke net ads join"
+        fi
+    done
+    pass "private administrator cache is removed after kinit, DC, LDAP, join, testjoin, and keytab failures"
+
+    for signal_name in HUP INT TERM; do
+        case_dir="$TMP_DIR/admin-cache-signal-$signal_name"
+        mkdir -p "$case_dir/counters"
+        printf '127.0.1.1 ep-cr-kit-05\n' > "$case_dir/hosts"
+        : > "$case_dir/smb.conf" "$case_dir/join.log" "$case_dir/ldap.log"
+        printf 'admin\n' | env PATH="$fake_bin:$PATH" KINIT_ENV_LOG="$case_dir/kinit-env.log" KDESTROY_LOG="$case_dir/kdestroy.log" FAKE_KINIT_READY="$case_dir/kinit.ready" FAKE_KINIT_SLEEP=2 FAKE_HOSTNAME=ep-cr-kit-05 HOSTNAMECTL_LOG="$case_dir/hostname.log" NET_JOIN_LOG="$case_dir/join.log" LDAP_COUNTER_DIR="$case_dir/counters" LDAP_QUERY_LOG="$case_dir/ldap.log" FAKE_KEYTAB="$case_dir/krb5.keytab" DR_ADMIN_STATE_DIR="$case_dir/state" DR_ADMIN_HOSTS_FILE="$case_dir/hosts" DR_ADMIN_SMB_CONF="$case_dir/smb.conf" DR_ADMIN_KEYTAB="$case_dir/krb5.keytab" DR_ADMIN_SECRETS_TDB="$case_dir/secrets.tdb" "$helper" > "$case_dir/output" 2>&1 &
+        helper_pid=$!
+        for _ in $(seq 1 20); do
+            [ -e "$case_dir/kinit.ready" ] && break
+            sleep 0.1
+        done
+        [ -e "$case_dir/kinit.ready" ] || fail "$signal_name fixture did not reach private-cache kinit"
+        kill -s "$signal_name" "$helper_pid"
+        set +e
+        wait "$helper_pid"
+        rc=$?
+        set -e
+        [ "$rc" -ne 0 ] || fail "$signal_name signal must stop the admin helper"
+        private_cache="$(<"$case_dir/kinit-env.log")"
+        [ ! -e "${private_cache#FILE:}" ] || fail "$signal_name signal must remove the private administrator cache"
+        grep -Fq -- "-q -c $private_cache|$private_cache" "$case_dir/kdestroy.log" || fail "$signal_name signal must destroy the exact private administrator cache"
+    done
+    pass "HUP, INT, and TERM clean the private administrator cache"
+
+    case_dir="$TMP_DIR/admin-cache-managed-rerun"
+    mkdir -p "$case_dir"
+    printf '127.0.1.1 ep-cr-kit-05\n' > "$case_dir/hosts"
+    printf 'machine keytab fixture\n' > "$case_dir/krb5.keytab"
+    printf 'machine secret fixture\n' > "$case_dir/secrets.tdb"
+    : > "$case_dir/smb.conf" "$case_dir/join.log"
+    output="$(PATH="$fake_bin:$PATH" KINIT_ENV_LOG="$case_dir/kinit-env.log" KDESTROY_LOG="$case_dir/kdestroy.log" FAKE_HOSTNAME=ep-cr-kit-05 HOSTNAMECTL_LOG="$case_dir/hostname.log" NET_JOIN_LOG="$case_dir/join.log" FAKE_KEYTAB="$case_dir/krb5.keytab" NET_TESTJOIN_OK=1 DR_ADMIN_STATE_DIR="$case_dir/state" DR_ADMIN_HOSTS_FILE="$case_dir/hosts" DR_ADMIN_SMB_CONF="$case_dir/smb.conf" DR_ADMIN_KEYTAB="$case_dir/krb5.keytab" DR_ADMIN_SECRETS_TDB="$case_dir/secrets.tdb" "$helper")"
+    assert_contains "$output" 'Existing Samba machine membership and local host/keytab identity are valid' "trusted machine rerun exits before administrator authentication"
+    [ ! -e "$case_dir/kinit-env.log" ] || fail "trusted machine rerun must not allocate or use an administrator cache"
+    [ ! -e "$case_dir/kdestroy.log" ] || fail "trusted machine rerun must not attempt administrator-cache cleanup"
+    pass "trusted machine rerun does not create an unnecessary administrator cache"
 
     case_dir="$TMP_DIR/stale-state"
     mkdir -p "$case_dir"
