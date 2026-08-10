@@ -2768,7 +2768,7 @@ select_pinned_dc() {
 
 ldap_search_computer_object() {
     local ldap_dc="\$1" base_dn="\$2" sam="\$3"
-    timeout 15s env KRB5_CONFIG=/tmp/dr-domain-admin-krb5.conf \
+    timeout 15s \
         ldapsearch -LLL -Q -Y GSSAPI -N \
         -o nettimeout=10 -o timelimit=10 -o referrals=false \
         -H "ldap://\$ldap_dc" -b "\$base_dn" -s sub \
@@ -2787,7 +2787,12 @@ ad_computer_exists() {
         rc=\$?
     fi
     if [ "\$rc" -ne 0 ]; then
-        print_error "AD query on pinned DC \$PINNED_DC failed while checking \$candidate"
+        if [ "\$rc" -eq 124 ]; then
+            print_error "AD query on pinned DC \$PINNED_DC timed out after 15 seconds while checking \$candidate."
+        else
+            print_error "AD query on pinned DC \$PINNED_DC failed with exit status \$rc while checking \$candidate."
+        fi
+        print_error "No domain join was attempted."
         echo "\$output" | sed 's/^/  /' >&2
         return 2
     fi

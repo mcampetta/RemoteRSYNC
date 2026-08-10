@@ -388,6 +388,9 @@ for ((index = 1; index <= $#; index++)); do
         printf '%s\n' "${!next_index}" >> "${LDAP_QUERY_LOG:?}"
     fi
 done
+if [ -n "${LDAP_ENV_LOG:-}" ]; then
+    printf '%s|%s\n' "${KRB5_CONFIG:-<unset>}" "${KRB5CCNAME:-<unset>}" >> "$LDAP_ENV_LOG"
+fi
 for arg in "$@"; do
     if [[ "$arg" == *sAMAccountName=* ]]; then
         candidate="${arg#*sAMAccountName=}"
@@ -400,6 +403,10 @@ count=0
 if [ -f "$counter_file" ]; then count="$(<"$counter_file")"; fi
 count=$((count + 1))
 printf '%s\n' "$count" > "$counter_file"
+if [ -n "${LDAP_FAILURE_RC:-}" ]; then
+    printf 'simulated ldap failure\n' >&2
+    exit "$LDAP_FAILURE_RC"
+fi
 if [ "${LDAP_FAIL_FINAL:-0}" = 1 ] && [ "$candidate" = EP-CR-KIT-05 ] && [ "$count" -ge 2 ]; then
     printf 'simulated pinned DC became unreachable\n' >&2
     exit 1
@@ -407,6 +414,14 @@ fi
 if [[ " ${AD_OCCUPIED:-} " == *" $candidate "* ]] || { [ "$candidate" = "${RACE_HOST:-}" ] && [ "$count" -ge 2 ]; }; then
     printf 'dn: CN=%s,OU=Computers,DC=dr,DC=kodr,DC=local\nsAMAccountName: %s$\ndNSHostName: %s.dr.kodr.local\ndescription: Existing fixture object\nwhenCreated: 20260706160422.0Z\n' "$candidate" "$candidate" "${candidate,,}"
 fi
+EOF
+    cat > "$fake_bin/timeout" << 'EOF'
+#!/bin/bash
+if [ -n "${FAKE_TIMEOUT_RC:-}" ]; then
+    printf 'simulated timeout from fixture\n' >&2
+    exit "$FAKE_TIMEOUT_RC"
+fi
+exec /usr/bin/timeout "$@"
 EOF
     cat > "$fake_bin/kinit" << 'EOF'
 #!/bin/bash
@@ -483,6 +498,12 @@ EOF
         fail "Arch admin helper must not enumerate global LDAP SRV records"
     fi
     pass "Arch admin helper uses Samba site-aware DC selection instead of global LDAP SRV enumeration"
+    if grep -Fq 'KRB5_CONFIG=/tmp/dr-domain-admin-krb5.conf' "$helper"; then
+        fail "Arch LDAP collision queries must use the workstation Kerberos configuration"
+    fi
+    grep -Fq 'timeout 15s' "$helper" || fail "Arch LDAP collision queries retain the bounded timeout"
+    grep -Fq 'ldapsearch -LLL -Q -Y GSSAPI -N' "$helper" || fail "Arch LDAP collision queries use GSSAPI ldapsearch"
+    pass "Arch LDAP collision queries use the normal Kerberos environment"
 
     for case_name in contiguous sparse; do
         case_dir="$TMP_DIR/hostname-$case_name"
@@ -513,7 +534,7 @@ EOF
     printf '127.0.1.1 ep-cr-kit-01\n' > "$case_dir/hosts"
     : > "$case_dir/smb.conf" "$case_dir/join.log" "$case_dir/ldap.log"
     set +e
-    output="$(printf 'admin\n' | PATH="$fake_bin:$PATH" FAKE_HOSTNAME=ep-cr-kit-01 HOSTNAMECTL_LOG="$case_dir/hostname.log" NET_JOIN_LOG="$case_dir/join.log" LDAP_COUNTER_DIR="$case_dir/counters" LDAP_QUERY_LOG="$case_dir/ldap.log" FAKE_KEYTAB="$case_dir/krb5.keytab" AD_OCCUPIED='EP-CR-KIT-01 EP-CR-KIT-02 EP-CR-KIT-03 EP-CR-KIT-04' NET_TESTJOIN_OK=1 DR_ADMIN_STATE_DIR="$case_dir/state" DR_ADMIN_HOSTS_FILE="$case_dir/hosts" DR_ADMIN_SMB_CONF="$case_dir/smb.conf" DR_ADMIN_KEYTAB="$case_dir/krb5.keytab" DR_ADMIN_SECRETS_TDB="$case_dir/secrets.tdb" "$helper" 2>&1)"
+    output="$(printf 'admin\n' | PATH="$fake_bin:$PATH" KRB5_CONFIG=/etc/krb5.conf KRB5CCNAME=FILE:/tmp/krb5cc_0 LDAP_ENV_LOG="$case_dir/ldap-env.log" FAKE_HOSTNAME=ep-cr-kit-01 HOSTNAMECTL_LOG="$case_dir/hostname.log" NET_JOIN_LOG="$case_dir/join.log" LDAP_COUNTER_DIR="$case_dir/counters" LDAP_QUERY_LOG="$case_dir/ldap.log" FAKE_KEYTAB="$case_dir/krb5.keytab" AD_OCCUPIED='EP-CR-KIT-01 EP-CR-KIT-02 EP-CR-KIT-03 EP-CR-KIT-04' NET_TESTJOIN_OK=1 DR_ADMIN_STATE_DIR="$case_dir/state" DR_ADMIN_HOSTS_FILE="$case_dir/hosts" DR_ADMIN_SMB_CONF="$case_dir/smb.conf" DR_ADMIN_KEYTAB="$case_dir/krb5.keytab" DR_ADMIN_SECRETS_TDB="$case_dir/secrets.tdb" "$helper" 2>&1)"
     rc=$?
     set -e
     [ "$rc" -eq 0 ] || fail "pinned absent candidate should complete the fixture join"
@@ -523,6 +544,7 @@ EOF
         fail "unreachable global DCs must not be queried"
     fi
     grep -Fq 'ads join -S US1P1OINFMAD004.dr.kodr.local --use-kerberos=required' "$case_dir/join.log" || fail "net ads join must target the exact selected DC"
+    grep -Fq '/etc/krb5.conf|FILE:/tmp/krb5cc_0' "$case_dir/ldap-env.log" || fail "LDAP query must inherit the existing Kerberos environment"
     grep -Fq 'set-hostname ep-cr-kit-05' "$case_dir/hostname.log" || fail "occupied NEW_JOIN object must not be reused"
     assert_contains "$output" 'ep-cr-kit-05' "pinned absent candidate proceeds to join"
     pass "pinned writable EP DC is used for LDAP checks and net ads join"
@@ -552,6 +574,35 @@ EOF
     [ ! -s "$case_dir/join.log" ] || fail "no writable DC must prevent net ads join"
     assert_contains "$output" 'not confirmed writable' "no suitable writable DC is a hard blocker"
     pass "absence of a suitable writable LDAP DC fails closed"
+
+    case_dir="$TMP_DIR/hostname-ldap-timeout"
+    mkdir -p "$case_dir/counters"
+    printf '127.0.1.1 ep-cr-kit-01\n' > "$case_dir/hosts"
+    : > "$case_dir/smb.conf" "$case_dir/join.log" "$case_dir/ldap.log"
+    set +e
+    output="$(printf 'admin\n' | PATH="$fake_bin:$PATH" FAKE_HOSTNAME=ep-cr-kit-01 HOSTNAMECTL_LOG="$case_dir/hostname.log" NET_JOIN_LOG="$case_dir/join.log" LDAP_COUNTER_DIR="$case_dir/counters" LDAP_QUERY_LOG="$case_dir/ldap.log" FAKE_TIMEOUT_RC=124 AD_OCCUPIED='EP-CR-KIT-01' DR_ADMIN_STATE_DIR="$case_dir/state" DR_ADMIN_HOSTS_FILE="$case_dir/hosts" DR_ADMIN_SMB_CONF="$case_dir/smb.conf" DR_ADMIN_KEYTAB="$case_dir/krb5.keytab" DR_ADMIN_SECRETS_TDB="$case_dir/secrets.tdb" "$helper" 2>&1)"
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "LDAP timeout must block the helper"
+    [ ! -s "$case_dir/join.log" ] || fail "LDAP timeout must prevent net ads join"
+    assert_contains "$output" 'timed out after 15 seconds' "LDAP timeout has a specific diagnostic"
+    assert_contains "$output" 'No domain join was attempted' "LDAP timeout preserves the no-join diagnostic"
+    pass "LDAP timeout blocks the pinned join without invoking net ads join"
+
+    case_dir="$TMP_DIR/hostname-ldap-failure"
+    mkdir -p "$case_dir/counters"
+    printf '127.0.1.1 ep-cr-kit-01\n' > "$case_dir/hosts"
+    : > "$case_dir/smb.conf" "$case_dir/join.log" "$case_dir/ldap.log"
+    set +e
+    output="$(printf 'admin\n' | PATH="$fake_bin:$PATH" FAKE_HOSTNAME=ep-cr-kit-01 HOSTNAMECTL_LOG="$case_dir/hostname.log" NET_JOIN_LOG="$case_dir/join.log" LDAP_COUNTER_DIR="$case_dir/counters" LDAP_QUERY_LOG="$case_dir/ldap.log" LDAP_FAILURE_RC=68 AD_OCCUPIED='EP-CR-KIT-01' DR_ADMIN_STATE_DIR="$case_dir/state" DR_ADMIN_HOSTS_FILE="$case_dir/hosts" DR_ADMIN_SMB_CONF="$case_dir/smb.conf" DR_ADMIN_KEYTAB="$case_dir/krb5.keytab" DR_ADMIN_SECRETS_TDB="$case_dir/secrets.tdb" "$helper" 2>&1)"
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "non-timeout LDAP failure must block the helper"
+    [ ! -s "$case_dir/join.log" ] || fail "non-timeout LDAP failure must prevent net ads join"
+    assert_contains "$output" 'failed with exit status 68' "non-timeout LDAP status is reported"
+    assert_contains "$output" 'simulated ldap failure' "captured LDAP diagnostics are preserved"
+    assert_contains "$output" 'No domain join was attempted' "non-timeout LDAP failure preserves the no-join diagnostic"
+    pass "non-timeout LDAP failure blocks the pinned join with captured diagnostics"
 
     case_dir="$TMP_DIR/stale-state"
     mkdir -p "$case_dir"
