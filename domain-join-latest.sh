@@ -7277,21 +7277,11 @@ applications_dir="\$user_home/.local/share/applications"
 bin_dir="\$user_home/.local/bin"
 resources_dir="\$desktop_dir/Ontrack Resources"
 notes_dir="\$user_home/Recovery Notes"
-mkdir -p "\$desktop_dir" "\$applications_dir" "\$bin_dir" "\$resources_dir" "\$notes_dir" "\$ONTRACK_LOG_DIR"
 
-# Keep the top-level desktop intentionally sparse. Manual mount lives inside Ontrack Resources.
-rm -f "\$desktop_dir/Mount DR Tools.desktop" 2>/dev/null || true
-rm -f "\$desktop_dir/Home.desktop" "\$desktop_dir/home.desktop" "\$desktop_dir/Computer.desktop" "\$desktop_dir/Trash.desktop" 2>/dev/null || true
-
-# Hide GNOME desktop special icons where the extension/schema supports it.
-if command -v gsettings >/dev/null 2>&1; then
-    gsettings set org.gnome.shell.extensions.ding show-home false >/dev/null 2>&1 || true
-    gsettings set org.gnome.shell.extensions.ding show-trash false >/dev/null 2>&1 || true
-    gsettings set org.gnome.desktop.background show-desktop-icons false >/dev/null 2>&1 || true
-fi
-
-wrapper="\$bin_dir/dr-launch-kit"
-cat > "\$wrapper" << 'EOF2'
+write_kit_user_launcher() {
+    local wrapper="\$bin_dir/dr-launch-kit"
+    mkdir -p "\$bin_dir"
+    cat > "\$wrapper" << 'EOF2'
 #!/bin/bash
 set +e
 
@@ -7337,7 +7327,28 @@ fi
 
 exit "\$rc"
 EOF2
-chmod 755 "\$wrapper"
+    chmod 755 "\$wrapper"
+}
+
+if [ "\${1:-}" = "--refresh-kit-launcher" ]; then
+    write_kit_user_launcher
+    exit 0
+fi
+
+mkdir -p "\$desktop_dir" "\$applications_dir" "\$bin_dir" "\$resources_dir" "\$notes_dir" "\$ONTRACK_LOG_DIR"
+
+# Keep the top-level desktop intentionally sparse. Manual mount lives inside Ontrack Resources.
+rm -f "\$desktop_dir/Mount DR Tools.desktop" 2>/dev/null || true
+rm -f "\$desktop_dir/Home.desktop" "\$desktop_dir/home.desktop" "\$desktop_dir/Computer.desktop" "\$desktop_dir/Trash.desktop" 2>/dev/null || true
+
+# Hide GNOME desktop special icons where the extension/schema supports it.
+if command -v gsettings >/dev/null 2>&1; then
+    gsettings set org.gnome.shell.extensions.ding show-home false >/dev/null 2>&1 || true
+    gsettings set org.gnome.shell.extensions.ding show-trash false >/dev/null 2>&1 || true
+    gsettings set org.gnome.desktop.background show-desktop-icons false >/dev/null 2>&1 || true
+fi
+
+write_kit_user_launcher
 
 kit_app="\$applications_dir/dr-kit.desktop"
 kit_desktop="\$desktop_dir/KIT.desktop"

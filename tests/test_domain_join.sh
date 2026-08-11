@@ -1874,7 +1874,7 @@ test_kit_root_access_and_helpers() {
 }
 
 test_kit_x11_session_launcher() {
-    local source x11_grants x11_revocations
+    local source x11_grants x11_revocations refresh_line desktop_repair_line
     source="$(<"$SCRIPT")"
 
     x11_grants="$(printf '%s\n' "$source" | grep -Fc '/usr/bin/xhost +SI:localuser:root')"
@@ -1886,6 +1886,11 @@ test_kit_x11_session_launcher() {
     assert_contains "$source" '[ -z "\${DISPLAY:-}" ]' "KIT user launcher fails clearly without an X11 display"
     assert_contains "$source" 'sudo -n /usr/local/sbin/dr-launch-kit "\$@"' "KIT user launcher keeps the narrow root launcher invocation"
     assert_contains "$source" 'Defaults!/usr/local/sbin/dr-launch-kit env_keep += "KRB5CCNAME"' "KIT sudoers still preserves only the Kerberos cache selector"
+    assert_contains "$source" '"--refresh-kit-launcher"' "user desktop helper has a narrow KIT launcher refresh mode"
+    refresh_line="$(printf '%s\n' "$source" | grep -n '"--refresh-kit-launcher"' | tail -1 | cut -d: -f1)"
+    desktop_repair_line="$(printf '%s\n' "$source" | grep -n 'Keep the top-level desktop intentionally sparse' | tail -1 | cut -d: -f1)"
+    [ "$refresh_line" -lt "$desktop_repair_line" ] || fail "narrow KIT launcher refresh must precede desktop repair work"
+    pass "user desktop helper refreshes only the KIT launcher before broader desktop work"
     if printf '%s\n' "$source" | grep -Fq 'env_keep += "KRB5CCNAME DISPLAY'; then
         fail "KIT sudoers must not broaden DISPLAY preservation"
     fi
