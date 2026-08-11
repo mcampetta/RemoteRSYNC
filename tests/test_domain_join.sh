@@ -1873,6 +1873,25 @@ test_kit_root_access_and_helpers() {
     pass "KIT launcher preserves root-cache and /mnt/p ownership boundaries"
 }
 
+test_kit_x11_session_launcher() {
+    local source x11_grants x11_revocations
+    source="$(<"$SCRIPT")"
+
+    x11_grants="$(printf '%s\n' "$source" | grep -Fc '/usr/bin/xhost +SI:localuser:root')"
+    x11_revocations="$(printf '%s\n' "$source" | grep -Fc '/usr/bin/xhost -SI:localuser:root')"
+    assert_eq "2" "$x11_grants" "both generated KIT user launchers grant only local-root X11 access"
+    assert_eq "2" "$x11_revocations" "both generated KIT user launchers revoke local-root X11 access"
+    assert_contains "$source" 'trap cleanup_x11_root_access EXIT' "KIT user launcher cleans up X11 access on normal exit"
+    assert_contains "$source" "trap 'exit 129' HUP" "KIT user launcher cleans up X11 access on signals"
+    assert_contains "$source" '[ -z "\${DISPLAY:-}" ]' "KIT user launcher fails clearly without an X11 display"
+    assert_contains "$source" 'sudo -n /usr/local/sbin/dr-launch-kit "\$@"' "KIT user launcher keeps the narrow root launcher invocation"
+    assert_contains "$source" 'Defaults!/usr/local/sbin/dr-launch-kit env_keep += "KRB5CCNAME"' "KIT sudoers still preserves only the Kerberos cache selector"
+    if printf '%s\n' "$source" | grep -Fq 'env_keep += "KRB5CCNAME DISPLAY'; then
+        fail "KIT sudoers must not broaden DISPLAY preservation"
+    fi
+    pass "KIT X11 access is session-scoped rather than sudo environment preservation"
+}
+
 test_drip_launcher_fail_closed() {
     local case_dir fake_bin launcher support output rc mount_unit automount_unit helper manifest
     case_dir="$TMP_DIR/drip-launcher-fail-closed"
@@ -2694,6 +2713,7 @@ test_drip_automount_unit_file_state
 test_machine_account_renewal
 test_machine_account_renewal_behavior
 test_kit_root_access_and_helpers
+test_kit_x11_session_launcher
 test_kit_cache_validation
 test_drip_launcher_fail_closed
 test_drip_install_transaction

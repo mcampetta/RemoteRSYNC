@@ -6925,9 +6925,33 @@ install_kit_desktop_shortcut_for_user() {
 #!/bin/bash
 set +e
 
+rc=1
+x11_root_access_granted=0
+
+cleanup_x11_root_access() {
+    if [ "\$x11_root_access_granted" -eq 1 ]; then
+        /usr/bin/xhost -SI:localuser:root >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+trap cleanup_x11_root_access EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 echo "Launching KIT..."
-sudo -n /usr/local/sbin/dr-launch-kit "\$@"
-rc=\$?
+if [ -z "\${DISPLAY:-}" ]; then
+    echo "KIT requires an active graphical X11 display." >&2
+elif [ ! -x /usr/bin/xhost ]; then
+    echo "KIT requires /usr/bin/xhost to authorize the root GUI process." >&2
+elif /usr/bin/xhost +SI:localuser:root >/dev/null 2>&1; then
+    x11_root_access_granted=1
+    sudo -n /usr/local/sbin/dr-launch-kit "\$@"
+    rc=\$?
+else
+    echo "Unable to authorize the root KIT process for this X11 session." >&2
+fi
 
 if [ -z "\${rc:-}" ]; then
     rc=1
@@ -7271,9 +7295,33 @@ cat > "\$wrapper" << 'EOF2'
 #!/bin/bash
 set +e
 
+rc=1
+x11_root_access_granted=0
+
+cleanup_x11_root_access() {
+    if [ "\$x11_root_access_granted" -eq 1 ]; then
+        /usr/bin/xhost -SI:localuser:root >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+trap cleanup_x11_root_access EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 echo "Launching KIT..."
-sudo -n /usr/local/sbin/dr-launch-kit "\$@"
-rc=\$?
+if [ -z "\${DISPLAY:-}" ]; then
+    echo "KIT requires an active graphical X11 display." >&2
+elif [ ! -x /usr/bin/xhost ]; then
+    echo "KIT requires /usr/bin/xhost to authorize the root GUI process." >&2
+elif /usr/bin/xhost +SI:localuser:root >/dev/null 2>&1; then
+    x11_root_access_granted=1
+    sudo -n /usr/local/sbin/dr-launch-kit "\$@"
+    rc=\$?
+else
+    echo "Unable to authorize the root KIT process for this X11 session." >&2
+fi
 
 if [ -z "\${rc:-}" ]; then
     rc=1
