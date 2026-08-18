@@ -1897,6 +1897,96 @@ test_kit_x11_session_launcher() {
     pass "KIT X11 access is session-scoped rather than sudo environment preservation"
 }
 
+test_arch_session_activation() {
+    local case_dir fake_bin root_helper user_helper sudoers output dispatch_log session_exit_line bookmark_line
+    case_dir="$TMP_DIR/arch-session-activation"
+    fake_bin="$case_dir/bin"
+    mkdir -p "$fake_bin"
+
+    root_helper="$(DR_JOIN_STATE_DIR="$case_dir/state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; render_arch_root_session_activation_helper")"
+    user_helper="$(DR_JOIN_STATE_DIR="$case_dir/state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; render_arch_user_session_activation_helper")"
+    sudoers="$(DR_JOIN_STATE_DIR="$case_dir/state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=arch; render_workstation_sudoers")"
+    printf '%s\n' "$root_helper" > "$case_dir/root-helper"
+    printf '%s\n' "$user_helper" > "$case_dir/user-helper"
+    bash -n "$case_dir/root-helper" || fail "generated Arch root session activation helper syntax"
+    bash -n "$case_dir/user-helper" || fail "generated Arch user session activation helper syntax"
+    assert_contains "$root_helper" 'validate_kit_invoking_cache' "root session activation reuses strict FILE cache validation"
+    assert_contains "$root_helper" 'id -nG "$caller_name"' "root session activation validates managed-user membership"
+    assert_contains "$root_helper" '"$REBIND_HELPER" "$SUDO_UID"' "root session activation uses the transactional rebind helper"
+    assert_contains "$root_helper" 'if [ "$current_cruid" != "$SUDO_UID" ]; then' "root session activation rebinds only when the mount belongs to another user"
+    assert_contains "$root_helper" '"$MOUNT_HELPER" --cruid "$SUDO_UID"' "root session activation mounts with the invoking domain UID"
+    assert_contains "$user_helper" 'is_managed_user || exit 0' "non-workstation users do not request root session activation"
+    assert_contains "$user_helper" 'for _attempt in {1..15}' "session activation waits briefly for the login FILE cache"
+    assert_contains "$user_helper" '"$WORKSPACE_HELPER" --session-activate' "session activation requests only the narrow workspace setup mode"
+    assert_contains "$user_helper" 'sudo -n "$ROOT_HELPER"' "user session dispatcher calls only the narrow root helper"
+    assert_contains "$sudoers" 'Defaults!/usr/local/sbin/dr-workstation-session-activate env_keep += "KRB5CCNAME"' "Arch session activation preserves only the FILE cache selector"
+    assert_contains "$sudoers" '%dr-workstation-users ALL=(root) NOPASSWD: /usr/local/sbin/dr-workstation-session-activate' "managed workstation users receive only session activation sudo"
+    printf '%s\n' "$sudoers" > "$case_dir/sudoers"
+    visudo -cf "$case_dir/sudoers" >/dev/null 2>&1 || fail "Arch session activation sudoers validates with visudo"
+    pass "Arch session activation helpers and sudoers validate"
+
+    output="$(DR_JOIN_STATE_DIR="$case_dir/state" bash -c "source '$SCRIPT'; PLATFORM_FAMILY=debian; render_workstation_sudoers")"
+    if printf '%s\n' "$output" | grep -Fq 'dr-workstation-session-activate'; then
+        fail "Debian sudoers must not render Arch session activation"
+    fi
+    pass "Debian sudoers remain isolated from Arch session activation"
+
+    cat > "$fake_bin/id" <<'EOF'
+#!/bin/bash
+if [ "$1" = -nG ]; then
+    echo 'domain users'
+    exit 0
+fi
+exit 1
+EOF
+    cat > "$fake_bin/sudo" <<'EOF'
+#!/bin/bash
+echo invoked >> "$SESSION_DISPATCH_LOG"
+exit 1
+EOF
+    chmod 755 "$fake_bin/id" "$fake_bin/sudo"
+    dispatch_log="$case_dir/non-managed.log"
+    PATH="$fake_bin:$PATH" SESSION_DISPATCH_LOG="$dispatch_log" KRB5CCNAME='FILE:/tmp/krb5cc_1234' bash "$case_dir/user-helper"
+    [ ! -e "$dispatch_log" ] || fail "non-workstation user must not invoke root session activation"
+    pass "non-workstation sessions are ignored safely"
+
+    cat > "$fake_bin/id" <<'EOF'
+#!/bin/bash
+if [ "$1" = -nG ]; then
+    echo 'domain users dr-workstation-users'
+    exit 0
+fi
+exit 1
+EOF
+    cat > "$fake_bin/klist" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+    cat > "$fake_bin/sudo" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "$SESSION_DISPATCH_LOG"
+exit 0
+EOF
+    workspace="$case_dir/workspace"
+    cat > "$workspace" <<'EOF'
+#!/bin/bash
+printf '%s\n' workspace >> "$SESSION_DISPATCH_LOG"
+EOF
+    chmod 755 "$fake_bin/id" "$fake_bin/klist" "$fake_bin/sudo" "$workspace"
+    sed -i "s#/usr/local/bin/dr-user-desktop-provision#$workspace#" "$case_dir/user-helper"
+    dispatch_log="$case_dir/managed.log"
+    PATH="$fake_bin:$PATH" SESSION_DISPATCH_LOG="$dispatch_log" XDG_RUNTIME_DIR="$case_dir/runtime" KRB5CCNAME='FILE:/tmp/krb5cc_1234' bash "$case_dir/user-helper"
+    assert_contains "$(<"$dispatch_log")" 'workspace' "managed session refreshes its user workspace before activation"
+    assert_contains "$(<"$dispatch_log")" '/usr/local/sbin/dr-workstation-session-activate' "managed session invokes only the root session activation helper"
+    assert_contains "$(<"$SCRIPT")" 'exec /usr/local/bin/dr-workstation-session-activate' "login autostart routes Arch sessions through the managed activation dispatcher"
+    assert_contains "$(<"$SCRIPT")" 'Arch uses a session-aware dispatcher because /mnt/x has one explicit' "Arch post-mount renderer installs the session-aware autostart dispatcher"
+    assert_contains "$(<"$SCRIPT")" 'rm -rf "\$resources_dir/Logical Recovery Tools"' "generated user workspace removes only its own stale logical-resource link"
+    session_exit_line="$(grep -n 'if \[ "\\$session_activate" -eq 1 \]' "$SCRIPT" | tail -1 | cut -d: -f1)"
+    bookmark_line="$(grep -n '^repair_bookmarks$' "$SCRIPT" | tail -1 | cut -d: -f1)"
+    [ "$session_exit_line" -lt "$bookmark_line" ] || fail "session workspace setup must exit before bookmark, alias, favorite, and wallpaper updates"
+    pass "managed Arch session dispatches workspace refresh and narrow root activation"
+}
+
 test_drip_launcher_fail_closed() {
     local case_dir fake_bin launcher support output rc mount_unit automount_unit helper manifest
     case_dir="$TMP_DIR/drip-launcher-fail-closed"
@@ -2719,6 +2809,7 @@ test_machine_account_renewal
 test_machine_account_renewal_behavior
 test_kit_root_access_and_helpers
 test_kit_x11_session_launcher
+test_arch_session_activation
 test_kit_cache_validation
 test_drip_launcher_fail_closed
 test_drip_install_transaction

@@ -5552,6 +5552,15 @@ render_workstation_sudoers() {
 %$users_group ALL=(root) NOPASSWD: /usr/local/sbin/dr-post-mount-provision
 %$users_group ALL=(root) NOPASSWD: /usr/local/sbin/dr-launch-kit
 EOF
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        cat << EOF
+
+# Arch session activation is restricted to managed workstation users. Preserve
+# only the caller's FILE cache selector for the root-side cache validation.
+Defaults!/usr/local/sbin/dr-workstation-session-activate env_keep += "KRB5CCNAME"
+%$users_group ALL=(root) NOPASSWD: /usr/local/sbin/dr-workstation-session-activate
+EOF
+    fi
 }
 
 render_kit_launcher_sudoers() {
@@ -6052,6 +6061,123 @@ if [ "${1:-}" = "--credential-self-test" ]; then
     echo 'validation=FAIL'
     exit 1
 fi
+EOF
+}
+
+render_arch_root_session_activation_helper() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+    local cache_validator users_group
+    cache_validator="$(render_kit_cache_validator)"
+    users_group="$DR_WORKSTATION_USERS_GROUP"
+    printf '%s\n' '#!/bin/bash' 'set -euo pipefail' ''
+    printf 'USERS_GROUP=%q\n' "$users_group"
+    cat << 'EOF'
+REBIND_HELPER="/usr/local/sbin/dr-tools-rebind"
+MOUNT_HELPER="/usr/local/bin/mount-kit-tools"
+
+EOF
+    printf '%s\n' "$cache_validator"
+    cat << 'EOF'
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run through sudo from an approved graphical workstation session." >&2
+    exit 1
+fi
+
+case "${SUDO_UID:-}" in
+    ''|0|*[!0-9]*)
+        echo "Session activation requires a non-root domain-user sudo invocation." >&2
+        exit 1
+        ;;
+esac
+
+caller_record="$(getent passwd "$SUDO_UID" 2>/dev/null || true)"
+IFS=: read -r caller_name _ caller_uid _ _ _ _ <<< "$caller_record"
+if [ -z "${caller_name:-}" ] || [ "${caller_uid:-}" != "$SUDO_UID" ] || [ "$(id -u "$caller_name" 2>/dev/null || true)" != "$SUDO_UID" ]; then
+    echo "Session activation could not resolve the invoking domain identity." >&2
+    exit 1
+fi
+
+if ! id -nG "$caller_name" 2>/dev/null | tr ' ' '\n' | grep -Fxq "$USERS_GROUP"; then
+    echo "Domain user $caller_name is not an approved DR workstation user." >&2
+    exit 1
+fi
+
+validate_kit_invoking_cache
+
+[ -x "$REBIND_HELPER" ] || { echo "Missing Tool Server rebind helper: $REBIND_HELPER" >&2; exit 1; }
+[ -x "$MOUNT_HELPER" ] || { echo "Missing Tool Server mount helper: $MOUNT_HELPER" >&2; exit 1; }
+
+status_output=""
+status_output="$("$REBIND_HELPER" --status)" || {
+    printf '%s\n' "$status_output" >&2
+    exit 1
+}
+current_cruid="$(printf '%s\n' "$status_output" | awk -F= '$1 == "unit_cruid" { print $2; exit }')"
+case "$current_cruid" in
+    ''|*[!0-9]*)
+        echo "Tool Server mount credential owner is unavailable or invalid." >&2
+        exit 1
+        ;;
+esac
+
+if [ "$current_cruid" != "$SUDO_UID" ]; then
+    echo "Switching Tool Server credential ownership from UID $current_cruid to $SUDO_UID."
+    "$REBIND_HELPER" "$SUDO_UID"
+fi
+
+"$MOUNT_HELPER" --cruid "$SUDO_UID"
+echo "Tool Server session activation completed for $caller_name (UID $SUDO_UID)."
+EOF
+}
+
+render_arch_user_session_activation_helper() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+    cat << EOF
+#!/bin/bash
+set -u
+
+USERS_GROUP="$DR_WORKSTATION_USERS_GROUP"
+WORKSPACE_HELPER="/usr/local/bin/dr-user-desktop-provision"
+ROOT_HELPER="/usr/local/sbin/dr-workstation-session-activate"
+LOG_DIR="\${XDG_RUNTIME_DIR:-/tmp}"
+LOG="\$LOG_DIR/dr-workstation-session-activate.log"
+
+is_managed_user() {
+    id -nG 2>/dev/null | tr ' ' '\\n' | grep -Fxq "\$USERS_GROUP"
+}
+
+notify_failure() {
+    local message="\$1"
+    command -v notify-send >/dev/null 2>&1 && notify-send "Ontrack Tool Server" "\$message" >/dev/null 2>&1 || true
+}
+
+is_managed_user || exit 0
+mkdir -p "\$LOG_DIR" 2>/dev/null || true
+
+if [ -x "\$WORKSPACE_HELPER" ]; then
+    "\$WORKSPACE_HELPER" --session-activate >>"\$LOG" 2>&1 || true
+fi
+
+cache_ready=0
+for _attempt in {1..15}; do
+    case "\${KRB5CCNAME:-}" in
+        FILE:*) klist -s -c "\${KRB5CCNAME#FILE:}" >/dev/null 2>&1 && { cache_ready=1; break; } ;;
+    esac
+    sleep 1
+done
+
+if [ "\$cache_ready" -ne 1 ]; then
+    echo "No ready FILE Kerberos cache was available for session activation." >>"\$LOG"
+    notify_failure "Tool Server is waiting for your Kerberos login cache. Sign out and back in if this persists."
+    exit 0
+fi
+
+if ! sudo -n "\$ROOT_HELPER" >>"\$LOG" 2>&1; then
+    notify_failure "Tool Server was not activated. It may be in use by another KIT/DRIP session; see \$LOG."
+fi
+
+exit 0
 EOF
 }
 
@@ -6598,12 +6724,16 @@ install_post_mount_provision_helper() {
     local drip_launcher_support
     local arch_kit_launcher_support
     local arch_kit_post_mount_support
+    local arch_root_session_activation
+    local arch_user_session_activation
     kit_runtime_dir="$(dirname "$KIT_INSTALLER_PATH")"
     kit_cache_validator="$(render_kit_cache_validator)"
     kit_credential_self_test="$(render_kit_credential_self_test)"
     drip_launcher_support="$(render_drip_launcher_support)"
     arch_kit_launcher_support="$(render_arch_kit_launcher_support)"
     arch_kit_post_mount_support="$(render_arch_kit_post_mount_support)"
+    arch_root_session_activation="$(render_arch_root_session_activation_helper)"
+    arch_user_session_activation="$(render_arch_user_session_activation_helper)"
 
     # Generate this helper with quoted heredoc segments so runtime variables
     # such as $LOG, $KIT_DIR, ${1:-}, and $? are preserved until launch time,
@@ -6687,6 +6817,26 @@ EOF
     sed -i "s#__KIT_RUNTIME_DIR__#$escaped_kit_runtime_dir#g" /usr/local/sbin/dr-launch-kit
     chmod 755 /usr/local/sbin/dr-launch-kit
     chown root:root /usr/local/sbin/dr-launch-kit
+
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        printf '%s\n' "$arch_root_session_activation" > /usr/local/sbin/dr-workstation-session-activate
+        chmod 755 /usr/local/sbin/dr-workstation-session-activate
+        chown root:root /usr/local/sbin/dr-workstation-session-activate
+
+        printf '%s\n' "$arch_user_session_activation" > /usr/local/bin/dr-workstation-session-activate
+        chmod 755 /usr/local/bin/dr-workstation-session-activate
+        chown root:root /usr/local/bin/dr-workstation-session-activate
+
+        cat > /usr/local/bin/mount-kit-tools-autostart << 'EOF'
+#!/bin/bash
+# Arch uses a session-aware dispatcher because /mnt/x has one explicit
+# Kerberos credential owner. It refreshes the user workspace and rebinds only
+# when the existing transactional helper confirms KIT/DRIP are inactive.
+exec /usr/local/bin/dr-workstation-session-activate
+EOF
+        chmod 755 /usr/local/bin/mount-kit-tools-autostart
+        chown root:root /usr/local/bin/mount-kit-tools-autostart
+    fi
 
     cat > /usr/local/sbin/dr-post-mount-provision << EOF
 #!/bin/bash
@@ -7335,17 +7485,22 @@ if [ "\${1:-}" = "--refresh-kit-launcher" ]; then
     exit 0
 fi
 
+session_activate=0
+[ "\${1:-}" = "--session-activate" ] && session_activate=1
+
 mkdir -p "\$desktop_dir" "\$applications_dir" "\$bin_dir" "\$resources_dir" "\$notes_dir" "\$ONTRACK_LOG_DIR"
 
-# Keep the top-level desktop intentionally sparse. Manual mount lives inside Ontrack Resources.
-rm -f "\$desktop_dir/Mount DR Tools.desktop" 2>/dev/null || true
-rm -f "\$desktop_dir/Home.desktop" "\$desktop_dir/home.desktop" "\$desktop_dir/Computer.desktop" "\$desktop_dir/Trash.desktop" 2>/dev/null || true
+if [ "\$session_activate" -eq 0 ]; then
+    # Keep the top-level desktop intentionally sparse. Manual mount lives inside Ontrack Resources.
+    rm -f "\$desktop_dir/Mount DR Tools.desktop" 2>/dev/null || true
+    rm -f "\$desktop_dir/Home.desktop" "\$desktop_dir/home.desktop" "\$desktop_dir/Computer.desktop" "\$desktop_dir/Trash.desktop" 2>/dev/null || true
 
-# Hide GNOME desktop special icons where the extension/schema supports it.
-if command -v gsettings >/dev/null 2>&1; then
-    gsettings set org.gnome.shell.extensions.ding show-home false >/dev/null 2>&1 || true
-    gsettings set org.gnome.shell.extensions.ding show-trash false >/dev/null 2>&1 || true
-    gsettings set org.gnome.desktop.background show-desktop-icons false >/dev/null 2>&1 || true
+    # Hide GNOME desktop special icons where the extension/schema supports it.
+    if command -v gsettings >/dev/null 2>&1; then
+        gsettings set org.gnome.shell.extensions.ding show-home false >/dev/null 2>&1 || true
+        gsettings set org.gnome.shell.extensions.ding show-trash false >/dev/null 2>&1 || true
+        gsettings set org.gnome.desktop.background show-desktop-icons false >/dev/null 2>&1 || true
+    fi
 fi
 
 write_kit_user_launcher
@@ -7383,9 +7538,9 @@ link_resource() {
 }
 
 link_resource "Tool Server" "/mnt/x"
-rm -rf "$resources_dir/Logical Recovery Tools" 2>/dev/null || true
+rm -rf "\$resources_dir/Logical Recovery Tools" 2>/dev/null || true
 link_resource "DRTools" "/mnt/x/DRTools"
-rm -rf "$resources_dir/Physical Recovery Tools" 2>/dev/null || true
+rm -rf "\$resources_dir/Physical Recovery Tools" 2>/dev/null || true
 link_resource "CRTools" "/mnt/x/CRTools"
 link_resource "Firmware" "/mnt/x/Firmware"
 link_resource "Audit Resources" "/mnt/x/Audit"
@@ -7420,6 +7575,10 @@ For workstation diagnostics, run:
   net ads testjoin 2>/dev/null || realm list
   findmnt /mnt/x
 EOF2
+
+if [ "\$session_activate" -eq 1 ]; then
+    exit 0
+fi
 
 repair_bookmarks
 repair_aliases
@@ -8952,6 +9111,10 @@ EOF
 # Quiet login-time Tool Server/workspace verifier. Successful runs produce no UI.
 # If anything fails, show the captured diagnostics in a terminal and leave it open.
 set -u
+
+if [ -x /usr/local/bin/dr-workstation-session-activate ]; then
+    exec /usr/local/bin/dr-workstation-session-activate
+fi
 
 RUNNER="/usr/local/bin/mount-kit-tools-desktop-runner"
 LOG_DIR="${XDG_RUNTIME_DIR:-/tmp}"
