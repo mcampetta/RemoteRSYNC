@@ -4,6 +4,7 @@ set -euo pipefail
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$TEST_DIR/.." && pwd)"
 SCRIPT="$REPO_DIR/domain-join-latest.sh"
+CANDIDATE_SCRIPT="$REPO_DIR/domain-join-candidate.sh"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -19,6 +20,11 @@ assert_contains() {
     local haystack="$1" needle="$2" name="$3"
     [[ "$haystack" == *"$needle"* ]] || fail "$name: missing '$needle'"
     pass "$name"
+}
+test_candidate_entrypoint() {
+    [ -f "$CANDIDATE_SCRIPT" ] || fail "CachyOS candidate entrypoint exists"
+    cmp -s "$SCRIPT" "$CANDIDATE_SCRIPT" || fail "CachyOS candidate entrypoint matches feature script"
+    pass "CachyOS candidate entrypoint matches feature script"
 }
 write_os_release() {
     local file="$1" id="$2" like="$3" version="$4"
@@ -2790,6 +2796,7 @@ test_missing_commands_and_packages() {
     pass "missing Samba command is rejected safely"
 }
 
+test_candidate_entrypoint
 test_detection
 test_mappings
 test_renderers
