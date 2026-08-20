@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-INSTALLER_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/domain-join-latest.sh"
+INSTALLER_URL="https://github.com/mcampetta/RemoteRSYNC/raw/refs/heads/main/domain-join-candidate.sh"
 TMP="$(mktemp /tmp/dr-domain-join.XXXXXX.sh)"
 
 cleanup() {
