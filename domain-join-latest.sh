@@ -25,14 +25,16 @@
 #          reruns stop safely and direct users to dr-workstation commands.
 #
 # DNS behavior:
-#   This script expects DHCP/VPN to provide the correct office-local AD DNS
-#   servers. The script applies the required corporate DNS search list before
-#   realm discovery.
+#   Debian/Ubuntu preserve DHCP/VPN DNS and apply the required corporate search
+#   list. On Arch, a resolver that already passes AD SRV discovery is preserved;
+#   otherwise the selected office's configured fallback servers are validated
+#   before NetworkManager is changed.
 #
 # Optional override:
 #   If DHCP does not provide usable AD DNS, create domain-join.conf next to this
-#   script and set DNS_SERVERS="10.x.x.x 10.x.x.x". When DNS_SERVERS is set,
-#   the script will explicitly apply those DNS servers via NetworkManager.
+#   script and set DNS_SERVERS="10.x.x.x 10.x.x.x". Arch may also use
+#   office-specific DR_DNS_SERVERS_<OFFICE> and DR_TIME_SERVERS_<OFFICE>
+#   mappings; only the selected office's validated fallback is applied.
 #
 # Test mode:
 #   wget -qO- http://ontrack.link/joindomain | sudo bash -s -- --dns-test
@@ -43,10 +45,10 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.3.0-cachyos-samba-systemd-candidate"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
-STATE_DIR="/var/lib/dr-domain-join"
+STATE_DIR="${DR_JOIN_STATE_DIR:-/var/lib/dr-domain-join}"
 STATE_FILE="$STATE_DIR/state"
 DOMAIN_TARGET_HOSTNAME=""
 HOSTNAME_CHANGED=0
@@ -63,8 +65,34 @@ WINS_SERVER="10.40.249.101"
 DNS_SEARCH="dr.kodr.local,corp.altegrity.com,corp.eddom.org,corp.kroll.com,ontrack.com,ccp.edp.local"
 DNS_TEST_ONLY=false
 FULL_RECONFIGURE=false
+PLATFORM_REPORT_ONLY=false
+PREFLIGHT_ONLY=false
+DRY_RUN_ONLY=false
+PLATFORM_FAMILY=""
+PLATFORM_SUPPORTED=false
+PLATFORM_PACKAGE_MANAGER=""
+PLATFORM_VERSION=""
+PLATFORM_DESKTOP=""
+PLATFORM_DISPLAY_MANAGER=""
+DISPLAY_MANAGER_RUNNING=false
+PLATFORM_ADMIN_GROUP=""
+PLATFORM_REPORT_BLOCKERS=0
+PREFLIGHT_BLOCKERS=0
+OS_RELEASE_FILE="${DR_JOIN_OS_RELEASE_FILE:-/etc/os-release}"
 KIT_PROCESS_PATTERN="${KIT_PROCESS_PATTERN:-KIT}"
 KIT_INSTALLER_PATH="${KIT_INSTALLER_PATH:-/mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/KIT-installer-modified.sh}"
+DR_KIT_ARCH_COMPAT_DIR="${DR_KIT_ARCH_COMPAT_DIR:-/usr/local/libexec/dr-kit-arch}"
+DR_KIT_CPPREST_LIBRARY_PATH="${DR_KIT_CPPREST_LIBRARY_PATH:-}"
+DR_KIT_CPPREST_DEB_PATH="${DR_KIT_CPPREST_DEB_PATH:-}"
+DR_KIT_CPPREST_DEB_URL="https://archive.ubuntu.com/ubuntu/pool/universe/c/cpprest/libcpprest2.10_2.10.19-2build2_amd64.deb"
+DR_KIT_CPPREST_DEB_SHA256="a100a5feac0d96b86c423bf0c11f8f8a3a8b7d05243edce2484a993ade9f5bbd"
+DR_HASP_SOURCE_DIR="${DR_HASP_SOURCE_DIR:-/mnt/x/DRTools/frozen/Generic/HASP/V10.21}"
+DR_HASP_DEB_PATH="${DR_HASP_DEB_PATH:-/mnt/x/DRTools/frozen/Generic/HASP/V10.21/Sentinel_LDK_Ubuntu_DEB_Run-time_Installer/aksusbd_10.21-1_amd64.deb}"
+DR_HASP_CONFIG_DIR="${DR_HASP_CONFIG_DIR:-/etc/hasplm}"
+DR_HASP_UDEV_RULE="${DR_HASP_UDEV_RULE:-/etc/udev/rules.d/80-hasp.rules}"
+DR_HASP_SBIN_DIR="${DR_HASP_SBIN_DIR:-/usr/sbin}"
+DR_HASP_INIT_DIR="${DR_HASP_INIT_DIR:-/var/hasplm/init}"
+DR_HASP_SYSTEMD_DIR="${DR_HASP_SYSTEMD_DIR:-/etc/systemd/system}"
 BRAND_WALLPAPER_SOURCE="${BRAND_WALLPAPER_SOURCE:-/mnt/x/CRtools/Frozen/Branding/Wallpaper/1080p_ontrackwallpaper.jpg}"
 BRAND_WALLPAPER_DEST="/usr/share/backgrounds/dr-company-wallpaper"
 OFFICE_CODE=""
@@ -72,6 +100,34 @@ TOOLS_SERVER=""
 CONFIG_FILE="/etc/domain-join.conf"
 DR_WORKSTATION_USERS_GROUP="dr-workstation-users"
 DR_WORKSTATION_ADMINS_GROUP="dr-workstation-admins"
+DR_LOCAL_ADMIN_USER="${DR_LOCAL_ADMIN_USER:-drone}"
+DR_DNS_SERVERS_EP1="${DR_DNS_SERVERS_EP1:-10.59.4.201 10.59.4.202}"
+DR_TIME_SERVERS_EP1="${DR_TIME_SERVERS_EP1:-10.59.4.201 10.59.4.202}"
+DR_DNS_SERVERS="${DR_DNS_SERVERS:-}"
+DR_TIME_SERVERS="${DR_TIME_SERVERS:-}"
+DR_TIMESYNCD_DROPIN="${DR_TIMESYNCD_DROPIN:-/etc/systemd/timesyncd.conf.d/90-dr-domain.conf}"
+# The production workflow depends on KIT/IOLib DRIP paths. Arch provides only
+# configured /smb/server/share roots through systemd automount units; arbitrary
+# dynamic /smb or /net paths remain unsupported. A candidate may opt into
+# KIT-only validation with DRIP_REQUIRED=false, but completion remains blocked
+# when configured DRIP roots are required and unvalidated.
+DRIP_REQUIRED="${DRIP_REQUIRED:-true}"
+DR_DRIP_SEARCH_ROOTS="${DR_DRIP_SEARCH_ROOTS:-dr-ep-drip04/Images}"
+DR_DRIP_MANIFEST="${DR_DRIP_MANIFEST:-/var/lib/dr-domain-join/drip-units.manifest}"
+DR_DRIP_UNIT_DIR="${DR_DRIP_UNIT_DIR:-/etc/systemd/system}"
+DR_DRIP_HELPER_PATH="${DR_DRIP_HELPER_PATH:-/usr/local/sbin/dr-drip-search}"
+# A systemd .mount unit is generated before a user accesses /mnt/x, so it
+# needs the UID of the domain user's Kerberos cache at generation time.  The
+# normal path derives this from DOMAIN_SUDO_USER; an explicit UID is useful for
+# a staged candidate run and is safe to store because it is not a credential.
+DR_TOOLS_MOUNT_CRUID="${DR_TOOLS_MOUNT_CRUID:-}"
+DR_CIFS_MODULES_ROOT="${DR_CIFS_MODULES_ROOT:-/usr/lib/modules}"
+DR_CIFS_PROC_FILESYSTEMS="${DR_CIFS_PROC_FILESYSTEMS:-/proc/filesystems}"
+DR_LOCAL_KEYTAB="${DR_LOCAL_KEYTAB:-/etc/krb5.keytab}"
+DR_SAMBA_SECRETS_TDB="${DR_SAMBA_SECRETS_TDB:-/var/lib/samba/private/secrets.tdb}"
+ARCH_SSSD_DEFAULT_SHELL="${ARCH_SSSD_DEFAULT_SHELL:-/bin/bash}"
+DR_SUPPORTED_SHELLS_FILE="${DR_SUPPORTED_SHELLS_FILE:-/etc/shells}"
+JOIN_LIFECYCLE="${JOIN_LIFECYCLE:-NEW_JOIN}"
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 
@@ -111,9 +167,9 @@ load_config() {
     fi
 
     if [ -n "$DNS_SERVERS" ]; then
-        print_info "Configuration loaded; DNS override enabled: $DNS_SERVERS"
+        print_info "Configuration loaded; explicit DNS override enabled: $DNS_SERVERS"
     else
-        print_info "No DNS override configured; using DHCP/VPN-provided DNS servers"
+        print_info "No explicit DNS override configured; preserving working DNS or using the selected office fallback"
     fi
 }
 
@@ -121,6 +177,15 @@ load_config() {
 
 check_privileges() {
     if [ "$EUID" -ne 0 ]; then
+        local arg
+        for arg in "$@"; do
+            case "$arg" in
+                --platform-report|--preflight|--dry-run)
+                    print_warning "Read-only mode selected; root is not required"
+                    return 0
+                    ;;
+            esac
+        done
         print_error "This script must be run as root or with sudo"
         print_info 'Please run: wget -qO- http://ontrack.link/joindomain | sudo bash'
         exit 1
@@ -163,7 +228,8 @@ is_managed_workstation_admin() {
 }
 
 state_is_postjoin_complete() {
-    [ -f "$STATE_FILE" ] && grep -q '^STAGE="POSTJOIN_COMPLETE"$' "$STATE_FILE" 2>/dev/null
+    [ -f "$STATE_FILE" ] && grep -q '^STAGE="POSTJOIN_COMPLETE"$' "$STATE_FILE" 2>/dev/null || return 1
+    ! state_identity_contradiction
 }
 
 show_completed_workstation_message() {
@@ -195,9 +261,9 @@ show_completed_workstation_message() {
         echo ""
         echo "  To grant this account workstation administrator access, run:"
         echo ""
-        echo "    su - drone"
+        echo "    su - $DR_LOCAL_ADMIN_USER"
         echo ""
-        echo "  Enter the local drone account password, then run:"
+        echo "  Enter the local $DR_LOCAL_ADMIN_USER account password, then run:"
         echo ""
         echo "    sudo dr-workstation add-user $current_user"
         echo ""
@@ -223,6 +289,13 @@ completed_workstation_rerun_guard() {
         return 0
     fi
 
+    # Read-only inspection modes must remain read-only even on a completed
+    # workstation. They are allowed to report the managed-workstation state,
+    # but must not refresh the management command or sudo policy.
+    if [ "$PLATFORM_REPORT_ONLY" = true ] || [ "$PREFLIGHT_ONLY" = true ] || [ "$DRY_RUN_ONLY" = true ]; then
+        return 0
+    fi
+
     # A completed-workstation rerun is allowed to refresh only the isolated
     # management command and its sudo policy. It must not enter provisioning or
     # touch hostname, NetworkManager, DNS, Chrony, Kerberos, SSSD, or the realm.
@@ -236,26 +309,1075 @@ completed_workstation_rerun_guard() {
     exit 0
 }
 
-# ── OS detection ──────────────────────────────────────────────────────────────
+# ── Platform adapter layer ──────────────────────────────────────────────────
+#
+# Keep distro-specific package, service, PAM, and desktop behavior here. The
+# shared provisioning workflow below should depend on logical capabilities
+# rather than individual distribution names. Fedora is recognized so it can
+# receive a clear unsupported result later, but has no implementation here.
+
+PLATFORM_CAPABILITIES=(
+    realmd sssd sssd-tools adcli kerberos samba smbclient cifs autofs time-sync
+    networkmanager dns ldap sudo pam home-directory ssh-server winbind desktop-helper
+)
+
+platform_capability_class() {
+    case "$1" in
+        sssd|kerberos|pam|home-directory|sudo|time-sync) echo "core AD login" ;;
+        samba|smbclient) echo "Arch join backend" ;;
+        sssd-tools) echo "diagnostics only" ;;
+        cifs) echo "Tool Server mounting" ;;
+        realmd|adcli|autofs|ldap|dns|networkmanager|time-sync|ssh-server|winbind) echo "diagnostics/platform support" ;;
+        desktop-helper) echo "optional desktop integration" ;;
+        *) echo "shared capability" ;;
+    esac
+}
+
+platform_capability_required() {
+    local capability="$1"
+    case "$PLATFORM_FAMILY:$capability" in
+        arch:realmd|arch:adcli|arch:autofs|arch:winbind|arch:ldap|arch:sssd-tools|arch:desktop-helper)
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+# DRIP is a path contract, not merely a CIFS capability. Debian retains its
+# dynamic autofs implementation. Arch implements only explicitly configured
+# /smb/server/share roots; arbitrary dynamic roots remain unsupported.
+platform_drip_supported() {
+    if [ "$PLATFORM_FAMILY" = "debian" ]; then
+        return 0
+    fi
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 1
+    platform_validate_drip_search_roots >/dev/null 2>&1
+}
+
+platform_drip_path_supported() {
+    local path="${1:-}"
+    case "$path" in
+        /smb/*)
+            local relative entry
+            [ "$PLATFORM_FAMILY" = "debian" ] && return 0
+            relative="${path#/smb/}"
+            platform_validate_drip_search_roots >/dev/null 2>&1 || return 1
+            while IFS= read -r entry; do
+                case "$relative" in
+                    "$entry"|"$entry"/*) return 0 ;;
+                esac
+            done < <(platform_drip_search_entries)
+            return 1
+            ;;
+        /net/*) [ "$PLATFORM_FAMILY" = "debian" ] ;;
+        *) return 1 ;;
+    esac
+}
+
+platform_drip_requirement_satisfied() {
+    [ "$DRIP_REQUIRED" != true ] || platform_drip_supported
+}
+
+platform_drip_search_entries() {
+    local roots="${DR_DRIP_SEARCH_ROOTS:-}"
+    [ -n "$roots" ] || return 0
+    case "$roots" in
+        *$'\n'*|*$'\r'*|*$'\t'*) return 1 ;;
+    esac
+    # Configuration is whitespace-delimited. Validation rejects whitespace
+    # inside an individual server/share entry, so this cannot split a valid
+    # component ambiguously.
+    read -r -a _drip_entries <<< "$roots"
+    printf '%s\n' "${_drip_entries[@]}"
+}
+
+validate_drip_search_root_entry() {
+    local entry="${1:-}"
+    local server share extra
+    case "$entry" in
+        ''|*[$'\t\r\n ']*|*\\*|*..*|*[\'\"\$\`\;\|\&\<\>\(\)\{\}\[\]]*) return 1 ;;
+    esac
+    IFS=/ read -r server share extra <<< "$entry"
+    [ -n "$server" ] && [ -n "$share" ] && [ -z "${extra:-}" ] || return 1
+    printf '%s\n' "$server" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$' || return 1
+    printf '%s\n' "$share" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' || return 1
+    return 0
+}
+
+platform_validate_drip_search_roots() {
+    local entry count=0
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        validate_drip_search_root_entry "$entry" || return 1
+        count=$((count + 1))
+    done < <(platform_drip_search_entries)
+    [ "$count" -gt 0 ]
+}
+
+platform_validate_drip_requirement() {
+    if platform_drip_supported; then
+        if [ "$PLATFORM_FAMILY" = "debian" ]; then
+            preflight_pass "DRIP dynamic paths are provided by the Debian autofs adapter"
+        else
+            preflight_pass "Configured Arch DRIP roots are syntactically valid; live DRIP validation remains required"
+        fi
+        return 0
+    fi
+
+    if [ "$DRIP_REQUIRED" = true ]; then
+        preflight_blocked "Arch DRIP configuration is invalid or empty; configured-root /smb support cannot be enabled"
+        return 1
+    fi
+
+    preflight_warning "Arch configured-root DRIP is invalid or empty; no /smb roots will be generated (DRIP_REQUIRED=false)"
+    return 0
+}
+
+platform_detect_desktop() {
+    local desktop="${XDG_CURRENT_DESKTOP:-}"
+
+    if [ -z "$desktop" ] && command -v loginctl >/dev/null 2>&1; then
+        desktop="$(loginctl show-session "${XDG_SESSION_ID:-}" -p Desktop --value 2>/dev/null || true)"
+    fi
+    if [ -z "$desktop" ] && [ -d /usr/share/plasma ]; then
+        desktop="KDE"
+    elif [ -z "$desktop" ] && [ -d /usr/share/gnome-shell ]; then
+        desktop="GNOME"
+    fi
+
+    case "${desktop,,}" in
+        *kde*|*plasma*) PLATFORM_DESKTOP="KDE Plasma" ;;
+        *gnome*) PLATFORM_DESKTOP="GNOME" ;;
+        *xfce*) PLATFORM_DESKTOP="XFCE" ;;
+        *mate*) PLATFORM_DESKTOP="MATE" ;;
+        "") PLATFORM_DESKTOP="Unknown" ;;
+        *) PLATFORM_DESKTOP="$desktop" ;;
+    esac
+}
+
+platform_detect_display_manager() {
+    local manager_id
+    manager_id="$(systemctl show display-manager.service -p Id --value 2>/dev/null || true)"
+    case "$manager_id" in
+        *.service) PLATFORM_DISPLAY_MANAGER="$manager_id" ;;
+        *) PLATFORM_DISPLAY_MANAGER="Unknown" ;;
+    esac
+}
+
+platform_validate_version() {
+    case "$PLATFORM_FAMILY" in
+        arch)
+            # Arch-family releases are rolling. CachyOS may expose BUILD_ID
+            # rather than a numeric VERSION_ID, so no numeric minimum applies.
+            return 0
+            ;;
+        debian)
+            case "$OS" in
+                ubuntu)
+                    [ -n "${VER:-}" ] || return 1
+                    [ "$(printf '%s\n' "$VER" "22.04" | sort -V | head -1)" = "22.04" ]
+                    ;;
+                debian)
+                    [ -n "${VER:-}" ] || return 1
+                    [ "$(printf '%s\n' "$VER" "13" | sort -V | head -1)" = "13" ]
+                    ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+detect_platform() {
+    if [ ! -f "$OS_RELEASE_FILE" ]; then
+        print_error "Cannot detect platform. $OS_RELEASE_FILE not found."
+        return 1
+    fi
+
+    # shellcheck disable=SC1090
+    . "$OS_RELEASE_FILE"
+    OS="${ID:-unknown}"
+    VER="${VERSION_ID:-${BUILD_ID:-rolling}}"
+    PLATFORM_VERSION="$VER"
+    PLATFORM_FAMILY=""
+
+    case "$OS" in
+        ubuntu|debian) PLATFORM_FAMILY="debian" ;;
+        arch|cachyos) PLATFORM_FAMILY="arch" ;;
+        fedora) PLATFORM_FAMILY="fedora" ;;
+    esac
+
+    if [ -z "$PLATFORM_FAMILY" ]; then
+        for family in $ID_LIKE; do
+            case "$family" in
+                debian) PLATFORM_FAMILY="debian"; break ;;
+                arch) PLATFORM_FAMILY="arch"; break ;;
+                fedora|rhel) PLATFORM_FAMILY="fedora"; break ;;
+            esac
+        done
+    fi
+
+    PLATFORM_SUPPORTED=false
+    case "$PLATFORM_FAMILY" in
+        debian|arch) PLATFORM_SUPPORTED=true ;;
+        fedora) PLATFORM_SUPPORTED=false ;;
+        *) PLATFORM_FAMILY="unknown" ;;
+    esac
+
+    case "$PLATFORM_FAMILY" in
+        debian) PLATFORM_PACKAGE_MANAGER="apt" ;;
+        arch) PLATFORM_PACKAGE_MANAGER="pacman" ;;
+        *) PLATFORM_PACKAGE_MANAGER="unknown" ;;
+    esac
+
+    platform_detect_desktop
+    platform_detect_display_manager
+    if ! platform_validate_version; then
+        PLATFORM_SUPPORTED=false
+    fi
+}
 
 detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS=$ID
-        VER=$VERSION_ID
-    else
-        print_error "Cannot detect OS. /etc/os-release not found."
-        exit 1
+    detect_platform || return 1
+
+    if [ "$PLATFORM_SUPPORTED" != true ]; then
+        print_error "Unsupported platform: ID=${OS:-unknown} ID_LIKE=${ID_LIKE:-unknown} VERSION=${VER:-unknown}"
+        if [ "$PLATFORM_FAMILY" = "fedora" ]; then
+            print_error "Fedora-family support is reserved for a future adapter implementation."
+        else
+            print_error "Supported families in this candidate are Debian/Ubuntu and Arch/CachyOS."
+        fi
+        return 1
     fi
 
-    if [[ "$OS" != "ubuntu" && "$OS" != "debian" ]]; then
-        print_error "Unsupported OS: $OS"
-        print_error "This script only supports Ubuntu and Debian."
-        exit 1
-    fi
-
-    print_info "Detected OS: $OS $VER"
+    print_info "Detected platform: $OS $VER (family=$PLATFORM_FAMILY, desktop=$PLATFORM_DESKTOP, display-manager=$PLATFORM_DISPLAY_MANAGER)"
 }
+
+platform_package_name() {
+    local capability="$1"
+
+    case "$PLATFORM_FAMILY:$capability" in
+        debian:realmd) echo "realmd" ;;
+        debian:sssd) echo "sssd" ;;
+        debian:sssd-tools) echo "sssd-tools" ;;
+        debian:adcli) echo "adcli" ;;
+        debian:kerberos) echo "krb5-user" ;;
+        debian:samba) echo "samba-common-bin" ;;
+        debian:smbclient) echo "smbclient" ;;
+        debian:cifs) echo "cifs-utils" ;;
+        debian:autofs) echo "autofs" ;;
+        debian:time-sync) echo "chrony" ;;
+        debian:networkmanager) echo "network-manager" ;;
+        debian:dns) echo "dnsutils" ;;
+        debian:ldap) echo "ldap-utils" ;;
+        debian:sudo) echo "sudo" ;;
+        debian:pam) echo "libpam-modules" ;;
+        debian:home-directory)
+            if [ "$OS" = "debian" ]; then echo "oddjob-mkhomedir"; else echo "libpam-mkhomedir"; fi
+            ;;
+        debian:ssh-server) echo "openssh-server" ;;
+        debian:desktop-helper) echo "xdg-utils" ;;
+        debian:winbind) echo "winbind" ;;
+        debian:packagekit) echo "packagekit" ;;
+        debian:update-policy) echo "unattended-upgrades" ;;
+        arch:realmd) ;;
+        arch:sssd) echo "sssd" ;;
+        # Arch packages sssctl with sssd when present; verify the command
+        # after installation because no separate sssd-tools package exists.
+        arch:sssd-tools) echo "sssd" ;;
+        arch:adcli) ;;
+        arch:kerberos) echo "krb5" ;;
+        arch:samba) echo "samba" ;;
+        arch:smbclient) echo "smbclient" ;;
+        arch:cifs) echo "cifs-utils" ;;
+        arch:autofs) ;;
+        arch:time-sync) echo "chrony" ;;
+        arch:networkmanager) echo "networkmanager" ;;
+        arch:dns) echo "bind" ;;
+        arch:ldap) echo "openldap" ;;
+        arch:sudo) echo "sudo" ;;
+        arch:pam) echo "pam" ;;
+        arch:home-directory) echo "pam" ;;
+        arch:ssh-server) echo "openssh" ;;
+        arch:desktop-helper) echo "xdg-utils" ;;
+        # The Arch backend uses Samba's net utility and SSSD. Winbind is not
+        # started or enabled, so it is intentionally not a dependency.
+        arch:winbind) ;;
+        *) ;;
+    esac
+}
+
+platform_is_package_installed() {
+    local package="$1"
+    [ -n "$package" ] || return 1
+
+    case "$PLATFORM_FAMILY" in
+        debian)
+            dpkg-query -W -f='${Status}\n' "$package" 2>/dev/null | grep -q '^install ok installed$'
+            ;;
+        arch)
+            pacman -Qq "$package" >/dev/null 2>&1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+platform_is_package_available() {
+    local package="$1"
+    [ -n "$package" ] || return 1
+
+    case "$PLATFORM_FAMILY" in
+        debian) apt-cache show "$package" >/dev/null 2>&1 ;;
+        arch) pacman -Si "$package" >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+platform_prepare_package_manager() {
+    case "$PLATFORM_FAMILY" in
+        debian)
+            wait_for_apt_locks
+            ;;
+        arch)
+            local newest_db now age
+            newest_db="$(stat -c '%Y' /var/lib/pacman/sync/*.db 2>/dev/null | sort -nr | head -1 || true)"
+            now="$(date +%s)"
+            if [ -n "$newest_db" ]; then
+                age=$((now - newest_db))
+                if [ "$age" -gt 604800 ]; then
+                    print_warning "pacman sync databases are ${age}s old; no automatic pacman -Syu or database refresh will be performed"
+                fi
+            else
+                print_error "No pacman sync database is available"
+                return 1
+            fi
+            ;;
+        *)
+            print_error "No package-manager adapter exists for platform family '$PLATFORM_FAMILY'"
+            return 1
+            ;;
+    esac
+}
+
+platform_install_package() {
+    local capability="$1"
+    local package
+    package="$(platform_package_name "$capability")"
+
+    if [ -z "$package" ]; then
+        print_error "No package mapping exists for capability '$capability' on $PLATFORM_FAMILY"
+        return 1
+    fi
+    if platform_is_package_installed "$package"; then
+        print_info "$capability: $package is already installed"
+        return 0
+    fi
+    if ! platform_is_package_available "$package"; then
+        print_error "Required package '$package' for capability '$capability' is unavailable in configured repositories"
+        return 1
+    fi
+
+    case "$PLATFORM_FAMILY" in
+        debian) install_package "$package" ;;
+        arch)
+            platform_prepare_package_manager || return 1
+            print_info "Installing $package with pacman --needed (no full-system upgrade)"
+            pacman -S --needed --noconfirm "$package"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+platform_install_packages() {
+    local capability
+    platform_prepare_package_manager || return 1
+    for capability in "$@"; do
+        if [ "$capability" = "time-sync" ] && platform_time_provider_satisfies; then
+            print_info "time-sync: existing supported provider $(platform_time_provider active) is already available"
+            continue
+        fi
+        platform_install_package "$capability" || return 1
+    done
+}
+
+platform_service_name() {
+    case "$PLATFORM_FAMILY:$1" in
+        arch:time-sync) echo "chronyd" ;;
+        debian:time-sync) echo "chrony" ;;
+        arch:ssh-server) echo "sshd" ;;
+        debian:ssh-server) echo "ssh" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+platform_enable_service() {
+    local capability="$1"
+    local service
+    service="$(platform_service_name "$capability")"
+    systemctl enable --now "$service"
+}
+
+platform_admin_group() {
+    case "$PLATFORM_FAMILY" in
+        arch)
+            PLATFORM_ADMIN_GROUP="wheel"
+            ;;
+        debian)
+            if getent group sudo >/dev/null 2>&1; then
+                PLATFORM_ADMIN_GROUP="sudo"
+            else
+                PLATFORM_ADMIN_GROUP="adm"
+            fi
+            ;;
+        *) PLATFORM_ADMIN_GROUP="" ;;
+    esac
+    printf '%s\n' "$PLATFORM_ADMIN_GROUP"
+}
+
+platform_desktop_integration() {
+    case "$PLATFORM_DESKTOP" in
+        "GNOME") echo "GNOME best-effort dconf/gsettings integration" ;;
+        "KDE Plasma") echo "KDE Plasma: preserve user preferences; desktop files only" ;;
+        *) echo "Unsupported desktop: core provisioning continues; customization skipped" ;;
+    esac
+}
+
+platform_validate_auth_stack() {
+    local failed=0
+    case "$PLATFORM_FAMILY" in
+        arch)
+            for file in /etc/pam.d/system-auth /etc/pam.d/system-login; do
+                [ -f "$file" ] || failed=1
+            done
+            [ -f /usr/lib/security/pam_mkhomedir.so ] || failed=1
+            ;;
+        debian)
+            [ -f /etc/pam.d/common-auth ] || failed=1
+            [ -f /etc/pam.d/common-account ] || failed=1
+            [ -f /etc/pam.d/common-session ] || failed=1
+            ;;
+        *) failed=1 ;;
+    esac
+    return "$failed"
+}
+
+platform_validate_cifs_kernel() {
+    [ "$PLATFORM_FAMILY" = arch ] || return 0
+    local running_kernel="$(uname -r)"
+    local module_tree="$DR_CIFS_MODULES_ROOT/$running_kernel"
+    if [ ! -d "$module_tree" ]; then
+        preflight_blocked "Running kernel $running_kernel has no matching module tree."
+        preflight_blocked "Installed kernel packages have changed since boot. Reboot into the installed kernel before continuing."
+        return 1
+    fi
+    if grep -Eq '(^|[[:space:]])cifs([[:space:]]|$)' "$DR_CIFS_PROC_FILESYSTEMS" 2>/dev/null; then
+        preflight_pass "CIFS is built into the running kernel $running_kernel"
+        return 0
+    fi
+    if command -v modinfo >/dev/null 2>&1 && modinfo -k "$running_kernel" cifs >/dev/null 2>&1; then
+        preflight_pass "CIFS module is available for the running kernel $running_kernel"
+        return 0
+    fi
+    preflight_blocked "CIFS is neither built into nor loadable for the running kernel $running_kernel"
+    return 1
+}
+
+platform_cifs_kernel_is_ready() {
+    [ "$PLATFORM_FAMILY" = arch ] || return 0
+    local running_kernel="$(uname -r)"
+    [ -d "$DR_CIFS_MODULES_ROOT/$running_kernel" ] || return 1
+    grep -Eq '(^|[[:space:]])cifs([[:space:]]|$)' "$DR_CIFS_PROC_FILESYSTEMS" 2>/dev/null && return 0
+    command -v modinfo >/dev/null 2>&1 && modinfo -k "$running_kernel" cifs >/dev/null 2>&1
+}
+
+backup_config_file() {
+    local file="$1"
+    local backup
+    [ -e "$file" ] || return 0
+    backup="${file}.domain-join.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a -- "$file" "$backup"
+    chmod --reference="$file" "$backup" 2>/dev/null || true
+    print_info "Backed up $file to $backup"
+}
+
+platform_capability_status() {
+    local capability="$1"
+    local package
+    if [ "$capability" = "time-sync" ] && platform_time_provider_satisfies; then
+        printf 'PASS|%s|existing selected provider is active or enabled (%s)' "$capability" "$(platform_time_provider selected)"
+        return 0
+    fi
+    package="$(platform_package_name "$capability")"
+    if [ -z "$package" ]; then
+        if platform_capability_required "$capability"; then
+            printf 'BLOCKED|%s|no configured-repository mapping' "$capability"
+        else
+            printf 'WARNING|%s|unavailable but no longer required on %s' "$capability" "$PLATFORM_FAMILY"
+        fi
+    elif platform_is_package_installed "$package"; then
+        printf 'PASS|%s|%s installed' "$capability" "$package"
+    elif platform_is_package_available "$package"; then
+        if platform_capability_required "$capability"; then
+            printf 'WARNING|%s|%s available but not installed' "$capability" "$package"
+        else
+            printf 'WARNING|%s|%s available but not installed (optional/diagnostic)' "$capability" "$package"
+        fi
+    else
+        if platform_capability_required "$capability"; then
+            printf 'BLOCKED|%s|%s unavailable in configured repositories' "$capability" "$package"
+        else
+            printf 'WARNING|%s|%s unavailable but no longer required' "$capability" "$package"
+        fi
+    fi
+}
+
+platform_report() {
+    local capability status name detail package_db display_package
+    PLATFORM_REPORT_BLOCKERS=0
+    platform_admin_group >/dev/null
+
+    package_db="unknown"
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        package_db="$(stat -c '%y' /var/lib/pacman/sync/*.db 2>/dev/null | sort -r | head -1 || echo unavailable)"
+    elif [ "$PLATFORM_FAMILY" = "debian" ]; then
+        package_db="apt metadata directory: /var/lib/apt/lists"
+    fi
+
+    echo "Platform report"
+    echo "  Distro:              ${OS:-unknown}"
+    echo "  Platform family:     ${PLATFORM_FAMILY:-unknown}"
+    echo "  Version:             ${PLATFORM_VERSION:-unknown}"
+    echo "  Supported:           ${PLATFORM_SUPPORTED}"
+    echo "  Desktop:             ${PLATFORM_DESKTOP:-Unknown}"
+    echo "  Display manager:     ${PLATFORM_DISPLAY_MANAGER:-Unknown}"
+    echo "  Package manager:     ${PLATFORM_PACKAGE_MANAGER:-unknown}"
+    echo "  Package-manager DB:  $package_db"
+    echo "  Administrator group: ${PLATFORM_ADMIN_GROUP:-unavailable}"
+    echo "  Resolver:            $(if systemctl is-active --quiet systemd-resolved 2>/dev/null; then echo systemd-resolved; else echo /etc/resolv.conf; fi)"
+    echo "  Time provider:       $(platform_time_provider active)"
+    echo "  Time enabled:        $(platform_time_provider enabled)"
+    echo "  Desktop adapter:     $(platform_desktop_integration)"
+    if [ "$PLATFORM_FAMILY" = "debian" ]; then
+        echo "  DRIP support:        supported via dynamic Debian autofs (/smb and /net)"
+    elif platform_drip_supported; then
+        echo "  DRIP support:        configured-root Arch systemd automounts (/smb only)"
+        echo "  DRIP search roots:   ${DR_DRIP_SEARCH_ROOTS:-none}"
+        echo "  DRIP scope:          arbitrary dynamic /smb and /net paths are unsupported"
+    else
+        echo "  DRIP support:        BLOCKED (configured Arch roots are invalid or unavailable)"
+    fi
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        echo "  /mnt/x ownership:    selected domain-user UID; explicit dr-tools-rebind required when users change"
+    fi
+    echo "  DRIP required:       $DRIP_REQUIRED"
+    echo ""
+    echo "Capability/package mapping"
+    for capability in "${PLATFORM_CAPABILITIES[@]}"; do
+        IFS='|' read -r status name detail <<< "$(platform_capability_status "$capability")"
+        display_package="$(platform_package_name "$name")"
+        if [ "$name" = time-sync ] && [ "$(platform_time_provider selected)" != none ]; then
+            display_package="$(platform_time_provider selected)"
+        fi
+        printf '  %-8s %-18s %-28s %s (%s)\n' "$status" "$name" "$(platform_capability_class "$name")" "$detail" "$display_package"
+        [ "$status" = "BLOCKED" ] && PLATFORM_REPORT_BLOCKERS=$((PLATFORM_REPORT_BLOCKERS + 1))
+    done
+    echo ""
+    if [ "$PLATFORM_SUPPORTED" = true ] && [ "$PLATFORM_REPORT_BLOCKERS" -eq 0 ]; then
+        echo "PASS Supported platform and configured-repository capability map"
+    elif [ "$PLATFORM_SUPPORTED" = true ]; then
+        echo "BLOCKED Supported platform has unavailable or unmapped capabilities"
+    else
+        echo "BLOCKED Platform is unsupported or not implemented"
+    fi
+}
+
+platform_time_provider() {
+    local mode="${1:-active}"
+    local service
+
+    if [ "$mode" = "selected" ]; then
+        service="$(platform_time_provider active)"
+        if [ "$service" != none ]; then
+            echo "$service"
+            return 0
+        fi
+        service="$(platform_time_provider enabled)"
+        [ "$service" != none ] && echo "$service" || echo none
+        return 0
+    elif [ "$mode" = "enabled" ]; then
+        for service in chronyd chrony systemd-timesyncd; do
+            if systemctl is-enabled --quiet "$service" 2>/dev/null; then
+                echo "$service"
+                return 0
+            fi
+        done
+    else
+        for service in chronyd chrony systemd-timesyncd; do
+            if systemctl is-active --quiet "$service" 2>/dev/null; then
+                echo "$service"
+                return 0
+            fi
+        done
+    fi
+
+    echo "none"
+}
+
+platform_time_provider_satisfies() {
+    [ "$(platform_time_provider selected)" != none ]
+}
+
+platform_time_sources() {
+    platform_office_server_list TIME
+}
+
+render_arch_timesyncd_dropin() {
+    [ "$PLATFORM_FAMILY" = arch ] || return 1
+    local sources
+    sources="$(platform_time_sources)"
+    platform_validate_server_list "$sources" || return 1
+    cat << EOF
+# Managed by DR Domain Join; vendor files under /usr/lib are not modified.
+[Time]
+NTP=
+NTP=$sources
+FallbackNTP=
+EOF
+}
+
+platform_timesyncd_source_matches() {
+    local status sources source
+    sources="$(platform_time_sources)"
+    platform_validate_server_list "$sources" || return 1
+    status="$(timedatectl timesync-status 2>/dev/null || true)"
+    [ -n "$status" ] || return 1
+    for source in $sources; do
+        if printf '%s\n' "$status" | grep -Fq -- "$source"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+platform_timesyncd_dropin_matches() {
+    [ -f "$DR_TIMESYNCD_DROPIN" ] || return 1
+    diff -q <(render_arch_timesyncd_dropin) "$DR_TIMESYNCD_DROPIN" >/dev/null 2>&1
+}
+
+platform_timesyncd_is_ready() {
+    [ "$(platform_time_provider selected)" = systemd-timesyncd ] || return 1
+    [ "$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || true)" = yes ] || return 1
+    platform_timesyncd_source_matches
+}
+
+platform_wait_for_timesyncd() {
+    local retries="${DR_TIME_SYNC_RETRIES:-6}"
+    local delay="${DR_TIME_SYNC_RETRY_DELAY:-5}"
+    local count=0
+    while [ "$count" -lt "$retries" ]; do
+        if platform_timesyncd_is_ready; then
+            return 0
+        fi
+        count=$((count + 1))
+        [ "$count" -lt "$retries" ] && sleep "$delay"
+    done
+    return 1
+}
+
+platform_configure_timesyncd() {
+    [ "$PLATFORM_FAMILY" = arch ] || return 0
+    if [ "${1:-}" != force ] && [ "$(platform_time_provider selected)" != systemd-timesyncd ]; then
+        return 0
+    fi
+    local target="$DR_TIMESYNCD_DROPIN"
+    local directory staged rollback_copy old_exists=0
+    directory="$(dirname "$target")"
+    mkdir -p "$directory" || return 1
+    staged="$(mktemp "$directory/.90-dr-domain.conf.XXXXXX")" || return 1
+    rollback_copy="$(mktemp "$directory/.90-dr-domain.rollback.XXXXXX")" || {
+        rm -f -- "$staged"
+        return 1
+    }
+    rm -f -- "$rollback_copy"
+
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        old_exists=1
+        cp -a -- "$target" "$rollback_copy" || {
+            rm -f -- "$staged" "$rollback_copy"
+            return 1
+        }
+    fi
+    render_arch_timesyncd_dropin > "$staged" || {
+        rm -f -- "$staged" "$rollback_copy"
+        return 1
+    }
+    chmod 644 "$staged"
+    chown root:root "$staged" 2>/dev/null || true
+
+    if cmp -s "$staged" "$target" 2>/dev/null; then
+        rm -f -- "$staged" "$rollback_copy"
+        if command -v systemd-analyze >/dev/null 2>&1; then
+            systemd-analyze cat-config systemd/timesyncd.conf >/dev/null 2>&1 || return 1
+        fi
+        return 0
+    fi
+
+    backup_config_file "$target"
+    mv -f -- "$staged" "$target" || {
+        rm -f -- "$staged" "$rollback_copy"
+        return 1
+    }
+    if command -v systemd-analyze >/dev/null 2>&1 && ! systemd-analyze cat-config systemd/timesyncd.conf >/dev/null 2>&1; then
+        if [ "$old_exists" -eq 1 ]; then
+            rm -f -- "$target"
+            cp -a -- "$rollback_copy" "$target"
+        else
+            rm -f -- "$target"
+        fi
+        rm -f -- "$rollback_copy"
+        return 1
+    fi
+
+    if ! systemctl restart systemd-timesyncd >/dev/null 2>&1 || ! platform_wait_for_timesyncd; then
+        if [ "$old_exists" -eq 1 ]; then
+            rm -f -- "$target"
+            cp -a -- "$rollback_copy" "$target"
+        else
+            rm -f -- "$target"
+        fi
+        systemctl restart systemd-timesyncd >/dev/null 2>&1 || true
+        rm -f -- "$rollback_copy"
+        return 1
+    fi
+    rm -f -- "$rollback_copy"
+    return 0
+}
+
+platform_time_is_synchronized() {
+    local ntp_synced
+    ntp_synced="$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || true)"
+    [ "$ntp_synced" = yes ] && return 0
+    chronyc tracking 2>/dev/null | grep -qE '^Leap status[[:space:]]*:[[:space:]]*Normal'
+}
+
+platform_time_diagnostics() {
+    local active enabled synced timesync_status chrony_tracking chrony_sources
+    active="$(platform_time_provider active)"
+    enabled="$(platform_time_provider enabled)"
+    synced="$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || echo unknown)"
+    timesync_status="$(timedatectl timesync-status 2>/dev/null || true)"
+    chrony_tracking="$(chronyc tracking 2>/dev/null || true)"
+    chrony_sources="$(chronyc sources -v 2>/dev/null || true)"
+
+    echo "Time synchronization diagnostics"
+    echo "  Active provider:    $active"
+    echo "  Enabled provider:   $enabled"
+    echo "  Synchronized:       $synced"
+    if [ -n "$timesync_status" ]; then
+        echo "  systemd-timesyncd:"
+        echo "$timesync_status" | sed 's/^/    /'
+    fi
+    if [ -n "$chrony_tracking" ]; then
+        echo "  chrony tracking:"
+        echo "$chrony_tracking" | sed 's/^/    /'
+    fi
+    if [ -n "$chrony_sources" ]; then
+        echo "  chrony sources:"
+        echo "$chrony_sources" | sed 's/^/    /'
+    fi
+
+    if [ "$(platform_time_provider selected)" = systemd-timesyncd ] && ! platform_timesyncd_source_matches; then
+        echo "  Source availability: synchronized state is not tied to a configured corporate source"
+        echo "  Kerberos impact:     BLOCKED — time source policy is not satisfied"
+        echo "  Proposed correction: install $DR_TIMESYNCD_DROPIN with NTP reset, configured office sources, and FallbackNTP reset"
+    elif platform_time_is_synchronized; then
+        echo "  Source availability: synchronized source reported"
+        echo "  Kerberos impact:     PASS"
+        echo "  Proposed correction: none"
+    else
+        echo "  Source availability: no synchronized source is currently reported"
+        echo "  Kerberos impact:     BLOCKED — clock skew can invalidate Kerberos"
+        echo "  Proposed correction: operator-approved repair of the active provider"
+        echo "                       after checking UDP/123 reachability and approved AD NTP sources"
+        echo "                       (no provider switch or NTP change is performed automatically)"
+    fi
+}
+
+platform_time_preflight_ready() {
+    local selected_provider
+    selected_provider="$(platform_time_provider selected)"
+    [ "$selected_provider" != none ] || return 1
+    if [ "$selected_provider" = systemd-timesyncd ]; then
+        platform_validate_server_list "$(platform_time_sources)" || return 1
+        [ "$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || true)" = yes ]
+    else
+        platform_time_is_synchronized
+    fi
+}
+
+platform_break_glass_is_local() {
+    awk -F: -v user="$DR_LOCAL_ADMIN_USER" '$1 == user { found=1 } END { exit(found ? 0 : 1) }' /etc/passwd 2>/dev/null
+}
+
+platform_validate_break_glass() {
+    local admin_group="$1"
+    local groups
+
+    echo "Break-glass account: $DR_LOCAL_ADMIN_USER"
+    if platform_break_glass_is_local; then
+        echo "Source: local"
+    else
+        echo "Source: missing or not local"
+        preflight_blocked "Break-glass account $DR_LOCAL_ADMIN_USER is not a local /etc/passwd account"
+        return 1
+    fi
+    echo "Administrator group: ${admin_group:-unavailable}"
+    echo "Password status: operator verification required"
+
+    groups="$(id -nG "$DR_LOCAL_ADMIN_USER" 2>/dev/null || true)"
+    if [ -n "$admin_group" ] && printf '%s\n' "$groups" | tr ' ' '\n' | grep -Fxq "$admin_group"; then
+        preflight_pass "Break-glass account $DR_LOCAL_ADMIN_USER is in native administrator group $admin_group"
+    else
+        preflight_blocked "Break-glass account $DR_LOCAL_ADMIN_USER is not in native administrator group ${admin_group:-<unknown>}"
+        return 1
+    fi
+    preflight_warning "Verify $DR_LOCAL_ADMIN_USER has a working local password and offline root access; no password test was performed"
+    return 0
+}
+
+preflight_pass() { printf 'PASS %s\n' "$*"; }
+preflight_warning() { printf 'WARNING %s\n' "$*"; }
+preflight_blocked() { PREFLIGHT_BLOCKERS=$((PREFLIGHT_BLOCKERS + 1)); printf 'BLOCKED %s\n' "$*"; }
+
+platform_preflight() {
+    local current_host dns_output dns_source
+    PREFLIGHT_BLOCKERS=0
+    platform_report
+
+    if state_requires_recovery; then
+        preflight_blocked "Persisted join state contradicts the current hostname and active machine credentials are absent; recovery is required before provisioning"
+    fi
+
+    [ "$PLATFORM_SUPPORTED" = true ] || preflight_blocked "platform is not supported by this candidate"
+    [ "$PLATFORM_REPORT_BLOCKERS" -eq 0 ] || preflight_blocked "$PLATFORM_REPORT_BLOCKERS required package capabilities are unavailable or unmapped"
+    platform_validate_cifs_kernel || true
+    platform_validate_drip_requirement || true
+
+    if nmcli general status >/dev/null 2>&1; then
+        preflight_pass "NetworkManager is queryable"
+    else
+        preflight_blocked "NetworkManager is unavailable or not queryable"
+    fi
+
+    dns_output="$(resolvectl status 2>/dev/null || true)"
+    if echo "$dns_output" | grep -qE 'DNS Servers:|Current DNS Server:' || grep -qE '^[[:space:]]*nameserver[[:space:]]+' /etc/resolv.conf 2>/dev/null; then
+        preflight_pass "A resolver and DNS server are configured"
+    else
+        preflight_blocked "No DNS server is visible in resolver state"
+    fi
+
+    if [ "$PLATFORM_FAMILY" = "arch" ] && command -v nmcli >/dev/null 2>&1; then
+        local active_connection dns_search
+        active_connection="$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | awk -F: '$2 != "" {print $1; exit}')"
+        dns_search="$(nmcli -g ipv4.dns-search connection show "$active_connection" 2>/dev/null || true)"
+        if platform_ad_dns_discovery_current && printf '%s\n' "$dns_search" | tr ',' '\n' | awk '{$1=$1; print}' | grep -Fxq "$DOMAIN"; then
+            preflight_pass "Active NetworkManager connection preserves working AD DNS and search configuration"
+        elif printf '%s\n' "$dns_search" | tr ',' '\n' | awk '{$1=$1; print}' | grep -Fxq "$DOMAIN"; then
+            preflight_warning "Active NetworkManager connection advertises $DOMAIN but current resolver AD discovery is failing"
+        else
+            preflight_warning "Active NetworkManager connection does not yet advertise $DOMAIN; normal provisioning would propose the search-domain change"
+        fi
+    fi
+
+    if [ "${DR_JOIN_TEST_MODE:-false}" = true ]; then
+        preflight_warning "Fixture test mode: external DNS and realm probes skipped"
+    elif [ "$PLATFORM_FAMILY" = arch ] && dns_source="$(platform_dns_discovery_source)"; then
+        if [ "$dns_source" = current ]; then
+            preflight_pass "AD DNS SRV discovery works using the current resolver"
+        else
+            preflight_pass "AD DNS SRV discovery works via the configured office fallback resolver(s)"
+        fi
+    elif platform_dns_srv_records "_kerberos._tcp.$DOMAIN" | grep -q .; then
+        preflight_pass "Kerberos SRV discovery works for $DOMAIN"
+    else
+        if [ "$PLATFORM_FAMILY" = arch ]; then
+            preflight_blocked "AD DNS SRV discovery failed using the current resolver and configured office fallback resolver(s)"
+        else
+            preflight_blocked "Kerberos SRV discovery failed for $DOMAIN"
+        fi
+    fi
+
+    platform_time_diagnostics
+    if platform_time_preflight_ready; then
+        if [ "$(platform_time_provider selected)" = systemd-timesyncd ]; then
+            if platform_timesyncd_source_matches; then
+                preflight_pass "System clock is synchronized via systemd-timesyncd to a configured corporate source"
+            else
+                preflight_pass "System clock is synchronized via systemd-timesyncd"
+                preflight_warning "Current timesyncd source is not one of the configured corporate sources; the modifying path will install/verify the office override"
+            fi
+        else
+            preflight_pass "System clock is synchronized via $(platform_time_provider selected)"
+        fi
+    else
+        if [ "$(platform_time_provider selected)" = systemd-timesyncd ]; then
+            preflight_blocked "systemd-timesyncd is not synchronized to a configured corporate source"
+        else
+            preflight_blocked "System clock is not synchronized; no time repair will be attempted"
+        fi
+    fi
+
+    current_host="$(hostnamectl --static 2>/dev/null || hostname 2>/dev/null || true)"
+    if is_valid_ad_hostname "$current_host"; then
+        preflight_pass "Current hostname is AD-safe: $current_host"
+    else
+        preflight_warning "Current hostname is not AD-safe and will require an explicit hostname-policy decision: ${current_host:-unknown}"
+    fi
+
+    if [ "${DR_JOIN_TEST_MODE:-false}" = true ]; then
+        preflight_warning "Fixture test mode: domain discovery skipped"
+    elif platform_domain_discover; then
+        preflight_pass "Arch Samba or Debian realm discovery works for $DOMAIN"
+    else
+        preflight_blocked "Domain discovery failed for $DOMAIN"
+    fi
+
+    local required_commands=(kinit smbclient mount.cifs visudo host)
+    if [ "$PLATFORM_FAMILY" = "debian" ]; then
+        required_commands+=(realm adcli automount)
+    else
+        required_commands+=(net testparm ldapsearch systemd-escape systemd-analyze findmnt)
+    fi
+    for command_name in "${required_commands[@]}"; do
+        if command -v "$command_name" >/dev/null 2>&1; then
+            preflight_pass "Required command available: $command_name"
+        else
+            preflight_blocked "Required command unavailable: $command_name"
+        fi
+    done
+
+    local diagnostic_commands=(ldapsearch sssctl)
+    [ "$PLATFORM_FAMILY" = arch ] && diagnostic_commands=(sssctl)
+    for command_name in "${diagnostic_commands[@]}"; do
+        if command -v "$command_name" >/dev/null 2>&1; then
+            preflight_pass "Diagnostic/post-install command available: $command_name"
+        elif [ "$PLATFORM_FAMILY" = "arch" ] && { [ "$command_name" = ldapsearch ] || [ "$command_name" = sssctl ]; }; then
+            preflight_warning "$command_name is pending an available package and is not required for the Arch join command"
+        else
+            preflight_blocked "Required diagnostic command unavailable: $command_name"
+        fi
+    done
+
+    if platform_validate_auth_stack; then
+        preflight_pass "Native PAM/authentication stack is present"
+    else
+        preflight_blocked "Native PAM/authentication stack is incomplete"
+    fi
+
+    if [ -r "$STATE_FILE" ]; then
+        preflight_pass "Persistent state file exists and is readable: $STATE_FILE"
+    elif [ -f "$STATE_FILE" ]; then
+        preflight_warning "Persistent state file exists but is not readable by this user: $STATE_FILE"
+    else
+        preflight_warning "No persistent state file exists yet: $STATE_FILE"
+    fi
+
+    if platform_domain_is_joined; then
+        preflight_pass "Existing domain membership is present and machine-account probing completed"
+    else
+        preflight_pass "No existing domain membership detected; first-stage join path applies"
+    fi
+    platform_admin_group >/dev/null
+    platform_validate_break_glass "$PLATFORM_ADMIN_GROUP" || true
+
+    if [ "$(df -Pk / | awk 'NR==2 {print $4}')" -ge 5242880 ] 2>/dev/null; then
+        preflight_pass "At least 5 GiB is available on /"
+    else
+        preflight_warning "Less than 5 GiB is available on /"
+    fi
+    if [ -f /var/run/reboot-required ] || command -v needs-restarting >/dev/null 2>&1 && needs-restarting -r >/dev/null 2>&1; then
+        preflight_warning "The host may require a reboot; no reboot will be initiated"
+    else
+        preflight_pass "No reboot-required marker is visible"
+    fi
+
+    if [ -d "$STATE_DIR" ]; then
+        preflight_pass "State/backup parent directory exists: $STATE_DIR"
+    else
+        preflight_warning "State/backup parent directory does not exist yet: $STATE_DIR"
+    fi
+    if [ -d "$STATE_DIR/backups" ]; then
+        preflight_pass "Expected backup location exists: $STATE_DIR/backups"
+    else
+        preflight_warning "Expected backup location does not exist yet: $STATE_DIR/backups"
+    fi
+
+    if [ "$PREFLIGHT_BLOCKERS" -eq 0 ]; then
+        echo "PASS Preflight completed with no blockers"
+        return 0
+    fi
+    echo "BLOCKED Preflight found $PREFLIGHT_BLOCKERS blocker(s); no persistent changes were made"
+    return 1
+}
+
+platform_dry_run() {
+    platform_preflight || true
+    echo ""
+    echo "Ordered dry-run plan (no persistent changes made)"
+    echo "  WOULD CHANGE packages: logical capabilities mapped above, using $PLATFORM_PACKAGE_MANAGER --needed"
+    echo "  WOULD CHANGE hostname and /etc/hosts after explicit operator confirmation"
+    if [ "$PLATFORM_FAMILY" = arch ] && platform_ad_dns_configuration_usable; then
+        echo "  WOULD PRESERVE already-valid AD DNS configuration"
+    else
+        if [ "$PLATFORM_FAMILY" = arch ]; then
+            echo "  WOULD CHANGE NetworkManager DNS/search settings using current or office-specific fallback policy"
+        else
+            echo "  WOULD CHANGE NetworkManager search domains; DNS servers remain DHCP/VPN unless explicit override is configured"
+        fi
+    fi
+    echo "  WOULD CHANGE /etc/krb5.conf, /etc/sssd/sssd.conf, native PAM files, /etc/sudoers.d/*, /etc/samba/smb.conf, /etc/nsswitch.conf"
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        echo "  WOULD CHANGE configured /smb roots: ${DR_DRIP_SEARCH_ROOTS:-none}"
+        echo "  DRIP support: configured-root /smb only; arbitrary /smb and /net paths remain unsupported"
+        echo "  WOULD START configured DRIP automounts only for the KIT launch; no global enablement"
+        echo "  WOULD CHANGE /etc/systemd/system/mnt-x.mount and /etc/systemd/system/mnt-x.automount"
+        echo "  WOULD CHANGE configured DRIP .mount/.automount units and $DR_DRIP_MANIFEST"
+        echo "  WOULD USE CIFS ownership: sec=krb5,cruid=<logged-in-domain-user-uid>,vers=3.0"
+        echo "  WOULD INSTALL /usr/local/sbin/dr-tools-rebind for explicit selected-user remounts; shared multi-user /mnt/x is not claimed"
+        echo "  WOULD CHANGE /etc/systemd/system/dr-domain-machine-password-renew.{service,timer} and /usr/local/sbin/dr-domain-machine-password-renew"
+        echo "  WOULD CHANGE /usr/local/bin/*, /usr/local/sbin/*, desktop integration files"
+        if [ "$(platform_time_provider selected)" = systemd-timesyncd ]; then
+            if platform_timesyncd_dropin_matches && platform_timesyncd_is_ready; then
+                echo "  WOULD PRESERVE already-valid corporate systemd-timesyncd configuration"
+            else
+                echo "  WOULD INSTALL/VERIFY Arch corporate timesyncd override: $DR_TIMESYNCD_DROPIN"
+            fi
+        elif platform_time_provider_satisfies; then
+            echo "  WOULD VALIDATE existing time provider: $(platform_time_provider selected); no provider switch"
+        else
+            echo "  WOULD ENABLE/RESTART time provider: $(platform_service_name time-sync)"
+        fi
+        echo "  WOULD ENABLE/RESTART services: sssd, $(platform_service_name ssh-server), mnt-x.automount, dr-domain-machine-password-renew.timer"
+        echo "  WOULD JOIN with Samba: kinit (interactive), site-aware DC pinning, net ads join -S PINNED_DC --use-kerberos=required, net ads testjoin, net ads keytab create"
+    else
+        echo "  WOULD CHANGE /etc/auto.master.d/*, /etc/auto.net.cifs, /usr/local/bin/*, /usr/local/sbin/*, desktop integration files"
+        echo "  WOULD ENABLE/RESTART services: $(platform_service_name time-sync), sssd, winbind, autofs, $(platform_service_name ssh-server)"
+        echo "  WOULD JOIN realm: $DOMAIN only at the human credential checkpoint"
+    fi
+    echo "  WOULD NOT reboot, log out, restart a display manager, disable security controls, or run pacman -Syu"
+    if [ "$PREFLIGHT_BLOCKERS" -gt 0 ] || [ "$PLATFORM_REPORT_BLOCKERS" -gt 0 ]; then
+        echo "BLOCKED Dry-run plan is not executable until preflight blockers are resolved"
+        return 1
+    fi
+    echo "PASS Dry-run plan is internally complete; no persistent changes were made"
+    return 0
+}
+
+# ── OS detection ──────────────────────────────────────────────────────────────
 
 # ── Package helpers ───────────────────────────────────────────────────────────
 
@@ -597,6 +1719,9 @@ OFFICE_CODE="${OFFICE_CODE:-}"
 DOMAIN="${DOMAIN:-}"
 TARGET_HOSTNAME="${DOMAIN_TARGET_HOSTNAME:-}"
 DOMAIN_SUDO_USER="${DOMAIN_SUDO_USER:-}"
+DR_TOOLS_MOUNT_CRUID="${DR_TOOLS_MOUNT_CRUID:-}"
+JOIN_LIFECYCLE="${JOIN_LIFECYCLE:-NEW_JOIN}"
+DR_DRIP_SEARCH_ROOTS="${DR_DRIP_SEARCH_ROOTS:-}"
 HOSTNAME_CHANGED="${HOSTNAME_CHANGED:-0}"
 EOF
     chmod 600 "$STATE_FILE"
@@ -604,17 +1729,168 @@ EOF
 
 load_state() {
     [ -f "$STATE_FILE" ] || return 1
+    [ -r "$STATE_FILE" ] || return 1
     # shellcheck disable=SC1090
     . "$STATE_FILE"
 
     [ -n "${OFFICE_CODE:-}" ] && OFFICE_CODE="$OFFICE_CODE"
     [ -n "${DOMAIN_SUDO_USER:-}" ] && DOMAIN_SUDO_USER="$DOMAIN_SUDO_USER"
+    [ -n "${DR_TOOLS_MOUNT_CRUID:-}" ] && DR_TOOLS_MOUNT_CRUID="$DR_TOOLS_MOUNT_CRUID"
+    [ -n "${JOIN_LIFECYCLE:-}" ] && JOIN_LIFECYCLE="$JOIN_LIFECYCLE"
+    [ -n "${DR_DRIP_SEARCH_ROOTS:-}" ] && DR_DRIP_SEARCH_ROOTS="$DR_DRIP_SEARCH_ROOTS"
     [ -n "${TARGET_HOSTNAME:-}" ] && DOMAIN_TARGET_HOSTNAME="$TARGET_HOSTNAME"
     return 0
 }
 
+state_identity_contradiction() {
+    local current_host persisted_host
+    case "${STAGE:-}" in
+        DOMAIN_JOIN_COMPLETE|POSTJOIN_COMPLETE) ;;
+        *) return 1 ;;
+    esac
+    persisted_host="${DOMAIN_TARGET_HOSTNAME:-${TARGET_HOSTNAME:-}}"
+    current_host="$(hostnamectl --static 2>/dev/null || hostname 2>/dev/null || true)"
+    [ -n "$persisted_host" ] && [ -n "$current_host" ] || return 1
+    [ "${persisted_host,,}" != "${current_host,,}" ] || return 1
+    # A completed state without the active local machine secret and keytab is
+    # not trusted when the local hostname contradicts the persisted identity.
+    [ ! -s "$DR_SAMBA_SECRETS_TDB" ] || return 1
+    [ ! -s "$DR_LOCAL_KEYTAB" ]
+}
+
+state_requires_recovery() {
+    [ "$PLATFORM_FAMILY" = arch ] || return 1
+    state_identity_contradiction
+}
+
+recover_stale_state() {
+    local current_host persisted_host
+    state_requires_recovery || return 1
+    current_host="$(hostnamectl --static 2>/dev/null || hostname 2>/dev/null || true)"
+    persisted_host="${DOMAIN_TARGET_HOSTNAME:-${TARGET_HOSTNAME:-unknown}}"
+    print_error "Persisted provisioning state is stale or contaminated."
+    print_error "Persisted target hostname: $persisted_host"
+    print_error "Current hostname:          $current_host"
+    print_error "Active Samba machine secret: absent"
+    print_error "Active local keytab:          absent"
+    print_warning "The old AD computer object will not be deleted, reset, disabled, moved, or reused."
+    print_info "The current candidate $current_host must be checked by the privileged AD helper before joining."
+
+    DOMAIN_TARGET_HOSTNAME="$current_host"
+    TARGET_HOSTNAME="$current_host"
+    DOMAIN_SUDO_USER=""
+    DR_TOOLS_MOUNT_CRUID=""
+    JOIN_LIFECYCLE="RECOVERY_REQUIRED"
+    save_state "WAITING_FOR_ADMIN"
+    print_info "Recovery state saved as WAITING_FOR_ADMIN for a fresh authoritative admin join."
+    print_info "Run: sudo /usr/local/sbin/dr-domain-admin-join"
+}
+
 clear_state() {
     rm -f "$STATE_FILE"
+}
+
+LIVE_VALIDATION_STATES=(
+    DOMAIN_JOIN_COMPLETE
+    IDENTITY_VALIDATED
+    TOOLS_MOUNT_VALIDATED
+    KIT_CREDENTIAL_LIFECYCLE_VALIDATED
+    DRIP_SEARCH_VALIDATED
+    DRIP_ACTIVATION_VALIDATED
+    DRIP_BOUNDED_READ_VALIDATED
+    DRIP_CLEANUP_VALIDATED
+)
+
+live_validation_marker_dir() {
+    printf '%s\n' "$STATE_DIR/live-validation"
+}
+
+platform_live_validation_complete() {
+    local required_state
+    for required_state in DOMAIN_JOIN_COMPLETE IDENTITY_VALIDATED TOOLS_MOUNT_VALIDATED KIT_CREDENTIAL_LIFECYCLE_VALIDATED; do
+        [ -f "$(live_validation_marker_dir)/$required_state" ] || return 1
+    done
+    if [ "$DRIP_REQUIRED" = true ]; then
+        for required_state in DRIP_SEARCH_VALIDATED DRIP_ACTIVATION_VALIDATED DRIP_BOUNDED_READ_VALIDATED DRIP_CLEANUP_VALIDATED; do
+            [ -f "$(live_validation_marker_dir)/$required_state" ] || return 1
+        done
+    fi
+}
+
+render_live_validation_helper() {
+    cat << EOF
+#!/bin/bash
+set -euo pipefail
+
+STATE_DIR="$STATE_DIR"
+STATE_FILE="$STATE_FILE"
+DRIP_REQUIRED="$DRIP_REQUIRED"
+MARKER_DIR="\$STATE_DIR/live-validation"
+VALID_STATES="DOMAIN_JOIN_COMPLETE IDENTITY_VALIDATED TOOLS_MOUNT_VALIDATED KIT_CREDENTIAL_LIFECYCLE_VALIDATED DRIP_SEARCH_VALIDATED DRIP_ACTIVATION_VALIDATED DRIP_BOUNDED_READ_VALIDATED DRIP_CLEANUP_VALIDATED"
+
+require_root() {
+    [ "\$(id -u)" -eq 0 ] || { echo "Run this validation helper as root." >&2; exit 1; }
+}
+
+valid_state() {
+    case " \$VALID_STATES " in *" \$1 "*) return 0 ;; *) return 1 ;; esac
+}
+
+complete() {
+    local state
+    for state in DOMAIN_JOIN_COMPLETE IDENTITY_VALIDATED TOOLS_MOUNT_VALIDATED KIT_CREDENTIAL_LIFECYCLE_VALIDATED; do
+        [ -f "\$MARKER_DIR/\$state" ] || return 1
+    done
+    if [ "\$DRIP_REQUIRED" = true ]; then
+        for state in DRIP_SEARCH_VALIDATED DRIP_ACTIVATION_VALIDATED DRIP_BOUNDED_READ_VALIDATED DRIP_CLEANUP_VALIDATED; do
+            [ -f "\$MARKER_DIR/\$state" ] || return 1
+        done
+    fi
+}
+
+promote_state_if_complete() {
+    local tmp
+    complete || return 0
+    [ -f "\$STATE_FILE" ] || return 0
+    tmp="\$STATE_FILE.tmp.\$\$"
+    awk '
+        /^STAGE=/ { print "STAGE=\\"POSTJOIN_COMPLETE\\""; next }
+        { print }
+    ' "\$STATE_FILE" > "\$tmp"
+    chmod 600 "\$tmp"
+    chown root:root "\$tmp" 2>/dev/null || true
+    mv -f -- "\$tmp" "\$STATE_FILE"
+    echo "POSTJOIN_COMPLETE recorded after all required live validation states were recorded."
+}
+
+require_root
+case "\${1:---status}" in
+    --status)
+        for state in \$VALID_STATES; do
+            if [ -f "\$MARKER_DIR/\$state" ]; then echo "PASS \$state"; else echo "PENDING \$state"; fi
+        done
+        if complete; then echo "PASS completion-gate"; else echo "PENDING completion-gate"; fi
+        ;;
+    --record)
+        valid_state "\${2:-}" || { echo "Unknown validation state." >&2; exit 2; }
+        mkdir -p "\$MARKER_DIR"
+        printf 'recorded_at=%s\\noperator=%s\\n' "\$(date -Is)" "\${SUDO_USER:-root}" > "\$MARKER_DIR/\$2"
+        chmod 600 "\$MARKER_DIR/\$2"
+        chown root:root "\$MARKER_DIR/\$2" 2>/dev/null || true
+        echo "Recorded \$2. This command records operator evidence; it does not perform the live test."
+        promote_state_if_complete
+        ;;
+    *) echo "Usage: dr-domain-join-live-validate {--status|--record STATE}" >&2; exit 2 ;;
+esac
+EOF
+}
+
+install_live_validation_helper() {
+    local helper="/usr/local/sbin/dr-domain-join-live-validate"
+    backup_config_file "$helper"
+    render_live_validation_helper > "$helper"
+    chmod 755 "$helper"
+    chown root:root "$helper"
 }
 
 print_resume_state() {
@@ -667,10 +1943,19 @@ update_hosts_for_hostname() {
 }
 
 ensure_local_pam_survives_sssd_failure() {
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        # Arch uses pambase's system-auth/system-login includes rather than
+        # Debian's common-* files. The native adapter adds pam_sss with
+        # user_unknown=ignore and keeps pam_unix in the stack so local users
+        # remain usable when the domain is offline.
+        print_info "Arch PAM resilience is provided by the native system-auth adapter"
+        return 0
+    fi
+
     local acct="/etc/pam.d/common-account"
 
     [ -f "$acct" ] || return 0
-    cp "$acct" "${acct}.domain-join.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    backup_config_file "$acct"
 
     if grep -q 'pam_sss.so' "$acct"; then
         sed -i -E 's/^account[[:space:]]+\[[^]]*\][[:space:]]+pam_sss\.so.*/account [success=ok new_authtok_reqd=done ignore=ignore user_unknown=ignore default=ignore] pam_sss.so/' "$acct"
@@ -680,7 +1965,7 @@ ensure_local_pam_survives_sssd_failure() {
 }
 
 disable_sssd_if_not_joined() {
-    if ! realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+    if ! platform_domain_is_joined; then
         if systemctl list-unit-files 2>/dev/null | grep -q '^sssd\.service'; then
             print_warning "Machine is not joined; disabling/stopping SSSD to protect local graphical login"
             systemctl disable --now sssd >/dev/null 2>&1 || true
@@ -804,7 +2089,7 @@ machine_has_domain_identity() {
     # Treat either a configured realm or a populated machine keytab as domain
     # identity. This protects already-joined machines from silent hostname
     # changes that would invalidate the AD computer account/SPNs.
-    if command -v realm >/dev/null 2>&1 && realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+    if platform_domain_is_joined; then
         return 0
     fi
 
@@ -1007,20 +2292,14 @@ validate_or_fix_hostname() {
 
 
 validate_existing_join() {
-    if ! realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+    if ! platform_domain_is_joined; then
         return 1
     fi
 
     print_info "Existing domain membership detected; validating machine account..."
 
-    if ! command -v adcli >/dev/null 2>&1; then
-        print_warning "adcli is not available yet; skipping machine-account validation"
-        return 0
-    fi
-
-    if adcli testjoin -D "$DOMAIN" >/dev/null 2>&1; then
+    if platform_domain_testjoin; then
         print_info "Machine account validation succeeded"
-        systemctl enable --now sssd >/dev/null 2>&1 || true
         return 0
     fi
 
@@ -1051,9 +2330,781 @@ validate_existing_join() {
     return 1
 }
 
+platform_domain_discover() {
+    case "$PLATFORM_FAMILY" in
+        debian)
+            command -v realm >/dev/null 2>&1 && realm discover --verbose "$DOMAIN" >/dev/null 2>&1
+            ;;
+        arch)
+            local kerberos_records ldap_records
+            kerberos_records="$(platform_dns_srv_records "_kerberos._tcp.$DOMAIN")"
+            ldap_records="$(platform_dns_srv_records "_ldap._tcp.$DOMAIN")"
+            [ -n "$kerberos_records" ] && [ -n "$ldap_records" ] || return 1
+            printf '%s\n' "$kerberos_records" "$ldap_records"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+platform_dns_srv_records() {
+    local record="$1"
+    local nameserver="${2:-}"
+    if command -v dig >/dev/null 2>&1; then
+        if [ -n "$nameserver" ]; then
+            timeout 5s dig +time=2 +tries=1 +short SRV "$record" "@$nameserver" 2>/dev/null \
+                | awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /\.$/'
+        else
+            timeout 5s dig +time=2 +tries=1 +short SRV "$record" 2>/dev/null \
+                | awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /\.$/'
+        fi
+    elif command -v host >/dev/null 2>&1; then
+        if [ -n "$nameserver" ]; then
+            timeout 5s host -t SRV "$record" "$nameserver" 2>/dev/null \
+                | awk '/has SRV record/ {print}'
+        else
+            timeout 5s host -t SRV "$record" 2>/dev/null \
+                | awk '/has SRV record/ {print}'
+        fi
+    fi
+}
+
+platform_office_server_list() {
+    local kind="$1"
+    local office="${OFFICE_CODE^^}"
+    local variable
+
+    case "$office" in
+        ''|*[!A-Z0-9]*) office="" ;;
+    esac
+
+    if [ -n "$office" ]; then
+        variable="DR_${kind}_SERVERS_${office}"
+        if [ -n "${!variable+x}" ]; then
+            printf '%s\n' "${!variable}"
+            return 0
+        fi
+    fi
+
+    case "$kind" in
+        DNS)
+            printf '%s\n' "$DR_DNS_SERVERS"
+            ;;
+        TIME)
+            printf '%s\n' "$DR_TIME_SERVERS"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+platform_validate_server_list() {
+    local servers="$1" server
+    [ -n "$servers" ] || return 1
+    case "$servers" in
+        *$'\n'*|*$'\r'*|*$'\t'*) return 1 ;;
+    esac
+    for server in $servers; do
+        case "$server" in
+            ''|*[!A-Za-z0-9._:-]*) return 1 ;;
+        esac
+    done
+}
+
+platform_ad_dns_discovery_current() {
+    local kerberos_records ldap_records
+    kerberos_records="$(platform_dns_srv_records "_kerberos._tcp.$DOMAIN")"
+    ldap_records="$(platform_dns_srv_records "_ldap._tcp.$DOMAIN")"
+    [ -n "$kerberos_records" ] && [ -n "$ldap_records" ]
+}
+
+platform_ad_dns_discovery_via_servers() {
+    local servers="$1" server kerberos_records ldap_records
+    platform_validate_server_list "$servers" || return 1
+    for server in $servers; do
+        kerberos_records="$(platform_dns_srv_records "_kerberos._tcp.$DOMAIN" "$server")"
+        ldap_records="$(platform_dns_srv_records "_ldap._tcp.$DOMAIN" "$server")"
+        if [ -n "$kerberos_records" ] && [ -n "$ldap_records" ]; then
+            printf '%s\n' "$server"
+            return 0
+        fi
+    done
+    return 1
+}
+
+platform_dns_search_has_ad_domain() {
+    local connection current
+    connection="$(get_active_connection)"
+    [ -n "$connection" ] || return 1
+    current="$(nmcli -g ipv4.dns-search connection show "$connection" 2>/dev/null || true)"
+    printf '%s\n' "$current" | tr ',' '\n' | awk '{$1=$1; print}' | grep -Fxq "$DOMAIN"
+}
+
+platform_ad_dns_configuration_usable() {
+    platform_ad_dns_discovery_current && platform_dns_search_has_ad_domain
+}
+
+platform_dns_discovery_source() {
+    if platform_ad_dns_discovery_current; then
+        printf 'current\n'
+        return 0
+    fi
+    local fallback
+    fallback="$(platform_office_server_list DNS)"
+    if platform_ad_dns_discovery_via_servers "$fallback" >/dev/null; then
+        printf 'office-fallback\n'
+        return 0
+    fi
+    return 1
+}
+
+platform_domain_testjoin() {
+    case "$PLATFORM_FAMILY" in
+        debian)
+            adcli testjoin -D "$DOMAIN" >/dev/null 2>&1
+            ;;
+        arch)
+            command -v net >/dev/null 2>&1 || return 1
+            net ads testjoin >/dev/null 2>&1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+platform_domain_is_joined() {
+    case "$PLATFORM_FAMILY" in
+        debian)
+            realm list 2>/dev/null | grep -q "configured: kerberos-member"
+            ;;
+        arch)
+            [ -s /etc/krb5.keytab ] && platform_domain_testjoin
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+platform_domain_leave() {
+    case "$PLATFORM_FAMILY" in
+        debian)
+            realm leave "$DOMAIN"
+            ;;
+        arch)
+            print_warning "Arch leave requires an existing Kerberos administrator ticket."
+            net ads leave --use-kerberos=required
+            ;;
+        *)
+            print_error "No domain-leave adapter exists for platform family '$PLATFORM_FAMILY'"
+            return 1
+            ;;
+    esac
+}
+
+render_arch_smb_conf() {
+    cat << EOF
+[global]
+    workgroup = $WORKGROUP
+    realm = $REALM
+    security = ADS
+    client ipc signing = required
+    client min protocol = SMB2
+    idmap config * : backend = tdb
+    idmap config * : range = 100000-199999
+
+    # Samba 4.21+ removed net ads keytab add/delete.  The machine password is
+    # synchronized by the documented declarative keytab rule, then materialized
+    # with: net ads keytab create.
+    kerberos method = secrets only
+    sync machine password to keytab = /etc/krb5.keytab:spn_prefixes=host:account_name:sync_spns:sync_kvno:machine_password
+EOF
+}
+
+platform_generate_machine_keytab() {
+    case "$PLATFORM_FAMILY" in
+        debian)
+            print_info "Debian backend delegates keytab creation to realmd/adcli"
+            ;;
+        arch)
+            command -v net >/dev/null 2>&1 || {
+                print_error "Samba net utility is unavailable; cannot generate machine keytab"
+                return 1
+            }
+            print_info "Generating /etc/krb5.keytab with Samba 4.21+ keytab synchronization"
+            backup_config_file /etc/krb5.keytab
+            net ads keytab create
+            platform_validate_machine_keytab
+            ;;
+        *)
+            print_error "No machine-keytab adapter exists for platform family '$PLATFORM_FAMILY'"
+            return 1
+            ;;
+    esac
+}
+
+platform_validate_machine_keytab() {
+    [ -s /etc/krb5.keytab ] || {
+        print_error "/etc/krb5.keytab is missing or empty"
+        return 1
+    }
+    command -v klist >/dev/null 2>&1 || {
+        print_error "klist is unavailable; cannot validate /etc/krb5.keytab"
+        return 1
+    }
+    if ! klist -k /etc/krb5.keytab 2>/dev/null | grep -qi "$REALM"; then
+        print_error "/etc/krb5.keytab has no $REALM principal"
+        return 1
+    fi
+    print_info "Validated /etc/krb5.keytab for $REALM"
+}
+
+platform_domain_join_plan() {
+    case "$PLATFORM_FAMILY" in
+        debian)
+            cat << 'EOF'
+realm join -v DOMAIN -U ADMIN_USER
+adcli testjoin -D DOMAIN
+EOF
+            ;;
+        arch)
+            cat << 'EOF'
+kdestroy
+kinit ADMIN_USER@REALM                 # human enters password at Kerberos prompt
+dr-domain-admin-join                     # authoritative AD allocation and collision gate
+net ads join -S PINNED_DC --use-kerberos=required  # same DC as both LDAP checks
+net ads testjoin                         # validates local machine membership
+net ads keytab create                    # materializes /etc/krb5.keytab from smb.conf
+klist -k /etc/krb5.keytab
+EOF
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+platform_domain_join() {
+    local admin_user="${1:-}"
+
+    case "$PLATFORM_FAMILY" in
+        debian)
+            realm join -v "$DOMAIN" -U "$admin_user"
+            ;;
+        arch)
+            print_error "Arch joins must use /usr/local/sbin/dr-domain-admin-join"
+            print_error "That helper performs the independent authoritative AD collision gate immediately before net ads join"
+            return 1
+            ;;
+        *)
+            print_error "No domain-join adapter exists for platform family '$PLATFORM_FAMILY'"
+            return 1
+            ;;
+    esac
+}
+
+render_arch_domain_admin_join_helper() {
+    cat << EOF
+#!/bin/bash
+set -euo pipefail
+
+DOMAIN="$DOMAIN"
+REALM="$REALM"
+OFFICE_CODE="${OFFICE_CODE:-EP1}"
+SCRIPT_VERSION="$SCRIPT_VERSION"
+STATE_DIR="\${DR_ADMIN_STATE_DIR:-$STATE_DIR}"
+STATE_FILE="\${DR_ADMIN_STATE_FILE:-\$STATE_DIR/state}"
+SMB_CONF="\${DR_ADMIN_SMB_CONF:-/etc/samba/smb.conf}"
+KEYTAB="\${DR_ADMIN_KEYTAB:-/etc/krb5.keytab}"
+SECRETS_TDB="\${DR_ADMIN_SECRETS_TDB:-/var/lib/samba/private/secrets.tdb}"
+HOSTS_FILE="\${DR_ADMIN_HOSTS_FILE:-/etc/hosts}"
+JOIN_LIFECYCLE="NEW_JOIN"
+
+print_info() { echo "[INFO] \$*"; }
+print_warn() { echo "[WARN] \$*" >&2; }
+print_error() { echo "[ERROR] \$*" >&2; }
+
+save_join_state() {
+    mkdir -p "\$STATE_DIR"
+    chmod 755 "\$STATE_DIR"
+    cat > "\$STATE_FILE" << STATEEOF
+SCRIPT_VERSION="\$SCRIPT_VERSION"
+STAGE="\${1:-DOMAIN_JOIN_COMPLETE}"
+OFFICE_CODE="\$OFFICE_CODE"
+DOMAIN="\$DOMAIN"
+TARGET_HOSTNAME="\${2:-}"
+JOIN_LIFECYCLE="\$JOIN_LIFECYCLE"
+HOSTNAME_CHANGED="0"
+STATEEOF
+    chmod 600 "\$STATE_FILE"
+}
+
+cleanup_local_join_state() {
+    print_warn "Explicit rollback requested for the local Arch join state."
+    if klist -s 2>/dev/null; then
+        net ads leave --use-kerberos=required || print_warn "Samba could not remove the AD computer account; verify it with the domain administrator."
+    else
+        print_warn "No Kerberos ticket is available; the AD computer object was not changed by rollback."
+    fi
+    rm -f "\$KEYTAB"
+    rm -rf /var/lib/sss/db/* /var/lib/sss/mc/* 2>/dev/null || true
+    systemctl disable --now sssd >/dev/null 2>&1 || true
+    save_join_state "WAITING_FOR_ADMIN" "\$(hostnamectl --static 2>/dev/null || hostname)"
+    print_info "Local keytab, SSSD cache, and SSSD enablement were removed."
+}
+
+if [ "\$(id -u)" -ne 0 ]; then
+    print_error "Run this helper with sudo: sudo /usr/local/sbin/dr-domain-admin-join"
+    exit 1
+fi
+
+for required in net kinit klist hostnamectl testparm ldapsearch; do
+    if ! command -v "\$required" >/dev/null 2>&1; then
+        print_error "Required Arch join command not found: \$required"
+        print_error "Have the technician rerun the candidate after the approved dependency checkpoint."
+        exit 1
+    fi
+done
+
+office_hostname_prefix() {
+    case "\$(echo "\${OFFICE_CODE:-}" | tr '[:lower:]' '[:upper:]')" in
+        EP|EP1) echo "ep-cr-kit" ;;
+        MSP) echo "msp-cr-kit" ;;
+        CHI) echo "chi-cr-kit" ;;
+        ATL) echo "atl-cr-kit" ;;
+        LON|UK|UK1) echo "lon-cr-kit" ;;
+        DE|DE1) echo "de-cr-kit" ;;
+        PL|PL1) echo "pl-cr-kit" ;;
+        *)
+            local office_lower
+            office_lower="\$(echo "\${OFFICE_CODE:-kit}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
+            [ -n "\$office_lower" ] || office_lower="kit"
+            echo "\${office_lower}-cr-kit" | cut -c1-12 | sed 's/-\$//'
+            ;;
+    esac
+}
+
+is_valid_ad_hostname() {
+    local hostname_value="\$1"
+    [ "\${#hostname_value}" -le 15 ] || return 1
+    echo "\$hostname_value" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\$'
+}
+
+suggest_hostname() {
+    local prefix="\$1" number="\$2"
+    number="\$(echo "\$number" | tr -cd '0-9')"
+    [ -n "\$number" ] || number="01"
+    [ "\${#number}" -eq 1 ] && number="0\$number"
+    echo "\${prefix}-\${number}"
+}
+
+hostname_matches_managed_policy() {
+    local hostname_value="\$1" prefix suffix
+    prefix="\$(office_hostname_prefix)"
+    case "\$hostname_value" in
+        "\${prefix}-"[0-9][0-9]) suffix="\${hostname_value#\${prefix}-}" ;;
+        *) return 1 ;;
+    esac
+    [ "\${#suffix}" -eq 2 ] && is_valid_ad_hostname "\$hostname_value"
+}
+
+machine_identity_trusted() {
+    local current_host
+    [ -s "\$KEYTAB" ] && [ -s "\$SECRETS_TDB" ] || return 1
+    net ads testjoin >/dev/null 2>&1 || return 1
+    current_host="\$(hostnamectl --static 2>/dev/null || hostname)"
+    LC_ALL=C klist -k "\$KEYTAB" 2>/dev/null \
+        | grep -Eiq "(host|cifs)/\${current_host}([.@]|$)" || return 1
+}
+
+domain_to_base_dn() {
+    echo "\$DOMAIN" | awk -F. '{
+        for (i = 1; i <= NF; i++) {
+            if (i > 1) printf ",";
+            printf "DC=%s", \$i;
+        }
+        printf "\\n";
+    }'
+}
+
+select_pinned_dc() {
+    local info_output lookup_output selected_dc lookup_dc
+    [ -z "\${PINNED_DC:-}" ] || {
+        print_error "The admin-join transaction already has a pinned DC: \$PINNED_DC"
+        return 1
+    }
+
+    # Samba's resolver applies AD site awareness and chooses the closest
+    # usable server. Do not replace this with a global LDAP SRV lookup:
+    # global records can contain unreachable worldwide DCs.
+    info_output="\$(net ads info 2>&1)" || {
+        print_error "Samba could not select a site-aware domain controller."
+        echo "\$info_output" | sed 's/^/  /' >&2
+        return 1
+    }
+    selected_dc="\$(echo "\$info_output" | awk -F: 'tolower(\$1) ~ /^[[:space:]]*ldap server name[[:space:]]*$/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", \$2); print \$2; exit}')"
+    case "\$selected_dc" in
+        *[!A-Za-z0-9.-]*|*[!A-Za-z0-9])
+            print_error "Samba returned an invalid LDAP server name: \${selected_dc:-<empty>}"
+            return 1
+            ;;
+    esac
+    [ -n "\$selected_dc" ] || {
+        print_error "Samba did not return an LDAP server FQDN."
+        return 1
+    }
+    [[ "\$selected_dc" == *.* ]] || {
+        print_error "Samba returned a non-FQDN LDAP server name: \$selected_dc"
+        return 1
+    }
+
+    # Confirm the selected server itself is the closest, writable, LDAP-capable
+    # DC. This is a single-server validation transaction; no remote/global DCs
+    # are enumerated or required to respond.
+    lookup_output="\$(net ads lookup -S "\$selected_dc" 2>&1)" || {
+        print_error "Samba could not validate selected DC \$selected_dc."
+        echo "\$lookup_output" | sed 's/^/  /' >&2
+        return 1
+    }
+    lookup_dc="\$(echo "\$lookup_output" | awk -F: 'tolower(\$1) ~ /^[[:space:]]*domain controller[[:space:]]*$/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", \$2); print \$2; exit}')"
+    [ -n "\$lookup_dc" ] && [[ "\${lookup_dc,,}" = "\${selected_dc,,}" ]] || {
+        print_error "Samba lookup did not confirm the selected DC identity: \$selected_dc"
+        return 1
+    }
+    echo "\$lookup_output" | grep -Eiq '^[[:space:]]*Is the closest DC:[[:space:]]*yes[[:space:]]*$' || {
+        print_error "Selected DC \$selected_dc is not confirmed as the closest DC."
+        return 1
+    }
+    echo "\$lookup_output" | grep -Eiq '^[[:space:]]*Is writable:[[:space:]]*yes[[:space:]]*$' || {
+        print_error "Selected DC \$selected_dc is not confirmed writable."
+        return 1
+    }
+    echo "\$lookup_output" | grep -Eiq '^[[:space:]]*Is an LDAP server:[[:space:]]*yes[[:space:]]*$' || {
+        print_error "Selected DC \$selected_dc is not confirmed as an LDAP server."
+        return 1
+    }
+
+    # Preserve Samba's exact FQDN spelling so the LDAP endpoint and the final
+    # net ads join -S argument are visibly identical in diagnostics.
+    PINNED_DC="\$selected_dc"
+    print_info "Pinned site-aware writable LDAP DC for this transaction: \$PINNED_DC"
+}
+
+ldap_search_computer_object() {
+    local ldap_dc="\$1" base_dn="\$2" sam="\$3"
+    timeout 15s \
+        ldapsearch -LLL -Q -Y GSSAPI -N \
+        -o nettimeout=10 -o timelimit=10 -o referrals=false \
+        -H "ldap://\$ldap_dc" -b "\$base_dn" -s sub \
+        "(&(objectClass=computer)(sAMAccountName=\$sam))" \
+        dn sAMAccountName dNSHostName description whenCreated </dev/null
+}
+
+ad_computer_exists() {
+    local candidate="\$1" sam base_dn output rc
+    [ -n "\${PINNED_DC:-}" ] || return 2
+    sam="\$(echo "\$candidate" | tr '[:lower:]' '[:upper:]')\$"
+    base_dn="\$(domain_to_base_dn)"
+    if output="\$(ldap_search_computer_object "\$PINNED_DC" "\$base_dn" "\$sam" 2>&1)"; then
+        rc=0
+    else
+        rc=\$?
+    fi
+    if [ "\$rc" -ne 0 ]; then
+        if [ "\$rc" -eq 124 ]; then
+            print_error "AD query on pinned DC \$PINNED_DC timed out after 15 seconds while checking \$candidate."
+        else
+            print_error "AD query on pinned DC \$PINNED_DC failed with exit status \$rc while checking \$candidate."
+        fi
+        print_error "No domain join was attempted."
+        echo "\$output" | sed 's/^/  /' >&2
+        return 2
+    fi
+    if echo "\$output" | grep -qi '^dn:'; then
+        print_error "Computer account \$candidate already exists in Active Directory."
+        print_error "Existing object on pinned DC \$PINNED_DC:"
+        echo "\$output" | sed 's/^/  /' >&2
+        return 0
+    fi
+    return 1
+}
+
+find_next_available_ad_hostname() {
+    local prefix="\$(office_hostname_prefix)" candidate rc n
+    for n in \$(seq 1 99); do
+        candidate="\$(suggest_hostname "\$prefix" "\$n")"
+        is_valid_ad_hostname "\$candidate" || continue
+        echo "  checking authoritative AD computer object: \$candidate" >&2
+        if ad_computer_exists "\$candidate"; then
+            continue
+        else
+            rc=\$?
+        fi
+        [ "\$rc" -eq 1 ] || {
+            print_error "AD availability query for \$candidate was not authoritative; refusing hostname allocation."
+            return 1
+        }
+        echo "\$candidate"
+        return 0
+    done
+    return 1
+}
+
+update_hosts_for_hostname_admin() {
+    local new_hostname="\$1" hosts_file="\$HOSTS_FILE" tmp_file
+    tmp_file="\$(mktemp)"
+    cp "\$hosts_file" "\${hosts_file}.dr-domain-admin-join.bak.\$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    awk -v hn="\$new_hostname" -v fqdn="\${new_hostname}.\$DOMAIN" '
+        BEGIN { replaced=0 }
+        /^127[.]0[.]1[.]1[[:space:]]+/ {
+            if (!replaced) { print "127.0.1.1    " fqdn "    " hn; replaced=1 }
+            next
+        }
+        { print }
+        END { if (!replaced) print "127.0.1.1    " fqdn "    " hn }
+    ' "\$hosts_file" > "\$tmp_file"
+    cat "\$tmp_file" > "\$hosts_file"
+    rm -f "\$tmp_file"
+}
+
+testparm -s "\$SMB_CONF" >/dev/null
+current_host="\$(hostnamectl --static 2>/dev/null || hostname)"
+echo "Current hostname: \$current_host"
+echo "Domain:           \$DOMAIN"
+echo "Office code:      \$OFFICE_CODE"
+echo "Join backend:     Samba ADS (SSSD remains the NSS/PAM provider)"
+echo ""
+
+if machine_identity_trusted; then
+    print_info "Existing Samba machine membership and local host/keytab identity are valid."
+    JOIN_LIFECYCLE="MANAGED_RERUN"
+    save_join_state "DOMAIN_JOIN_COMPLETE" "\$current_host"
+    exit 0
+fi
+
+# This helper's administrator credentials are deliberately isolated from the
+# root default cache. The Tool Server KIT.sh root-cache lifecycle is separate
+# and must never be created, replaced, or destroyed here.
+JOIN_CCACHE=""
+cleanup_join_credentials() {
+    local cache_path="\${JOIN_CCACHE:-}"
+    [ -n "\$cache_path" ] || return 0
+    case "\$cache_path" in
+        /tmp/dr-domain-admin-krb5cc.*) ;;
+        *)
+            print_warn "Refusing to clean an unexpected administrator credential-cache path."
+            JOIN_CCACHE=""
+            return 0
+            ;;
+    esac
+    # -c names precisely this helper-owned FILE cache; never destroy root's
+    # default cache or another workflow's KRB5CCNAME.
+    kdestroy -q -c "FILE:\$cache_path" >/dev/null 2>&1 || true
+    rm -f -- "\$cache_path" 2>/dev/null || true
+    JOIN_CCACHE=""
+}
+
+trap cleanup_join_credentials EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+echo "Enter the domain admin username that may create or update the AD computer account."
+read -r -p "Domain admin username: " admin_user
+[ -n "\$admin_user" ] || { print_error "Domain admin username is required."; exit 1; }
+case "\$admin_user" in
+    *@*) kerberos_principal="\$admin_user" ;;
+    *) kerberos_principal="\${admin_user}@\${REALM}" ;;
+esac
+
+echo ""
+print_info "Obtaining a Kerberos ticket for \$kerberos_principal."
+print_info "Enter the password directly at the kinit prompt; it is not captured by this helper."
+JOIN_CCACHE="\$(mktemp -p /tmp dr-domain-admin-krb5cc.XXXXXXXX)" || {
+    print_error "Could not allocate the private administrator Kerberos credential cache."
+    exit 1
+}
+chmod 600 "\$JOIN_CCACHE"
+chown root:root "\$JOIN_CCACHE"
+export KRB5CCNAME="FILE:\$JOIN_CCACHE"
+if ! kinit "\$kerberos_principal"; then
+    print_error "Kerberos authentication failed; the private administrator credential cache will be removed."
+    exit 1
+fi
+
+PINNED_DC=""
+if ! select_pinned_dc; then
+    print_error "Cannot query AD authoritatively without a suitable site-aware writable LDAP DC."
+    exit 1
+fi
+print_info "All hostname checks and the final Samba join will use pinned DC \$PINNED_DC."
+
+selected_host=""
+if is_valid_ad_hostname "\$current_host" && hostname_matches_managed_policy "\$current_host"; then
+    if ad_computer_exists "\$current_host"; then
+        print_info "Current hostname \$current_host is occupied; allocating the next free AD name."
+    else
+        current_rc=\$?
+        [ "\$current_rc" -eq 1 ] || {
+            print_error "Current hostname availability could not be established authoritatively."
+            exit 1
+        }
+        selected_host="\$current_host"
+    fi
+fi
+if [ -z "\$selected_host" ]; then
+    selected_host="\$(find_next_available_ad_hostname)" || {
+        print_error "Active Directory did not provide an authoritative unused workstation name."
+        exit 1
+    }
+fi
+
+if [ "\$selected_host" != "\$current_host" ]; then
+    print_info "Allocating unused AD hostname \$selected_host (current local hostname: \$current_host)."
+    hostnamectl set-hostname "\$selected_host"
+    update_hosts_for_hostname_admin "\$selected_host"
+    current_host="\$selected_host"
+fi
+
+# Independent last-moment collision gate. This query is deliberately repeated
+# immediately before net ads join to close stale-state and TOCTOU races.
+if ad_computer_exists "\$selected_host"; then
+    print_error "Computer account \$selected_host already exists in Active Directory."
+    print_error "No domain join was attempted. Rerun provisioning to allocate an unused workstation name."
+    exit 1
+else
+    collision_rc=\$?
+fi
+[ "\$collision_rc" -eq 1 ] || {
+    print_error "Unable to prove that \$selected_host is unused in Active Directory."
+    print_error "No domain join was attempted."
+    exit 1
+}
+
+print_info "Joining the AD domain with Samba's Kerberos ticket."
+net ads join -S "\$PINNED_DC" --use-kerberos=required
+print_info "Validating the local machine membership."
+if ! net ads testjoin; then
+    print_error "Samba joined, but net ads testjoin failed."
+    read -r -p "Explicitly leave the local/domain join now? [y/N]: " cleanup
+    case "\${cleanup:-N}" in
+        y|Y|yes|YES) cleanup_local_join_state ;;
+        *) print_warn "Leaving local join material in place for administrator diagnosis." ;;
+    esac
+    exit 1
+fi
+
+print_info "Generating the system keytab using Samba's 4.21+ synchronization rule."
+net ads keytab create
+klist -k "\$KEYTAB" | grep -qi "\$REALM"
+chmod 600 "\$KEYTAB"
+JOIN_LIFECYCLE="NEW_JOIN"
+save_join_state "DOMAIN_JOIN_COMPLETE" "\$current_host"
+print_info "Join is OK and \$KEYTAB is valid."
+echo ""
+echo "Rerun the candidate provisioning script locally to configure SSSD, PAM, sudo, and Tool Server mounting."
+EOF
+}
+
+install_arch_domain_admin_join_helper_binary() {
+    local helper="${DR_ARCH_ADMIN_HELPER_PATH:-/usr/local/sbin/dr-domain-admin-join}"
+    local helper_dir staged
+
+    helper_dir="$(dirname "$helper")"
+    mkdir -p "$helper_dir"
+    staged="$(mktemp "$helper_dir/.dr-domain-admin-join.XXXXXX")" || {
+        print_error "Could not stage the Arch domain-admin helper beside $helper"
+        return 1
+    }
+    if ! render_arch_domain_admin_join_helper > "$staged"; then
+        rm -f -- "$staged"
+        print_error "Could not render the Arch domain-admin helper"
+        return 1
+    fi
+    chmod 755 "$staged"
+    chown root:root "$staged"
+
+    if [ -f "$helper" ] && cmp -s -- "$staged" "$helper"; then
+        rm -f -- "$staged"
+        chmod 755 "$helper"
+        chown root:root "$helper"
+        print_info "Arch Samba domain-admin join helper is already current: $helper"
+        return 0
+    fi
+
+    backup_config_file "$helper" || {
+        rm -f -- "$staged"
+        print_error "Could not back up the existing Arch domain-admin helper"
+        return 1
+    }
+    if ! mv -f -- "$staged" "$helper"; then
+        rm -f -- "$staged"
+        print_error "Could not install the current Arch domain-admin helper"
+        return 1
+    fi
+    chmod 755 "$helper"
+    chown root:root "$helper"
+    print_info "Installed current Arch Samba domain-admin join helper: $helper"
+}
+
+install_arch_domain_join_pending_notices() {
+    local helper="${DR_ARCH_ADMIN_HELPER_PATH:-/usr/local/sbin/dr-domain-admin-join}"
+    local motd="${DR_ARCH_PENDING_MOTD_PATH:-/etc/update-motd.d/99-dr-domain-join}"
+    local profiled="${DR_ARCH_PENDING_PROFILE_PATH:-/etc/profile.d/dr-domain-join.sh}"
+    local static_motd="${DR_ARCH_PENDING_STATIC_MOTD_PATH:-/etc/motd}"
+
+    mkdir -p "$(dirname "$motd")" "$(dirname "$profiled")" "$(dirname "$static_motd")"
+    backup_config_file "$motd"
+    backup_config_file "$profiled"
+    backup_config_file "$static_motd"
+
+    cat > "$motd" << EOF
+#!/bin/sh
+if command -v net >/dev/null 2>&1 && net ads testjoin >/dev/null 2>&1; then
+    exit 0
+fi
+if [ -x "$helper" ]; then
+    echo "DR Domain Join Pending: sudo $helper"
+fi
+EOF
+    chmod 755 "$motd"
+    chown root:root "$motd"
+
+    cat > "$profiled" << EOF
+#!/bin/sh
+case "\$-" in *i*) ;; *) return 0 2>/dev/null || exit 0 ;; esac
+if [ -x "$helper" ] && ! net ads testjoin >/dev/null 2>&1; then
+    echo "DR Domain Join Pending: sudo $helper"
+fi
+EOF
+    chmod 644 "$profiled"
+    chown root:root "$profiled"
+
+    cat > "$static_motd" << EOF
+DR Domain Join Pending
+Run: sudo $helper
+EOF
+    chmod 644 "$static_motd"
+    chown root:root "$static_motd"
+
+    print_info "Installed Arch pending-domain-join notices: $motd, $profiled, $static_motd"
+}
+
+install_arch_domain_admin_join_helper() {
+    install_arch_domain_admin_join_helper_binary || return 1
+    install_arch_domain_join_pending_notices
+}
+
 
 
 install_domain_admin_join_helper() {
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        install_arch_domain_admin_join_helper
+        return
+    fi
     local helper="/usr/local/sbin/dr-domain-admin-join"
     local motd="/etc/update-motd.d/99-dr-domain-join"
     local profiled="/etc/profile.d/dr-domain-join.sh"
@@ -1679,9 +3730,9 @@ print_machine_status() {
     echo "=========================================="
     echo "  Hostname: $(hostnamectl --static 2>/dev/null || hostname)"
     echo "  Domain:   $DOMAIN"
-    if realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+    if platform_domain_is_joined; then
         echo "  Realm:    Joined"
-        if command -v adcli >/dev/null 2>&1 && adcli testjoin -D "$DOMAIN" >/dev/null 2>&1; then
+        if platform_domain_testjoin; then
             echo "  Machine Account: VALID"
         else
             echo "  Machine Account: NOT VALIDATED"
@@ -1710,12 +3761,9 @@ prompt_sudo_user() {
 # ── Install domain packages ───────────────────────────────────────────────────
 
 install_time_sync_prerequisites() {
-    # IMPORTANT: Do not run apt-get here. If the workstation clock is behind or
-    # ahead of the repository timestamps, apt will fail with "Release file ...
-    # is not valid yet" before we get a chance to repair time. This function is
-    # intentionally limited to checking already-present tooling. The full package
-    # install occurs after sync_time() has repaired/verified the clock.
-    print_info "Checking time/DNS prerequisite tools without using apt..."
+    # IMPORTANT: Do not run a package manager here. A bad clock can invalidate
+    # both apt metadata and pacman signatures before time has been repaired.
+    print_info "Checking time/DNS prerequisite tools without using a package manager..."
 
     if ! command -v nmcli >/dev/null 2>&1; then
         print_warning "nmcli not found; NetworkManager DNS configuration may not be available"
@@ -1733,7 +3781,36 @@ bootstrap_time_before_apt() {
     # if it is already present.
     print_info "Bootstrapping system clock before apt..."
 
-    if systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd.service'; then
+    local selected_provider
+    selected_provider="$(platform_time_provider selected)"
+
+    if [ "$PLATFORM_FAMILY" = arch ] && {
+        [ "$selected_provider" = systemd-timesyncd ] || {
+            [ "$selected_provider" = none ] && ! command -v chronyc >/dev/null 2>&1 && \
+                systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd.service'
+        }
+    }; then
+        print_info "Preparing Arch systemd-timesyncd configuration..."
+        platform_configure_timesyncd force || return 1
+        print_info "Trying systemd-timesyncd..."
+        systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || true
+        timedatectl set-ntp true >/dev/null 2>&1 || true
+
+        local arch_count=0
+        while [ "$arch_count" -lt 6 ]; do
+            if platform_timesyncd_is_ready; then
+                print_info "Clock synchronized via systemd-timesyncd"
+                hwclock --systohc >/dev/null 2>&1 || true
+                return 0
+            fi
+            sleep 5
+            arch_count=$((arch_count + 1))
+        done
+        print_error "Arch systemd-timesyncd did not synchronize to a configured corporate source"
+        return 1
+    fi
+
+    if [ "$PLATFORM_FAMILY" != arch ] && systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd.service'; then
         print_info "Trying systemd-timesyncd..."
         systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || true
         timedatectl set-ntp true >/dev/null 2>&1 || true
@@ -1795,8 +3872,43 @@ $/, ""); print; exit}')
     return 1
 }
 
+bootstrap_time_before_packages() {
+    if [ "$PLATFORM_FAMILY" = "debian" ]; then
+        bootstrap_time_before_apt
+        return $?
+    fi
+
+    print_info "Bootstrapping system clock before package installation..."
+    if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+        timedatectl set-ntp true >/dev/null 2>&1 || true
+    elif command -v chronyc >/dev/null 2>&1; then
+        platform_enable_service time-sync >/dev/null 2>&1 || true
+        chronyc -a makestep >/dev/null 2>&1 || true
+    fi
+
+    if timedatectl show --property=NTPSynchronized --value 2>/dev/null | grep -q '^yes$' || \
+       chronyc tracking 2>/dev/null | grep -qE '^Leap status[[:space:]]*:[[:space:]]*Normal'; then
+        print_info "Clock synchronization is confirmed"
+        return 0
+    fi
+
+    print_warning "Clock synchronization could not be confirmed before package installation"
+    return 1
+}
+
 install_domain_packages() {
     print_info "Installing domain packages..."
+
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        # No pacman -Syu is performed here. The configured sync databases are
+        # inspected and only the mapped capabilities are installed with
+        # --needed. Arch joins use Samba ADS and systemd automount, so realmd,
+        # adcli, and userspace autofs are deliberately not requested.
+        platform_install_packages \
+            sssd kerberos samba smbclient cifs time-sync dns pam sudo ssh-server || return 1
+        return 0
+    fi
+
     trap 'if [ "$APT_BACKGROUND_GUARD_ACTIVE" -eq 1 ]; then restore_apt_respawn_units; APT_BACKGROUND_GUARD_ACTIVE=0; fi' RETURN
 
     wait_for_apt_locks || return 1
@@ -1826,7 +3938,7 @@ install_domain_packages() {
     install_package "unattended-upgrades"
     install_package "apt-listchanges"
     install_package "needrestart"
-    systemctl enable --now ssh > /dev/null 2>&1 || true
+    systemctl enable --now "$(platform_service_name ssh-server)" > /dev/null 2>&1 || true
 
     # Home directory creation: oddjob on Debian, libpam-mkhomedir on Ubuntu
     if [[ "$OS" == "debian" ]]; then
@@ -1849,6 +3961,11 @@ install_domain_packages() {
 # surfaced through syslog and MOTD so technicians can schedule downtime safely.
 
 configure_no_reboot_policy() {
+    if [ "$PLATFORM_FAMILY" != "debian" ]; then
+        print_info "Skipping Debian unattended-upgrade/no-reboot policy on $PLATFORM_FAMILY"
+        return 0
+    fi
+
     print_info "Configuring no-auto-reboot update policy for KIT workstations..."
 
     mkdir -p /etc/apt/apt.conf.d
@@ -2021,7 +4138,7 @@ get_current_dns_servers() {
 # correctly; the failure was missing search domains, not wrong DNS servers.
 
 configure_dns_servers() {
-    local connection
+    local connection servers dns_source
     connection="$(get_active_connection)"
 
     if [ -z "$connection" ]; then
@@ -2030,24 +4147,42 @@ configure_dns_servers() {
     fi
 
     if [ -z "$DNS_SERVERS" ]; then
-        print_info "Keeping DHCP/VPN DNS servers on '$connection'"
-        nmcli -g IP4.DNS device show "$(nmcli -g GENERAL.DEVICES connection show "$connection" 2>/dev/null | head -1)" 2>/dev/null || true
-        return 0
+        if [ "$PLATFORM_FAMILY" != arch ]; then
+            print_info "Keeping DHCP/VPN DNS servers on '$connection'"
+            nmcli -g IP4.DNS device show "$(nmcli -g GENERAL.DEVICES connection show "$connection" 2>/dev/null | head -1)" 2>/dev/null || true
+            return 0
+        fi
+        if dns_source="$(platform_dns_discovery_source)" && [ "$dns_source" = current ]; then
+            print_info "Preserving already-valid AD DNS configuration on '$connection' (source: $dns_source)"
+            return 0
+        fi
+
+        servers="$(platform_office_server_list DNS)"
+        if [ -z "$servers" ] || ! platform_ad_dns_discovery_via_servers "$servers" >/dev/null; then
+            print_error "Current DNS fails AD discovery and no reachable office-specific fallback DNS is configured"
+            return 1
+        fi
+        print_info "Applying reachable office-specific fallback DNS servers to '$connection': $servers"
+    else
+        servers="$DNS_SERVERS"
     fi
 
     local first_dns
-    first_dns=$(echo "$DNS_SERVERS" | awk '{print $1}')
+    first_dns=$(echo "$servers" | awk '{print $1}')
     local current
     current=$(nmcli -g ipv4.dns connection show "$connection" 2>/dev/null || true)
-    if echo "$current" | grep -q "$first_dns"; then
-        print_info "DNS override already configured on '$connection'"
+    local ignore_auto_dns
+    ignore_auto_dns="$(nmcli -g ipv4.ignore-auto-dns connection show "$connection" 2>/dev/null || true)"
+    if echo "$current" | grep -Fq "$first_dns" && [ "$ignore_auto_dns" = yes ]; then
+        print_info "DNS servers already configured explicitly on '$connection'"
         return 0
     fi
 
-    print_info "Applying DNS override to connection '$connection': $DNS_SERVERS"
-    nmcli connection modify "$connection" ipv4.dns "$DNS_SERVERS"
+    backup_config_file /etc/NetworkManager/system-connections
+    print_info "Applying DNS servers to connection '$connection': $servers"
+    nmcli connection modify "$connection" ipv4.ignore-auto-dns yes ipv4.dns "$servers"
     nmcli connection up "$connection" > /dev/null
-    print_info "DNS override applied"
+    print_info "DNS servers applied"
 
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         systemctl restart systemd-resolved
@@ -2094,6 +4229,7 @@ configure_chrony() {
         return 0
     fi
 
+    backup_config_file "$chrony_conf"
     print_info "Configuring chrony to use current domain DNS/DC servers as NTP sources: $ntp_servers"
 
     # Clean up bad/duplicate entries from earlier test runs. This keeps the
@@ -2126,7 +4262,7 @@ configure_chrony() {
         echo "# END domain-join chrony sources"
     } >> "$chrony_conf"
 
-    systemctl restart chrony > /dev/null 2>&1 || true
+    systemctl restart "$(platform_service_name time-sync)" > /dev/null 2>&1 || true
     print_info "chrony NTP sources configured"
 }
 
@@ -2172,8 +4308,25 @@ force_step_from_chrony_offset() {
 }
 
 sync_time() {
+    local selected_provider
+    selected_provider="$(platform_time_provider selected)"
+    if [ "$PLATFORM_FAMILY" = arch ] && [ "$selected_provider" = systemd-timesyncd ]; then
+        print_info "Using systemd-timesyncd for time synchronization on Arch family"
+        platform_configure_timesyncd || return 1
+        timedatectl set-ntp true >/dev/null 2>&1 || true
+        if platform_wait_for_timesyncd; then
+            print_info "Clock is synchronized via systemd-timesyncd"
+            return 0
+        fi
+        print_error "systemd-timesyncd did not confirm synchronization with a configured corporate source"
+        return 1
+    elif [ "$PLATFORM_FAMILY" = arch ] && [ "$selected_provider" = none ] && ! command -v chronyc >/dev/null 2>&1; then
+        print_error "No supported Arch time provider is selected"
+        return 1
+    fi
+
     print_info "Enabling time synchronization via chrony..."
-    systemctl enable --now chrony > /dev/null 2>&1
+    platform_enable_service time-sync > /dev/null 2>&1
 
     # Ask chrony to take immediate measurements and step the clock if needed.
     chronyc -a burst 4/4 > /dev/null 2>&1 || true
@@ -2184,7 +4337,7 @@ sync_time() {
     # still not select a source. Force a one-time step from a valid NTP offset.
     if ! chronyc tracking 2>/dev/null | grep -qE '^Leap status[[:space:]]*:[[:space:]]*Normal'; then
         force_step_from_chrony_offset || true
-        systemctl restart chrony > /dev/null 2>&1 || true
+        systemctl restart "$(platform_service_name time-sync)" > /dev/null 2>&1 || true
         chronyc -a burst 4/4 > /dev/null 2>&1 || true
         sleep 2
         chronyc -a makestep > /dev/null 2>&1 || true
@@ -2221,13 +4374,8 @@ sync_time() {
 # full leave/rejoin to fix. Also sets rdns = false to prevent SSSD GSSAPI
 # failures in environments where the DC's IP has no PTR record.
 
-verify_krb5_conf() {
-    local krb5_conf="/etc/krb5.conf"
-    print_info "Verifying Kerberos configuration ($krb5_conf)..."
-
-    if [ ! -f "$krb5_conf" ]; then
-        print_info "$krb5_conf not found — creating with correct settings"
-        cat > "$krb5_conf" << EOF
+render_krb5_config() {
+    cat << EOF
 [libdefaults]
     default_realm = $REALM
     udp_preference_limit = 0
@@ -2243,8 +4391,19 @@ verify_krb5_conf() {
     .$DOMAIN = $REALM
     $DOMAIN = $REALM
 EOF
+}
+
+verify_krb5_conf() {
+    local krb5_conf="/etc/krb5.conf"
+    print_info "Verifying Kerberos configuration ($krb5_conf)..."
+
+    if [ ! -f "$krb5_conf" ]; then
+        print_info "$krb5_conf not found — creating with correct settings"
+        render_krb5_config > "$krb5_conf"
         return 0
     fi
+
+    backup_config_file "$krb5_conf"
 
     # Check and fix default_realm
     local current_realm
@@ -2317,6 +4476,7 @@ configure_fqdn() {
     fi
 
     print_info "Configuring machine FQDN in /etc/hosts ($fqdn)..."
+    backup_config_file /etc/hosts
 
     if grep -q "^127\.0\.1\.1" /etc/hosts; then
         # Replace the first 127.0.1.1 line to include the FQDN
@@ -2333,7 +4493,10 @@ configure_fqdn() {
 verify_ad_discovery() {
     print_info "Verifying Active Directory discovery for $DOMAIN..."
 
-    if realm discover --verbose "$DOMAIN"; then
+    if [ "$PLATFORM_FAMILY" = "debian" ] && realm discover --verbose "$DOMAIN"; then
+        print_info "Active Directory discovery successful"
+        return 0
+    elif [ "$PLATFORM_FAMILY" = "arch" ] && platform_domain_discover; then
         print_info "Active Directory discovery successful"
         return 0
     fi
@@ -2402,13 +4565,27 @@ print_ssh_handoff() {
 # automatically. On Ubuntu, --stdin is supported and used directly.
 
 join_domain() {
-    if realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+    if platform_domain_is_joined; then
+        if [ "$PLATFORM_FAMILY" = "arch" ]; then
+            # Refresh only the inert generated helper. Pending-join notices are
+            # deliberately pre-join-only and are not recreated on members.
+            install_arch_domain_admin_join_helper_binary || return 1
+        fi
         print_info "Machine is already joined to $DOMAIN — skipping join"
         return 0
     fi
 
-    if ! verify_ad_discovery; then
+    if [ "$PLATFORM_FAMILY" = "debian" ]; then
+        verify_ad_discovery || exit 1
+    elif ! platform_domain_discover; then
         exit 1
+    fi
+
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        # Samba must have its 4.21+ keytab policy in place before the admin
+        # helper runs. This writes only smb.conf after the normal preflight
+        # checkpoint; the helper remains the credential boundary.
+        configure_samba
     fi
 
     echo ""
@@ -2422,7 +4599,11 @@ join_domain() {
     echo ""
     echo "    sudo /usr/local/sbin/dr-domain-admin-join"
     echo ""
-    echo "  The helper will allocate the final hostname from Active Directory, rename the workstation, join the domain, and validate with adcli testjoin."
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        echo "  The helper will obtain a Kerberos ticket interactively, pin a site-aware writable LDAP DC, join with net ads join -S PINNED_DC --use-kerberos=required, validate with net ads testjoin, and create /etc/krb5.keytab with net ads keytab create."
+    else
+        echo "  The helper will allocate the final hostname from Active Directory, rename the workstation, join the domain, and validate with adcli testjoin."
+    fi
     echo ""
     echo "  Once the helper reports 'Join is OK', re-run this script to complete configuration:"
     echo ""
@@ -2433,7 +4614,156 @@ join_domain() {
 
 # ── Configure PAM for home directory creation ─────────────────────────────────
 
-configure_pam_mkhomedir() {
+render_arch_pam_sss_lines() {
+    cat << 'EOF'
+auth       [success=2 default=ignore]  pam_sss.so          forward_pass
+account    [success=1 default=ignore] pam_sss.so
+session    optional                   pam_sss.so
+session    required                   pam_mkhomedir.so    skel=/etc/skel/ umask=0077
+EOF
+}
+
+render_arch_pam_system_auth() {
+    local pam_file="${1:-}"
+    [ -f "$pam_file" ] && [ ! -L "$pam_file" ] || {
+        print_error "Arch PAM adapter requires a regular non-symlink system-auth file: ${pam_file:-<empty>}" >&2
+        return 1
+    }
+
+    # This deliberately recognizes only the pambase layout validated on
+    # CachyOS/Arch. Numeric PAM jumps are relative to subsequent modules, so
+    # inserting pam_sss requires adjusting the two native success counts.
+    awk '
+        function problem(message) {
+            print "Unsupported Arch system-auth layout: " message > "/dev/stderr"
+            errors = 1
+        }
+        {
+            lines[NR] = $0
+            trimmed = $0
+            sub(/^[[:space:]]*/, "", trimmed)
+
+            if (trimmed ~ /^-auth[[:space:]].*pam_systemd_home[.]so/) {
+                systemd_count++
+                systemd_index = NR
+                if (trimmed ~ /^-auth[[:space:]]+\[success=2[[:space:]]+default=ignore\][[:space:]]+pam_systemd_home[.]so[[:space:]]*$/) systemd_success = 2
+                else if (trimmed ~ /^-auth[[:space:]]+\[success=3[[:space:]]+default=ignore\][[:space:]]+pam_systemd_home[.]so[[:space:]]*$/) systemd_success = 3
+                else problem("pam_systemd_home auth control is not a supported success=2/3 default=ignore form")
+            }
+
+            if (trimmed ~ /^auth[[:space:]].*pam_sss[.]so/) {
+                sss_count++
+                sss_index = NR
+                if (trimmed ~ /^auth[[:space:]]+\[success=1[[:space:]]+default=ignore\][[:space:]]+pam_sss[.]so[[:space:]]+forward_pass[[:space:]]*$/) sss_success = 1
+                else if (trimmed ~ /^auth[[:space:]]+\[success=2[[:space:]]+default=ignore\][[:space:]]+pam_sss[.]so[[:space:]]+forward_pass[[:space:]]*$/) sss_success = 2
+                else problem("pam_sss auth control is not a supported success=1/2 default=ignore forward_pass form")
+            }
+
+            if (trimmed ~ /^auth[[:space:]].*pam_unix[.]so/) {
+                unix_count++
+                unix_index = NR
+                if (trimmed !~ /^auth[[:space:]]+\[success=1[[:space:]]+default=bad\][[:space:]]+pam_unix[.]so([[:space:]]+.*)?$/) problem("pam_unix auth control is not the native success=1 default=bad form")
+            }
+
+            if (trimmed ~ /^auth[[:space:]].*pam_faillock[.]so[[:space:]]+authfail([[:space:]]|$)/) {
+                authfail_count++
+                authfail_index = NR
+                if (trimmed !~ /^auth[[:space:]]+\[default=die\][[:space:]]+pam_faillock[.]so[[:space:]]+authfail[[:space:]]*$/) problem("pam_faillock authfail control is not the native default=die form")
+            }
+
+            if (trimmed ~ /^account[[:space:]].*pam_sss[.]so/) account_sss_count++
+            if (trimmed ~ /^session[[:space:]].*pam_sss[.]so/) session_sss_count++
+            if (trimmed ~ /^account[[:space:]].*pam_unix[.]so/) { account_unix_count++; account_unix_index = NR }
+            if (trimmed ~ /^session[[:space:]].*pam_unix[.]so/) { session_unix_count++; session_unix_index = NR }
+            if (trimmed ~ /^session[[:space:]].*pam_mkhomedir[.]so/) mkhomedir_count++
+        }
+        END {
+            if (systemd_count != 1) problem("expected exactly one auth pam_systemd_home line")
+            if (sss_count > 1) problem("expected zero or one auth pam_sss line")
+            if (unix_count != 1) problem("expected exactly one auth pam_unix line")
+            if (authfail_count != 1) problem("expected exactly one auth pam_faillock authfail line")
+
+            if (!errors) {
+                if (sss_count == 0) {
+                    if (systemd_success != 2) problem("success=3 pam_systemd_home requires the managed pam_sss insertion")
+                    if (systemd_index + 1 != unix_index) problem("native pam_systemd_home and pam_unix lines are not adjacent")
+                } else {
+                    if (systemd_index + 1 != sss_index || sss_index + 1 != unix_index) problem("managed pam_sss is not directly between pam_systemd_home and pam_unix")
+                }
+                if (unix_index + 1 != authfail_index) problem("pam_unix is not immediately followed by pam_faillock authfail")
+                if (account_sss_count == 0 && account_unix_count != 1) problem("cannot safely place the missing account pam_sss line")
+                if (session_sss_count == 0 && session_unix_count != 1) problem("cannot safely place the missing session pam_sss line")
+            }
+            if (errors) exit 2
+
+            for (i = 1; i <= NR; i++) {
+                if (account_sss_count == 0 && i == account_unix_index) print "account    [success=1 default=ignore] pam_sss.so"
+                if (i == systemd_index && systemd_success != 3) {
+                    print "-auth      [success=3 default=ignore]  pam_systemd_home.so"
+                } else if (sss_count == 1 && i == sss_index && sss_success != 2) {
+                    print "auth       [success=2 default=ignore]  pam_sss.so          forward_pass"
+                } else if (sss_count == 0 && i == unix_index) {
+                    print "auth       [success=2 default=ignore]  pam_sss.so          forward_pass"
+                    print lines[i]
+                } else {
+                    print lines[i]
+                }
+
+                if (session_sss_count == 0 && i == session_unix_index) print "session    optional                   pam_sss.so"
+            }
+            if (mkhomedir_count == 0) print "session    required                   pam_mkhomedir.so    skel=/etc/skel/ umask=0077"
+        }
+    ' "$pam_file"
+}
+
+configure_arch_pam() {
+    local pam_file="${1:-/etc/pam.d/system-auth}"
+    local pam_dir staged
+
+    if [ ! -f "$pam_file" ] || [ -L "$pam_file" ]; then
+        print_error "Arch PAM file is missing, not regular, or a symlink: $pam_file"
+        return 1
+    fi
+    pam_dir="$(dirname "$pam_file")"
+    staged="$(mktemp "$pam_dir/.system-auth.dr-domain-join.XXXXXX")" || {
+        print_error "Could not create a staged Arch PAM file beside $pam_file"
+        return 1
+    }
+    if ! render_arch_pam_system_auth "$pam_file" > "$staged"; then
+        rm -f -- "$staged"
+        print_error "Arch PAM layout is not a supported native/managed system-auth structure; $pam_file is unchanged"
+        return 1
+    fi
+    if cmp -s -- "$pam_file" "$staged"; then
+        rm -f -- "$staged"
+        print_info "Arch PAM system-auth already has the managed SSSD jump layout"
+        return 0
+    fi
+    if ! chmod --reference="$pam_file" "$staged"; then
+        rm -f -- "$staged"
+        print_error "Could not preserve the mode while staging $pam_file"
+        return 1
+    fi
+    if [ "$(stat -c '%u:%g' "$staged")" != "$(stat -c '%u:%g' "$pam_file")" ] &&
+       ! chown --reference="$pam_file" "$staged" 2>/dev/null; then
+        rm -f -- "$staged"
+        print_error "Could not preserve ownership while staging $pam_file"
+        return 1
+    fi
+    backup_config_file "$pam_file" || {
+        rm -f -- "$staged"
+        print_error "Could not back up $pam_file; refusing the Arch PAM update"
+        return 1
+    }
+    if ! mv -f -- "$staged" "$pam_file"; then
+        rm -f -- "$staged"
+        print_error "Could not atomically install the Arch PAM update"
+        return 1
+    fi
+    print_info "Configured native Arch PAM stack in $pam_file"
+}
+
+configure_debian_pam_mkhomedir() {
     if [[ "$OS" == "debian" ]]; then
         print_info "Configuring PAM home directory creation (oddjob)..."
         pam-auth-update --enable mkhomedir
@@ -2444,6 +4774,7 @@ configure_pam_mkhomedir() {
         if grep -qF "pam_mkhomedir.so" "$pam_session" 2>/dev/null; then
             print_info "pam_mkhomedir already configured in $pam_session"
         else
+            backup_config_file "$pam_session"
             echo "$mkhomedir_line" >> "$pam_session"
             print_info "Added pam_mkhomedir to $pam_session"
         fi
@@ -2454,6 +4785,7 @@ configure_pam_mkhomedir() {
     # password for SSSD to reuse. Remove it so pam_sss.so prompts independently.
     local pam_auth="/etc/pam.d/common-auth"
     if grep -q "pam_sss\.so.*use_first_pass" "$pam_auth" 2>/dev/null; then
+        backup_config_file "$pam_auth"
         sed -i '/pam_sss\.so/ s/[[:space:]]*use_first_pass//' "$pam_auth"
         print_info "Removed use_first_pass from pam_sss.so in $pam_auth"
     else
@@ -2461,9 +4793,32 @@ configure_pam_mkhomedir() {
     fi
 }
 
+platform_configure_pam() {
+    case "$PLATFORM_FAMILY" in
+        arch) configure_arch_pam ;;
+        debian) configure_debian_pam_mkhomedir ;;
+        *)
+            print_error "No PAM adapter exists for platform family '$PLATFORM_FAMILY'"
+            return 1
+            ;;
+    esac
+}
+
+configure_pam_mkhomedir() {
+    platform_validate_auth_stack || {
+        print_error "Native PAM/authentication prerequisites are not present"
+        return 1
+    }
+    platform_configure_pam
+}
+
 # ── Allow all domain users to log in ─────────────────────────────────────────
 
 configure_realm_permissions() {
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        print_info "Arch backend uses SSSD's access_provider=simple; no realm permit command is required"
+        return 0
+    fi
     print_info "Configuring realm login permissions..."
     realm permit --all
 }
@@ -2511,14 +4866,381 @@ set_sssd_global_option() {
     fi
 }
 
+# Arch does not have the realmd renewal helper used by SSSD's default
+# ad_machine_account_password_renewal_opts (realm).  The authoritative Arch
+# path is the root-owned Samba helper/timer below, which updates secrets.tdb
+# and then explicitly rebuilds /etc/krb5.keytab before re-running testjoin.
+platform_machine_account_renewal_policy() {
+    case "$PLATFORM_FAMILY" in
+        arch)
+            cat << 'EOF'
+Arch machine-account renewal policy:
+  authority: dr-domain-machine-password-renew.service/timer
+  schedule: daily with Persistent=true and RandomizedDelaySec=6h
+  age gate: no password rotation until 25 days after the last successful rotation
+  SSSD renewal: disabled with ad_maximum_machine_account_password_age=0
+  ad_update_samba_machine_account_password: false (SSSD realm/adcli helper unavailable)
+  authority: this helper alone updates Samba secrets.tdb and /etc/krb5.keytab
+  normal sequence: age gate -> preflight -> testjoin -> changetrustpw -P -> bounded keytab create -> klist -k -> testjoin -> SSSD refresh -> timestamp
+  repair sequence: preflight -> testjoin -> keytab create from the current Samba secret; no password rotation
+  failure state: a root-owned repair marker is written if password rotation succeeds but keytab regeneration fails
+EOF
+            ;;
+        debian)
+            echo "Debian machine-account renewal policy: preserve existing realmd/adcli/SSSD behavior"
+            ;;
+        *)
+            echo "No machine-account renewal policy for platform family '$PLATFORM_FAMILY'"
+            return 1
+            ;;
+    esac
+}
+
+render_arch_machine_account_renewal_helper() {
+    cat << EOF
+#!/bin/bash
+set -euo pipefail
+
+DOMAIN="$DOMAIN"
+REALM="$REALM"
+STATE_DIR="\${DR_RENEWAL_STATE_DIR:-$STATE_DIR}"
+LAST_SUCCESS="\$STATE_DIR/machine-password-last-success"
+REPAIR_MARKER="\$STATE_DIR/machine-password-keytab-repair-needed"
+LOCK_DIR="\${DR_RENEWAL_LOCK_DIR:-/run/dr-domain-machine-password-renew.lock}"
+KEYTAB="\${DR_RENEWAL_KEYTAB:-/etc/krb5.keytab}"
+MIN_AGE_SECONDS=2160000
+RETRY_DELAYS=(2 5 10)
+REPAIR_DIAGNOSTIC="\$STATE_DIR/keytab-before-failed-renewal.\$(date +%s)"
+
+cleanup() {
+    rmdir "\$LOCK_DIR" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+fail() {
+    echo "Machine-account renewal blocked: \$*" >&2
+    exit 1
+}
+
+require_root() {
+    [ "\$(id -u)" -eq 0 ] || fail "run as root"
+}
+
+preflight() {
+    local synchronized dc
+    synchronized="\$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+    [ "\$synchronized" = yes ] || fail "system clock is not synchronized"
+    command -v host >/dev/null 2>&1 || fail "host is required for AD SRV discovery"
+    host -t SRV "_kerberos._tcp.\$DOMAIN" >/dev/null 2>&1 || fail "AD Kerberos SRV discovery failed"
+    dc="\$(host -t SRV "_kerberos._tcp.\$DOMAIN" 2>/dev/null | awk 'NF >= 8 {sub(/\.$/, "", \$NF); print \$NF; exit}')"
+    [ -n "\$dc" ] || fail "no domain controller was returned by SRV discovery"
+    getent hosts "\$dc" >/dev/null 2>&1 || fail "domain controller does not resolve"
+    timeout 5 bash -c ":</dev/tcp/\$dc/88" >/dev/null 2>&1 || fail "domain controller port 88 is unreachable"
+    command -v net >/dev/null 2>&1 || fail "Samba net is unavailable"
+    command -v testparm >/dev/null 2>&1 || fail "testparm is unavailable"
+    testparm -s /etc/samba/smb.conf >/dev/null 2>&1 || fail "smb.conf is invalid"
+    [ -r "\$KEYTAB" ] || fail "keytab is not readable"
+    [ -d "\$(dirname -- "\$KEYTAB")" ] && [ -w "\$(dirname -- "\$KEYTAB")" ] || fail "keytab parent is not writable"
+    [ "\$(df -Pk "\$(dirname -- "\$KEYTAB")" | awk 'NR == 2 {print \$4}')" -ge 1024 ] || fail "insufficient free space for keytab diagnostics"
+    if command -v sssctl >/dev/null 2>&1; then
+        sssctl config-check >/dev/null 2>&1 || fail "SSSD configuration check failed"
+    fi
+}
+
+validate_keytab() {
+    local host_name
+    command -v klist >/dev/null 2>&1 || { echo "klist is unavailable" >&2; return 1; }
+    klist -k "\$KEYTAB" >/dev/null 2>&1 || { echo "keytab cannot be read" >&2; return 1; }
+    LC_ALL=C klist -k "\$KEYTAB" | grep -qi "\$REALM" || { echo "keytab has no \$REALM principal" >&2; return 1; }
+    host_name="\$(hostname -s 2>/dev/null || hostname)"
+    LC_ALL=C klist -k "\$KEYTAB" | grep -Eiq "(host|cifs)/\${host_name}([.@]|$)" || {
+        echo "keytab has no host/cifs principal for \$host_name" >&2
+        return 1
+    }
+}
+
+write_repair_marker() {
+    mkdir -p "\$STATE_DIR"
+    printf 'password_rotation_completed=unknown-keytab-sync-failed\\nold_keytab_diagnostic=%s\\n' "\$REPAIR_DIAGNOSTIC" > "\$REPAIR_MARKER"
+    chmod 600 "\$REPAIR_MARKER"
+    chown root:root "\$REPAIR_MARKER" 2>/dev/null || true
+    echo "CRITICAL: Samba password changed but keytab regeneration failed." >&2
+    echo "The old keytab is diagnostic evidence only; restoring it does not restore the old AD password." >&2
+    echo "Run: dr-domain-machine-password-renew --repair-keytab" >&2
+}
+
+renew_keytab() {
+    local delay
+    for delay in "\${RETRY_DELAYS[@]}"; do
+        if net ads keytab create; then
+            return 0
+        fi
+        sleep "\$delay"
+    done
+    return 1
+}
+
+refresh_sssd() {
+    if command -v sss_cache >/dev/null 2>&1; then
+        sss_cache -E >/dev/null 2>&1 || true
+    fi
+    if systemctl is-active --quiet sssd 2>/dev/null; then
+        systemctl reload sssd >/dev/null 2>&1 || systemctl try-restart sssd >/dev/null 2>&1
+    fi
+    if command -v sssctl >/dev/null 2>&1; then
+        sssctl config-check >/dev/null 2>&1 || fail "SSSD validation failed after renewal"
+    fi
+}
+
+atomic_success_timestamp() {
+    local tmp
+    mkdir -p "\$STATE_DIR"
+    tmp="\$LAST_SUCCESS.tmp.\$\$"
+    date +%s > "\$tmp"
+    chmod 600 "\$tmp"
+    chown root:root "\$tmp" 2>/dev/null || true
+    mv -f -- "\$tmp" "\$LAST_SUCCESS"
+}
+
+require_root
+mkdir -p "\$STATE_DIR"
+if ! mkdir "\$LOCK_DIR" 2>/dev/null; then
+    echo "Machine-account renewal is already running; exiting." >&2
+    exit 0
+fi
+
+mode="\${1:-}"
+case "\$mode" in
+    --force|--repair-keytab|"") ;;
+    *) echo "Usage: dr-domain-machine-password-renew [--force|--repair-keytab]" >&2; exit 2 ;;
+esac
+
+if [ -e "\$REPAIR_MARKER" ]; then
+    preflight
+    net ads testjoin >/dev/null 2>&1 || fail "net ads testjoin failed"
+    renew_keytab || fail "keytab repair from the current Samba secret failed"
+    validate_keytab || fail "repaired keytab validation failed"
+    refresh_sssd
+    rm -f -- "\$REPAIR_MARKER"
+    echo "Outstanding keytab repair completed; no password rotation was performed."
+    exit 0
+fi
+
+if [ "\$mode" = --repair-keytab ]; then
+    preflight
+    net ads testjoin >/dev/null 2>&1 || fail "net ads testjoin failed"
+    renew_keytab || fail "keytab repair failed"
+    validate_keytab || fail "repaired keytab validation failed"
+    refresh_sssd
+    rm -f -- "\$REPAIR_MARKER"
+    echo "Keytab repaired from the current Samba machine secret; no password rotation was performed."
+    exit 0
+fi
+
+now="\$(date +%s)"
+last=0
+if [ -r "\$LAST_SUCCESS" ]; then
+    last="\$(cat "\$LAST_SUCCESS")"
+fi
+case "\$last" in ''|*[!0-9]*) last=0 ;; esac
+if [ "\$mode" != --force ] && [ "\$last" -gt 0 ] && [ "\$((now - last))" -lt "\$MIN_AGE_SECONDS" ]; then
+    echo "Machine-account password is younger than 25 days; no rotation performed."
+    exit 0
+fi
+
+preflight
+net ads testjoin >/dev/null 2>&1 || fail "net ads testjoin failed"
+
+if [ -s "\$KEYTAB" ]; then
+    cp -- "\$KEYTAB" "\$REPAIR_DIAGNOSTIC"
+    chmod 600 "\$REPAIR_DIAGNOSTIC"
+    chown root:root "\$REPAIR_DIAGNOSTIC" 2>/dev/null || true
+fi
+net ads changetrustpw -P || fail "Samba machine-password rotation failed"
+if ! renew_keytab; then
+    write_repair_marker
+    exit 1
+fi
+if ! validate_keytab; then
+    write_repair_marker
+    exit 1
+fi
+net ads testjoin >/dev/null 2>&1 || fail "net ads testjoin failed after keytab regeneration"
+refresh_sssd
+atomic_success_timestamp
+rm -f -- "\$REPAIR_MARKER"
+echo "Samba machine password and SSSD keytab renewed successfully."
+EOF
+}
+
+render_arch_machine_account_renewal_service() {
+    cat << 'EOF'
+[Unit]
+Description=Renew the Samba AD machine account password and rebuild the Kerberos keytab
+After=network-online.target sssd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/dr-domain-machine-password-renew
+EOF
+}
+
+render_arch_machine_account_renewal_timer() {
+    cat << 'EOF'
+[Unit]
+Description=Periodic Samba AD machine-account renewal
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=6h
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+platform_machine_account_renewal_service_name() {
+    echo "dr-domain-machine-password-renew.service"
+}
+
+platform_machine_account_renewal_timer_name() {
+    echo "dr-domain-machine-password-renew.timer"
+}
+
+platform_initialize_machine_account_renewal_state() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+    local marker="$STATE_DIR/machine-password-last-success"
+    [ -f "$marker" ] && return 0
+    mkdir -p "$STATE_DIR"
+    date +%s > "$marker"
+    chmod 600 "$marker"
+    chown root:root "$marker" 2>/dev/null || true
+    print_info "Initialized the Arch machine-password age clock after successful join validation"
+}
+
+platform_install_machine_account_renewal() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+
+    local helper="/usr/local/sbin/dr-domain-machine-password-renew"
+    local service="/etc/systemd/system/$(platform_machine_account_renewal_service_name)"
+    local timer="/etc/systemd/system/$(platform_machine_account_renewal_timer_name)"
+    backup_config_file "$helper"
+    backup_config_file "$service"
+    backup_config_file "$timer"
+    render_arch_machine_account_renewal_helper > "$helper"
+    render_arch_machine_account_renewal_service > "$service"
+    render_arch_machine_account_renewal_timer > "$timer"
+    chmod 755 "$helper"
+    chmod 644 "$service" "$timer"
+    chown root:root "$helper" "$service" "$timer"
+    systemd-analyze verify "$service" "$timer"
+    systemctl daemon-reload
+    systemctl enable "$(platform_machine_account_renewal_timer_name)" >/dev/null
+    print_info "Installed authoritative Samba machine-account renewal timer"
+}
+
+platform_verify_machine_account_renewal() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+    local service="/etc/systemd/system/$(platform_machine_account_renewal_service_name)"
+    local timer="/etc/systemd/system/$(platform_machine_account_renewal_timer_name)"
+    [ -x /usr/local/sbin/dr-domain-machine-password-renew ] || return 1
+    [ -f "$service" ] && [ -f "$timer" ] || return 1
+    systemd-analyze verify "$service" "$timer" >/dev/null 2>&1 || return 1
+    systemctl is-enabled --quiet "$(platform_machine_account_renewal_timer_name)" 2>/dev/null
+}
+
+platform_remove_machine_account_renewal() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+    systemctl disable --now "$(platform_machine_account_renewal_timer_name)" >/dev/null 2>&1 || true
+    rm -f /usr/local/sbin/dr-domain-machine-password-renew \
+        "/etc/systemd/system/$(platform_machine_account_renewal_service_name)" \
+        "/etc/systemd/system/$(platform_machine_account_renewal_timer_name)"
+    systemctl daemon-reload
+}
+
+render_sssd_config() {
+    cat << EOF
+[sssd]
+services = nss, pam
+domains = $DOMAIN
+
+[domain/$DOMAIN]
+id_provider = ad
+ad_domain = $DOMAIN
+krb5_realm = $REALM
+use_fully_qualified_names = False
+access_provider = simple
+ad_enable_gc = false
+krb5_renewable_lifetime = 7d
+krb5_renew_interval = 1h
+krb5_ccname_template = FILE:/tmp/krb5cc_%U
+ldap_id_mapping = True
+cache_credentials = True
+fallback_homedir = /home/%u
+EOF
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        printf 'default_shell = %s\n' "$ARCH_SSSD_DEFAULT_SHELL"
+        cat << 'EOF'
+# Arch uses the Samba renewal timer because the SSSD default realm/adcli
+# renewal helper is unavailable. Keeping this disabled avoids two competing
+# password-renewal authorities.
+ad_maximum_machine_account_password_age = 0
+ad_update_samba_machine_account_password = false
+EOF
+    fi
+}
+
+platform_login_shell_is_acceptable() {
+    local login_shell="${1:-}" supported_shells="${DR_SUPPORTED_SHELLS_FILE:-/etc/shells}"
+    case "$login_shell" in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    [ -f "$login_shell" ] && [ -x "$login_shell" ] || return 1
+    [ -r "$supported_shells" ] || return 1
+    awk -v expected="$login_shell" '
+        /^[[:space:]]*#/ { next }
+        {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            if (line == expected) found = 1
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$supported_shells"
+}
+
+platform_validate_arch_default_shell() {
+    [ "$PLATFORM_FAMILY" = arch ] || return 0
+    if ! platform_login_shell_is_acceptable "$ARCH_SSSD_DEFAULT_SHELL"; then
+        print_error "Configured Arch SSSD default shell '$ARCH_SSSD_DEFAULT_SHELL' is not an executable shell listed in $DR_SUPPORTED_SHELLS_FILE"
+        return 1
+    fi
+}
+
 configure_sssd_settings() {
     local sssd_conf="/etc/sssd/sssd.conf"
     print_info "Applying SSSD settings ($sssd_conf)..."
+
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        platform_validate_arch_default_shell || return 1
+        mkdir -p "$(dirname "$sssd_conf")"
+        backup_config_file "$sssd_conf"
+        render_sssd_config > "$sssd_conf"
+        chmod 600 "$sssd_conf"
+        chown root:root "$sssd_conf"
+        print_info "Generated native Arch SSSD AD-provider configuration"
+        return 0
+    fi
 
     if [ ! -f "$sssd_conf" ]; then
         print_warning "$sssd_conf not found — skipping SSSD settings (realm join may not have run)"
         return 0
     fi
+
+    backup_config_file "$sssd_conf"
 
     if grep -q "^\s*ad_enable_gc\s*=" "$sssd_conf"; then
         print_info "ad_enable_gc already set in $sssd_conf"
@@ -2577,6 +5299,196 @@ enable_sssd() {
     print_info "SSSD is running"
 }
 
+# ── Configure NSS for SSSD identity resolution ───────────────────────────────
+
+render_arch_nsswitch_with_sss() {
+    local nsswitch="${1:-}"
+    [ -f "$nsswitch" ] && [ ! -L "$nsswitch" ] || {
+        print_error "Arch NSS configuration is not a regular non-symlink file: ${nsswitch:-<empty>}" >&2
+        return 1
+    }
+
+    # Preserve each line byte-for-byte unless it is one of the supported NSS
+    # databases and lacks the standalone `sss` service token. Bracketed NSS
+    # actions are parsed separately so comments or action text cannot be
+    # mistaken for a provider.
+    awk '
+        BEGIN {
+            target["passwd"] = 1
+            target["group"] = 1
+            target["shadow"] = 1
+            target["initgroups"] = 1
+        }
+        {
+            original = $0
+            content = original
+            comment = ""
+            hash = index(content, "#")
+            if (hash > 0) {
+                comment = substr(content, hash)
+                content = substr(content, 1, hash - 1)
+            }
+
+            probe = content
+            sub(/^[[:space:]]*/, "", probe)
+            colon = index(probe, ":")
+            if (colon == 0) {
+                print original
+                next
+            }
+
+            header = substr(probe, 1, colon - 1)
+            sub(/^[[:space:]]*/, "", header)
+            sub(/[[:space:]]*$/, "", header)
+            if (!(header in target)) {
+                print original
+                next
+            }
+
+            seen[header]++
+            rest = substr(probe, colon + 1)
+            scan = rest
+            sub(/^[[:space:]]*/, "", scan)
+            sub(/[[:space:]]*$/, "", scan)
+            if (scan == "") {
+                printf "Unsafe %s NSS database line: no providers are configured.\n", header > "/dev/stderr"
+                errors = 1
+                print original
+                next
+            }
+
+            token_count = split(scan, token, /[[:space:]]+/)
+            bracket_depth = 0
+            provider_count = 0
+            sss_count = 0
+            line_error = 0
+            for (i = 1; i <= token_count; i++) {
+                value = token[i]
+                depth_before = bracket_depth
+                opens_text = value
+                closes_text = value
+                opens = gsub(/\[/, "", opens_text)
+                closes = gsub(/\]/, "", closes_text)
+
+                if (depth_before == 0 && substr(value, 1, 1) != "[") {
+                    if (value !~ /^[[:alnum:]_.-]+$/) {
+                        printf "Unsafe %s NSS database line: malformed provider token %s.\n", header, value > "/dev/stderr"
+                        line_error = 1
+                    } else {
+                        provider_count++
+                        if (value == "sss") sss_count++
+                    }
+                }
+
+                bracket_depth += opens - closes
+                if (bracket_depth < 0) line_error = 1
+            }
+            if (bracket_depth != 0) line_error = 1
+            if (provider_count == 0) line_error = 1
+            if (sss_count > 1) {
+                printf "Unsafe %s NSS database line: duplicate sss service tokens.\n", header > "/dev/stderr"
+                line_error = 1
+            }
+            if (line_error) {
+                printf "Unsafe %s NSS database line; refusing to rewrite it.\n", header > "/dev/stderr"
+                errors = 1
+                print original
+                next
+            }
+
+            if (sss_count == 1) {
+                print original
+                next
+            }
+
+            trimmed = content
+            sub(/[[:space:]]+$/, "", trimmed)
+            trailing = substr(content, length(trimmed) + 1)
+            print trimmed " sss" trailing comment
+            next
+        }
+        END {
+            required[1] = "passwd"
+            required[2] = "group"
+            required[3] = "shadow"
+            for (i = 1; i <= 3; i++) {
+                database = required[i]
+                if (seen[database] != 1) {
+                    printf "Required NSS database %s must have exactly one valid line; found %d.\n", database, seen[database] > "/dev/stderr"
+                    errors = 1
+                }
+            }
+            if (seen["initgroups"] > 1) {
+                printf "Optional NSS database initgroups has multiple lines; refusing an ambiguous update.\n" > "/dev/stderr"
+                errors = 1
+            }
+            if (errors) exit 2
+        }
+    ' "$nsswitch"
+}
+
+configure_arch_nss_sss() {
+    local nsswitch="${1:-/etc/nsswitch.conf}"
+    local directory temporary
+
+    [ -f "$nsswitch" ] && [ ! -L "$nsswitch" ] || {
+        print_error "Cannot configure Arch NSS: $nsswitch is missing, not regular, or a symlink"
+        return 1
+    }
+    directory="$(dirname "$nsswitch")"
+    temporary="$(mktemp "$directory/.nsswitch.conf.dr-domain-join.XXXXXX")" || {
+        print_error "Cannot create a staged Arch NSS configuration beside $nsswitch"
+        return 1
+    }
+
+    if ! render_arch_nsswitch_with_sss "$nsswitch" > "$temporary"; then
+        rm -f -- "$temporary"
+        print_error "Arch NSS configuration could not be updated safely; $nsswitch is unchanged"
+        return 1
+    fi
+
+    if cmp -s -- "$nsswitch" "$temporary"; then
+        rm -f -- "$temporary"
+        print_info "Arch NSS databases already include the sss provider"
+        return 0
+    fi
+
+    if ! chmod --reference="$nsswitch" "$temporary"; then
+        rm -f -- "$temporary"
+        print_error "Could not preserve the mode while staging $nsswitch"
+        return 1
+    fi
+    if [ "$(stat -c '%u:%g' "$temporary")" != "$(stat -c '%u:%g' "$nsswitch")" ] &&
+       ! chown --reference="$nsswitch" "$temporary" 2>/dev/null; then
+        rm -f -- "$temporary"
+        print_error "Could not preserve ownership while staging $nsswitch"
+        return 1
+    fi
+
+    backup_config_file "$nsswitch" || {
+        rm -f -- "$temporary"
+        print_error "Could not back up $nsswitch; refusing the Arch NSS update"
+        return 1
+    }
+    if ! mv -f -- "$temporary" "$nsswitch"; then
+        rm -f -- "$temporary"
+        print_error "Could not atomically install the Arch NSS configuration; the original file remains available in its timestamped backup"
+        return 1
+    fi
+    print_info "Configured passwd, group, shadow, and existing initgroups NSS databases to use SSSD"
+}
+
+platform_configure_nss() {
+    case "$PLATFORM_FAMILY" in
+        arch) configure_arch_nss_sss "${1:-/etc/nsswitch.conf}" ;;
+        debian) return 0 ;;
+        *)
+            print_error "No NSS adapter exists for platform family '$PLATFORM_FAMILY'"
+            return 1
+            ;;
+    esac
+}
+
 
 # ── Filesystem path helper ───────────────────────────────────────────────────
 
@@ -2602,6 +5514,113 @@ ensure_directory_path() {
 # has already been provisioned. This avoids hand-editing /etc/sudoers.d and
 # gives future releases one managed place to evolve workstation authorization.
 
+sudoers_escape_identifier() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value// /\\ }"
+    value="${value//#/\\#}"
+    value="${value//,/\\,}"
+    printf '%s\n' "$value"
+}
+
+normalize_domain_user_for_sudoers() {
+    local user="${1:-}"
+    user="${user##*\\}"
+    user="${user%%@*}"
+    case "$user" in
+        ""|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    printf '%s\n' "$user"
+}
+
+render_workstation_sudoers() {
+    local users_group admins_group
+    users_group="$(sudoers_escape_identifier "$DR_WORKSTATION_USERS_GROUP")"
+    admins_group="$(sudoers_escape_identifier "$DR_WORKSTATION_ADMINS_GROUP")"
+    cat << EOF
+# Managed by Ontrack Recovery Workstation Provisioner
+# Members of $DR_WORKSTATION_ADMINS_GROUP are workstation administrators.
+%$admins_group ALL=(ALL:ALL) ALL
+
+# Every authenticated DR domain user may mount the standard Tool Server.
+# SSSD is configured with use_fully_qualified_names=False, so the AD group is
+# exposed as the short group name "domain users". The escaped space is required.
+%domain\\ users ALL=(root) NOPASSWD: /usr/local/bin/mount-kit-tools
+
+# Locally managed workstation users may also run the remaining managed helpers.
+%$users_group ALL=(root) NOPASSWD: /usr/local/bin/mount-kit-tools
+%$users_group ALL=(root) NOPASSWD: /usr/local/sbin/dr-post-mount-provision
+%$users_group ALL=(root) NOPASSWD: /usr/local/sbin/dr-launch-kit
+EOF
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        cat << EOF
+
+# Arch session activation is restricted to managed workstation users. Preserve
+# only the caller's FILE cache selector for the root-side cache validation.
+Defaults!/usr/local/sbin/dr-workstation-session-activate env_keep += "KRB5CCNAME"
+%$users_group ALL=(root) NOPASSWD: /usr/local/sbin/dr-workstation-session-activate
+EOF
+    fi
+}
+
+render_kit_launcher_sudoers() {
+    local user
+    user="$(normalize_domain_user_for_sudoers "${1:-}")" || return 1
+    user="$(sudoers_escape_identifier "$user")"
+    cat << EOF
+# Managed by DR Domain Join
+# KIT.sh owns the root cache copy/cleanup. Preserve only the invoking user's
+# FILE credential-cache selector for the narrow KIT launcher command.
+# SUDO_UID and SUDO_USER are supplied by sudo itself.
+Defaults!/usr/local/sbin/dr-launch-kit env_keep += "KRB5CCNAME"
+$user ALL=(root) NOPASSWD: /usr/local/sbin/dr-launch-kit
+EOF
+}
+
+stage_generated_configurations() {
+    local stage_dir="${1:-}"
+    [ -n "$stage_dir" ] || {
+        print_error "A staging directory is required"
+        return 1
+    }
+    mkdir -p "$stage_dir"
+    render_krb5_config > "$stage_dir/krb5.conf"
+    render_sssd_config > "$stage_dir/sssd.conf"
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        local stage_cruid="${DR_TOOLS_MOUNT_CRUID:-}"
+        render_arch_tools_mount_unit "/mnt/x" "$TOOLS_SERVER" "$stage_cruid" > "$stage_dir/mnt-x.mount"
+        render_arch_tools_automount_unit "/mnt/x" > "$stage_dir/mnt-x.automount"
+        render_arch_tools_mount_helper "$stage_cruid" > "$stage_dir/mount-kit-tools"
+        render_arch_machine_account_renewal_service > "$stage_dir/dr-domain-machine-password-renew.service"
+        render_arch_machine_account_renewal_timer > "$stage_dir/dr-domain-machine-password-renew.timer"
+        if platform_validate_drip_search_roots; then
+            local drip_entry drip_mount drip_automount
+            while IFS= read -r drip_entry; do
+                [ -n "$drip_entry" ] || continue
+                drip_mount="$(drip_mount_unit_name "$drip_entry")"
+                drip_automount="$(drip_automount_unit_name "$drip_entry")"
+                render_arch_drip_mount_unit "$drip_entry" > "$stage_dir/$drip_mount"
+                render_arch_drip_automount_unit "$drip_entry" > "$stage_dir/$drip_automount"
+            done < <(platform_drip_search_entries)
+            render_drip_search_mount_helper > "$stage_dir/dr-drip-search"
+        fi
+    else
+        render_autofs_master_maps > "$stage_dir/auto.master"
+        render_autofs_cifs_map > "$stage_dir/auto.net.cifs"
+    fi
+    render_workstation_sudoers > "$stage_dir/sudoers.d-zz-dr_workstation_users"
+    render_arch_pam_sss_lines > "$stage_dir/system-auth-adapter.lines"
+    chmod 600 "$stage_dir/krb5.conf" "$stage_dir/sssd.conf"
+    chmod 440 "$stage_dir/sudoers.d-zz-dr_workstation_users"
+    printf '%s\n' "$stage_dir"
+}
+
+render_domain_user_sudoers() {
+    local user
+    user="$(normalize_domain_user_for_sudoers "${1:-}")" || return 1
+    printf '%s ALL=(root) NOPASSWD: /usr/local/bin/mount-kit-tools\n' "$(sudoers_escape_identifier "$user")"
+}
+
 install_dr_workstation_manager() {
     print_info "Installing Ontrack workstation user management command..."
 
@@ -2609,21 +5628,8 @@ install_dr_workstation_manager() {
     groupadd -f "$DR_WORKSTATION_ADMINS_GROUP"
 
     local sudoers_file="/etc/sudoers.d/zz-dr_workstation_users"
-    cat > "$sudoers_file" << EOF
-# Managed by Ontrack Recovery Workstation Provisioner
-# Members of $DR_WORKSTATION_ADMINS_GROUP are workstation administrators.
-%$DR_WORKSTATION_ADMINS_GROUP ALL=(ALL:ALL) ALL
-
-# Every authenticated DR domain user may mount the standard Tool Server.
-# SSSD is configured with use_fully_qualified_names=False, so the AD group is
-# exposed as the short group name "domain users". The escaped space is required.
-%domain\ users ALL=(root) NOPASSWD: /usr/local/bin/mount-kit-tools
-
-# Locally managed workstation users may also run the remaining managed helpers.
-%$DR_WORKSTATION_USERS_GROUP ALL=(root) NOPASSWD: /usr/local/bin/mount-kit-tools
-%$DR_WORKSTATION_USERS_GROUP ALL=(root) NOPASSWD: /usr/local/sbin/dr-post-mount-provision
-%$DR_WORKSTATION_USERS_GROUP ALL=(root) NOPASSWD: /usr/local/sbin/dr-launch-kit
-EOF
+    backup_config_file "$sudoers_file"
+    render_workstation_sudoers > "$sudoers_file"
     chmod 440 "$sudoers_file"
     chown root:root "$sudoers_file"
 
@@ -2780,10 +5786,12 @@ verify() {
     echo "Ontrack Recovery Workstation verification"
     echo ""
 
-    if realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+    if command -v net >/dev/null 2>&1 && [ -s /etc/krb5.keytab ] && net ads testjoin >/dev/null 2>&1; then
+        echo "[OK] Samba ADS membership is configured"
+    elif command -v realm >/dev/null 2>&1 && realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
         echo "[OK] Realm membership is configured"
     else
-        echo "[FAIL] Realm membership is not configured"
+        echo "[FAIL] Domain membership is not configured"
         failed=1
     fi
 
@@ -2801,11 +5809,22 @@ verify() {
         failed=1
     fi
 
-    if adcli testjoin -D "$DOMAIN" >/dev/null 2>&1; then
+    if command -v net >/dev/null 2>&1 && net ads testjoin >/dev/null 2>&1; then
+        echo "[OK] Machine account trust is valid"
+    elif command -v adcli >/dev/null 2>&1 && adcli testjoin -D "$DOMAIN" >/dev/null 2>&1; then
         echo "[OK] Machine account trust is valid"
     else
         echo "[FAIL] Machine account trust could not be validated"
         failed=1
+    fi
+
+    if [ -f /etc/systemd/system/dr-domain-machine-password-renew.timer ]; then
+        if systemctl is-enabled --quiet dr-domain-machine-password-renew.timer 2>/dev/null; then
+            echo "[OK] Arch Samba machine-account renewal timer is enabled"
+        else
+            echo "[FAIL] Arch Samba machine-account renewal timer is not enabled"
+            failed=1
+        fi
     fi
 
     if visudo -cf /etc/sudoers.d/zz-dr_workstation_users >/dev/null 2>&1; then
@@ -2877,10 +5896,822 @@ EOF
 # kernel keyring (belt-and-suspenders; the kernel keyring is used automatically
 # on modern systems regardless).
 
+# Rendered into the root KIT launcher. This deliberately validates the cache
+# selected by sudo without opening, copying, or creating a root cache. KIT.sh
+# remains the sole owner of /tmp/krb5cc_0 creation and EXIT-trap cleanup.
+render_kit_cache_validator() {
+    cat << 'EOF'
+validate_kit_invoking_cache() {
+    local cache_spec="${KRB5CCNAME:-}"
+    local cache_path=""
+    local expected_prefix=""
+    local cache_suffix=""
+    local owner=""
+    local mode=""
+    local mode_value=0
+    local principal=""
+    local principal_realm=""
+    local initial_signature=""
+    local final_signature=""
+
+    KIT_VALIDATED_CACHE_PATH=""
+    KIT_VALIDATED_CACHE_OWNER=""
+    KIT_VALIDATED_CACHE_MODE=""
+    KIT_VALIDATED_PRINCIPAL=""
+
+    case "${SUDO_UID:-}" in
+        ''|0|*[!0-9]*)
+            echo "KIT launch requires a non-root SUDO_UID from the domain-user sudo invocation." >&2
+            return 1
+            ;;
+    esac
+
+    case "$cache_spec" in
+        FILE:*) cache_path="${cache_spec#FILE:}" ;;
+        *)
+            echo "KIT launch requires KRB5CCNAME to use the FILE: cache type." >&2
+            return 1
+            ;;
+    esac
+
+    expected_prefix="/tmp/krb5cc_${SUDO_UID}"
+    case "$cache_path" in
+        "$expected_prefix") ;;
+        "$expected_prefix"_*)
+            cache_suffix="${cache_path#${expected_prefix}_}"
+            printf '%s\n' "$cache_suffix" | LC_ALL=C grep -Eq '^[A-Za-z0-9_-]+$' || {
+                echo "KIT launch rejected an unsafe cache suffix." >&2
+                return 1
+            }
+            ;;
+        *)
+            echo "KIT launch requires the invoking user's /tmp FILE cache path." >&2
+            return 1
+            ;;
+    esac
+
+    case "$cache_path" in
+        *[$'\t\r\n ']*|*\\*|*..*|*[!A-Za-z0-9_./-]*)
+            echo "KIT launch rejected an unsafe Kerberos cache path." >&2
+            return 1
+            ;;
+    esac
+
+    if [ -z "$cache_path" ] || [ "$cache_path" = "/tmp/krb5cc_0" ]; then
+        echo "KIT launch rejected an empty or root-owned Kerberos cache path." >&2
+        return 1
+    fi
+    if [ ! -f "$cache_path" ] || [ -L "$cache_path" ]; then
+        echo "KIT launch requires a regular, non-symlink Kerberos cache file." >&2
+        return 1
+    fi
+
+    initial_signature="$(stat -c '%d:%i:%F:%u:%a' -- "$cache_path" 2>/dev/null || true)"
+    [ -n "$initial_signature" ] || {
+        echo "KIT launch could not stat the Kerberos cache." >&2
+        return 1
+    }
+    owner="$(stat -c '%u' -- "$cache_path" 2>/dev/null || true)"
+    if [ "$owner" != "$SUDO_UID" ]; then
+        echo "KIT launch rejected a Kerberos cache not owned by SUDO_UID." >&2
+        return 1
+    fi
+
+    mode="$(stat -c '%a' -- "$cache_path" 2>/dev/null || true)"
+    case "$mode" in
+        ''|*[!0-7]*)
+            echo "KIT launch could not inspect Kerberos cache permissions." >&2
+            return 1
+            ;;
+    esac
+    mode_value=$((8#$mode))
+    if (( mode_value & 07177 )); then
+        echo "KIT launch requires a Kerberos cache with mode 0600 or stricter." >&2
+        return 1
+    fi
+
+    command -v klist >/dev/null 2>&1 || {
+        echo "KIT launch requires klist to validate the invoking user's ticket." >&2
+        return 1
+    }
+    LC_ALL=C klist -s -c "$cache_path" 2>/dev/null || {
+        echo "KIT launch requires a usable Kerberos credential cache." >&2
+        return 1
+    }
+
+    principal="$(LC_ALL=C klist -c "$cache_path" 2>/dev/null | LC_ALL=C awk -F': ' '/Default principal:/ {print $2; exit}')"
+    principal_realm="${principal##*@}"
+    if [ -z "$principal" ] || [ "${principal_realm^^}" != "DR.KODR.LOCAL" ]; then
+        echo "KIT launch requires a ticket principal in DR.KODR.LOCAL." >&2
+        return 1
+    fi
+
+    if [ ! -f "$cache_path" ] || [ -L "$cache_path" ]; then
+        echo "KIT launch detected a changed Kerberos cache path." >&2
+        return 1
+    fi
+    final_signature="$(stat -c '%d:%i:%F:%u:%a' -- "$cache_path" 2>/dev/null || true)"
+    if [ -z "$final_signature" ] || [ "$initial_signature" != "$final_signature" ]; then
+        echo "KIT launch detected a Kerberos cache changed during validation." >&2
+        return 1
+    fi
+
+    KIT_VALIDATED_CACHE_PATH="$cache_path"
+    KIT_VALIDATED_CACHE_OWNER="$owner"
+    KIT_VALIDATED_CACHE_MODE="$mode"
+    KIT_VALIDATED_PRINCIPAL="$principal"
+}
+
+sanitize_kit_evidence() {
+    LC_ALL=C printf '%s' "${1:-}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_'
+}
+EOF
+}
+
+render_kit_credential_self_test() {
+    cat << 'EOF'
+if [ "${1:-}" = "--credential-self-test" ]; then
+    [ "$(id -u)" -eq 0 ] || {
+        echo "validation=FAIL"
+        echo "reason=root-helper-required"
+        exit 1
+    }
+    evidence_user="$(sanitize_kit_evidence "${SUDO_USER:-unknown}")"
+    evidence_uid="$(sanitize_kit_evidence "${SUDO_UID:-unset}")"
+    evidence_cache="<unavailable>"
+    case "${KRB5CCNAME:-}" in
+        FILE:*) evidence_cache="$(sanitize_kit_evidence "$(basename -- "${KRB5CCNAME#FILE:}" 2>/dev/null || true)")" ;;
+    esac
+    if validate_kit_invoking_cache >/dev/null 2>&1; then
+        printf 'invoking_user=%s\n' "$evidence_user"
+        printf 'invoking_uid=%s\n' "$evidence_uid"
+        printf 'cache_basename=%s\n' "$(sanitize_kit_evidence "$(basename -- "$KIT_VALIDATED_CACHE_PATH")")"
+        printf 'owner_uid=%s\n' "$(sanitize_kit_evidence "$KIT_VALIDATED_CACHE_OWNER")"
+        printf 'numeric_mode=%s\n' "$(sanitize_kit_evidence "$KIT_VALIDATED_CACHE_MODE")"
+        printf 'validated_principal=%s\n' "$(sanitize_kit_evidence "$KIT_VALIDATED_PRINCIPAL")"
+        echo "validation=PASS"
+        exit 0
+    fi
+    printf 'invoking_user=%s\n' "$evidence_user"
+    printf 'invoking_uid=%s\n' "$evidence_uid"
+    printf 'cache_basename=%s\n' "$evidence_cache"
+    echo 'owner_uid=<unavailable>'
+    echo 'numeric_mode=<unavailable>'
+    echo 'validated_principal=<unavailable>'
+    echo 'validation=FAIL'
+    exit 1
+fi
+EOF
+}
+
+render_arch_root_session_activation_helper() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+    local cache_validator users_group
+    cache_validator="$(render_kit_cache_validator)"
+    users_group="$DR_WORKSTATION_USERS_GROUP"
+    printf '%s\n' '#!/bin/bash' 'set -euo pipefail' ''
+    printf 'USERS_GROUP=%q\n' "$users_group"
+    cat << 'EOF'
+REBIND_HELPER="/usr/local/sbin/dr-tools-rebind"
+MOUNT_HELPER="/usr/local/bin/mount-kit-tools"
+
+EOF
+    printf '%s\n' "$cache_validator"
+    cat << 'EOF'
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run through sudo from an approved graphical workstation session." >&2
+    exit 1
+fi
+
+case "${SUDO_UID:-}" in
+    ''|0|*[!0-9]*)
+        echo "Session activation requires a non-root domain-user sudo invocation." >&2
+        exit 1
+        ;;
+esac
+
+caller_record="$(getent passwd "$SUDO_UID" 2>/dev/null || true)"
+IFS=: read -r caller_name _ caller_uid _ _ _ _ <<< "$caller_record"
+if [ -z "${caller_name:-}" ] || [ "${caller_uid:-}" != "$SUDO_UID" ] || [ "$(id -u "$caller_name" 2>/dev/null || true)" != "$SUDO_UID" ]; then
+    echo "Session activation could not resolve the invoking domain identity." >&2
+    exit 1
+fi
+
+if ! id -nG "$caller_name" 2>/dev/null | tr ' ' '\n' | grep -Fxq "$USERS_GROUP"; then
+    echo "Domain user $caller_name is not an approved DR workstation user." >&2
+    exit 1
+fi
+
+validate_kit_invoking_cache
+
+[ -x "$REBIND_HELPER" ] || { echo "Missing Tool Server rebind helper: $REBIND_HELPER" >&2; exit 1; }
+[ -x "$MOUNT_HELPER" ] || { echo "Missing Tool Server mount helper: $MOUNT_HELPER" >&2; exit 1; }
+
+status_output=""
+status_output="$("$REBIND_HELPER" --status)" || {
+    printf '%s\n' "$status_output" >&2
+    exit 1
+}
+current_cruid="$(printf '%s\n' "$status_output" | awk -F= '$1 == "unit_cruid" { print $2; exit }')"
+case "$current_cruid" in
+    ''|*[!0-9]*)
+        echo "Tool Server mount credential owner is unavailable or invalid." >&2
+        exit 1
+        ;;
+esac
+
+if [ "$current_cruid" != "$SUDO_UID" ]; then
+    echo "Switching Tool Server credential ownership from UID $current_cruid to $SUDO_UID."
+    "$REBIND_HELPER" "$SUDO_UID"
+fi
+
+"$MOUNT_HELPER" --cruid "$SUDO_UID"
+echo "Tool Server session activation completed for $caller_name (UID $SUDO_UID)."
+EOF
+}
+
+render_arch_user_session_activation_helper() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+    cat << EOF
+#!/bin/bash
+set -u
+
+USERS_GROUP="$DR_WORKSTATION_USERS_GROUP"
+WORKSPACE_HELPER="/usr/local/bin/dr-user-desktop-provision"
+ROOT_HELPER="/usr/local/sbin/dr-workstation-session-activate"
+LOG_DIR="\${XDG_RUNTIME_DIR:-/tmp}"
+LOG="\$LOG_DIR/dr-workstation-session-activate.log"
+
+is_managed_user() {
+    id -nG 2>/dev/null | tr ' ' '\\n' | grep -Fxq "\$USERS_GROUP"
+}
+
+notify_failure() {
+    local message="\$1"
+    command -v notify-send >/dev/null 2>&1 && notify-send "Ontrack Tool Server" "\$message" >/dev/null 2>&1 || true
+}
+
+is_managed_user || exit 0
+mkdir -p "\$LOG_DIR" 2>/dev/null || true
+
+if [ -x "\$WORKSPACE_HELPER" ]; then
+    "\$WORKSPACE_HELPER" --session-activate >>"\$LOG" 2>&1 || true
+fi
+
+cache_ready=0
+for _attempt in {1..15}; do
+    case "\${KRB5CCNAME:-}" in
+        FILE:*) klist -s -c "\${KRB5CCNAME#FILE:}" >/dev/null 2>&1 && { cache_ready=1; break; } ;;
+    esac
+    sleep 1
+done
+
+if [ "\$cache_ready" -ne 1 ]; then
+    echo "No ready FILE Kerberos cache was available for session activation." >>"\$LOG"
+    notify_failure "Tool Server is waiting for your Kerberos login cache. Sign out and back in if this persists."
+    exit 0
+fi
+
+if ! sudo -n "\$ROOT_HELPER" >>"\$LOG" 2>&1; then
+    notify_failure "Tool Server was not activated. It may be in use by another KIT/DRIP session; see \$LOG."
+fi
+
+exit 0
+EOF
+}
+
+
+# ── Arch KIT compatibility renderers ─────────────────────────────────────────
+#
+# KIT.sh is a shared Tool Server artifact.  It deliberately remains untouched:
+# the Arch adapter below is generated locally and is prepended to PATH only for
+# the one KIT.sh child process.  It implements precisely the read-only
+# dpkg-query predicate that the current shared script uses, not dpkg generally.
+render_arch_kit_dpkg_query_shim() {
+    cat <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+if [ "$#" -ne 3 ] || [ "$1" != "-W" ] || [ "$2" != '-f=${Status}' ]; then
+    echo "dr-kit-arch dpkg-query compatibility adapter: unsupported query" >&2
+    exit 2
+fi
+
+package_name="$3"
+
+have_soname() {
+    local soname="$1"
+    ldconfig -p 2>/dev/null | awk -v wanted="$soname" '$1 == wanted { found=1 } END { exit(found ? 0 : 1) }' \
+        || [ -e "/usr/lib/$soname" ]
+}
+
+have_cpprest() {
+    local candidate metadata output
+    candidate="${DR_KIT_CPPREST_LIBRARY_PATH:-}"
+    [ -n "$candidate" ] && [ -f "$candidate" ] && [ ! -L "$candidate" ] || return 1
+    metadata="$(stat -c '%u:%a' "$candidate" 2>/dev/null || true)"
+    case "$metadata" in 0:4[04][04]|0:6[04][04]) ;; *) return 1 ;; esac
+    readelf -h "$candidate" 2>/dev/null | grep -Fq 'ELF64' || return 1
+    readelf -h "$candidate" 2>/dev/null | grep -Fq 'X86-64' || return 1
+    readelf -d "$candidate" 2>/dev/null | grep -Eq 'SONAME.*libcpprest\.so\.2\.10' || return 1
+    output="$(ldd "$candidate" 2>&1)" || return 1
+    printf '%s\n' "$output" | grep -Eiq 'not found|version .+ not found|not a dynamic executable|error' && return 1
+    return 0
+}
+
+have_sentinel() {
+    local sbin_dir="${DR_KIT_HASP_SBIN_DIR:-/usr/sbin}"
+    local systemd_dir="${DR_KIT_HASP_SYSTEMD_DIR:-/etc/systemd/system}"
+    [ -r "${DR_KIT_HASP_CONFIG_DIR:-/etc/hasplm}/hasplm.ini" ] || return 1
+    [ -f "$sbin_dir/aksusbd" ] && [ ! -L "$sbin_dir/aksusbd" ] && [ -x "$sbin_dir/aksusbd" ] || return 1
+    [ -f "$sbin_dir/aksusbd_x86_64" ] && [ ! -L "$sbin_dir/aksusbd_x86_64" ] && [ -x "$sbin_dir/aksusbd_x86_64" ] || return 1
+    [ -f "$sbin_dir/hasplmd" ] && [ ! -L "$sbin_dir/hasplmd" ] && [ -x "$sbin_dir/hasplmd" ] || return 1
+    [ -f "$sbin_dir/hasplmd_x86_64" ] && [ ! -L "$sbin_dir/hasplmd_x86_64" ] && [ -x "$sbin_dir/hasplmd_x86_64" ] || return 1
+    [ -f "$systemd_dir/aksusbd.service" ] && [ ! -L "$systemd_dir/aksusbd.service" ] || return 1
+    [ -f "$systemd_dir/hasplmd.service" ] && [ ! -L "$systemd_dir/hasplmd.service" ] || return 1
+    [ -f "${DR_KIT_HASP_UDEV_RULE:-/etc/udev/rules.d/80-hasp.rules}" ] && [ ! -L "${DR_KIT_HASP_UDEV_RULE:-/etc/udev/rules.d/80-hasp.rules}" ] || return 1
+    ldd "$sbin_dir/aksusbd_x86_64" "$sbin_dir/hasplmd_x86_64" >/dev/null 2>&1 || return 1
+    ldd "$sbin_dir/aksusbd_x86_64" "$sbin_dir/hasplmd_x86_64" 2>/dev/null | grep -Fq 'not found' && return 1
+    [ "$(systemctl show aksusbd.service -p LoadState --value 2>/dev/null)" = loaded ] || return 1
+    [ "$(systemctl show hasplmd.service -p LoadState --value 2>/dev/null)" = loaded ] || return 1
+    systemctl is-active --quiet aksusbd.service && systemctl is-active --quiet hasplmd.service
+}
+
+case "$package_name" in
+    libgtk-3-0) pacman -Q gtk3 >/dev/null 2>&1 && have_soname libgtk-3.so.0 ;;
+    libgl1) pacman -Q libglvnd >/dev/null 2>&1 && have_soname libGL.so.1 ;;
+    libglu1-mesa) pacman -Q glu >/dev/null 2>&1 && have_soname libGLU.so.1 ;;
+    libx11-6) pacman -Q libx11 >/dev/null 2>&1 && have_soname libX11.so.6 ;;
+    libxext6) pacman -Q libxext >/dev/null 2>&1 && have_soname libXext.so.6 ;;
+    libxrender1) pacman -Q libxrender >/dev/null 2>&1 && have_soname libXrender.so.1 ;;
+    libxrandr2) pacman -Q libxrandr >/dev/null 2>&1 && have_soname libXrandr.so.2 ;;
+    libpango-1.0-0|libpangocairo-1.0-0) pacman -Q pango >/dev/null 2>&1 && have_soname libpango-1.0.so.0 ;;
+    libcairo2) pacman -Q cairo >/dev/null 2>&1 && have_soname libcairo.so.2 ;;
+    libpng16-16) pacman -Q libpng >/dev/null 2>&1 && have_soname libpng16.so.16 ;;
+    libnotify4) pacman -Q libnotify >/dev/null 2>&1 && have_soname libnotify.so.4 ;;
+    libsm6) pacman -Q libsm >/dev/null 2>&1 && have_soname libSM.so.6 ;;
+    libexpat1) pacman -Q expat >/dev/null 2>&1 && have_soname libexpat.so.1 ;;
+    libstdc++6) pacman -Q gcc-libs >/dev/null 2>&1 && have_soname libstdc++.so.6 ;;
+    libglib2.0-0) pacman -Q glib2 >/dev/null 2>&1 && have_soname libglib-2.0.so.0 ;;
+    libpcre2-32-0) pacman -Q pcre2 >/dev/null 2>&1 && have_soname libpcre2-32.so.0 ;;
+    libglibmm-2.4-1) pacman -Q glibmm >/dev/null 2>&1 && have_soname libglibmm-2.4.so.1 ;;
+    libcpprest2.10) have_cpprest ;;
+    libudev1) pacman -Q systemd-libs >/dev/null 2>&1 && have_soname libudev.so.1 ;;
+    libxml++2.6-2v5) pacman -Q libxml++2.6 >/dev/null 2>&1 && have_soname libxml++-2.6.so.2 ;;
+    gedit) command -v gedit >/dev/null 2>&1 ;;
+    cifs-utils) pacman -Q cifs-utils >/dev/null 2>&1 && command -v mount.cifs >/dev/null 2>&1 ;;
+    winbind) pacman -Q samba >/dev/null 2>&1 && command -v winbindd >/dev/null 2>&1 ;;
+    libjpeg62-turbo|libjpeg-turbo8) pacman -Q libjpeg-turbo >/dev/null 2>&1 && have_soname libjpeg.so.8 ;;
+    libtiff6) pacman -Q libtiff >/dev/null 2>&1 && have_soname libtiff.so.6 ;;
+    aksusbd) have_sentinel ;;
+    *) echo "dr-kit-arch dpkg-query compatibility adapter: unsupported package '$package_name'" >&2; exit 2 ;;
+esac
+
+printf 'install ok installed\n'
+EOF
+}
+
+render_arch_kit_launcher_support() {
+    [ "$PLATFORM_FAMILY" = arch ] || return 0
+    cat <<EOF
+ARCH_KIT_COMPAT_DIR="$DR_KIT_ARCH_COMPAT_DIR"
+ARCH_KIT_HASP_CONFIG_DIR="$DR_HASP_CONFIG_DIR"
+ARCH_KIT_HASP_UDEV_RULE="$DR_HASP_UDEV_RULE"
+ARCH_KIT_HASP_SBIN_DIR="$DR_HASP_SBIN_DIR"
+ARCH_KIT_HASP_SYSTEMD_DIR="$DR_HASP_SYSTEMD_DIR"
+ARCH_KIT_CPPREST_LIBRARY_PATH="${DR_KIT_CPPREST_LIBRARY_PATH:-$DR_KIT_ARCH_COMPAT_DIR/lib/libcpprest.so.2.10}"
+ARCH_KIT_CPPREST_LIB_DIR="\$(dirname "\$ARCH_KIT_CPPREST_LIBRARY_PATH")"
+ARCH_KIT_RUNTIME_WRAPPER="\$ARCH_KIT_COMPAT_DIR/KIT.cpprest.sh"
+
+arch_kit_validate_private_cpprest() {
+    local candidate="\$ARCH_KIT_CPPREST_LIBRARY_PATH" metadata output
+    [ -f "\$candidate" ] && [ ! -L "\$candidate" ] || { echo "Private Arch cpprest runtime is missing or unsafe: \$candidate" >&2; return 1; }
+    metadata="\$(stat -c '%u:%a' "\$candidate" 2>/dev/null || true)"
+    case "\$metadata" in 0:4[04][04]|0:6[04][04]) ;; *) echo "Private Arch cpprest runtime must be root-owned and not group/other writable: \$candidate" >&2; return 1 ;; esac
+    readelf -h "\$candidate" 2>/dev/null | grep -Fq 'ELF64' || { echo "Private Arch cpprest runtime is not ELF64: \$candidate" >&2; return 1; }
+    readelf -h "\$candidate" 2>/dev/null | grep -Fq 'X86-64' || { echo "Private Arch cpprest runtime is not x86-64: \$candidate" >&2; return 1; }
+    readelf -d "\$candidate" 2>/dev/null | grep -Eq 'SONAME.*libcpprest\\.so\\.2\\.10' || { echo "Private Arch cpprest SONAME is unexpected: \$candidate" >&2; return 1; }
+    output="\$(ldd "\$candidate" 2>&1)" || { printf '%s\\n' "\$output" >&2; return 1; }
+    printf '%s\\n' "\$output" | grep -Eiq 'not found|version .+ not found|not a dynamic executable|error' && { printf '%s\\n' "\$output" >&2; return 1; }
+    return 0
+}
+
+arch_kit_launcher_validate_drip_cpprest() {
+    local client="/mnt/x/DRTools/UA/Imaging/DRIP/Drip.WebApi.Backend.UnmanagedClient-Linux/V12.00/x64/libDrip.WebApi.Backend.UnmanagedClient.so" output
+    [ -f "\$client" ] && [ ! -L "\$client" ] || { echo "DRIP WebAPI client is missing or unsafe: \$client" >&2; return 1; }
+    output="\$(LD_LIBRARY_PATH="\$ARCH_KIT_CPPREST_LIB_DIR\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" ldd -r "\$client" 2>&1)" || { printf '%s\\n' "\$output" >&2; return 1; }
+    printf '%s\\n' "\$output" | grep -Eiq 'not found|undefined symbol|version .+ not found|not a dynamic executable|error' && { printf '%s\\n' "\$output" >&2; return 1; }
+    return 0
+}
+
+prepare_arch_kit_runtime_wrapper() {
+    local source="\$KIT_DIR/KIT.sh" stage
+    [ -r "\$source" ] && [ ! -L "\$source" ] || { echo "Shared KIT.sh is missing or unsafe: \$source" >&2; return 1; }
+    install -d -o root -g root -m 0755 "\$ARCH_KIT_COMPAT_DIR" || return 1
+    stage="\$(mktemp "\$ARCH_KIT_COMPAT_DIR/.KIT.cpprest.XXXXXXXX")" || return 1
+    if ! awk -v kit_dir="\$KIT_DIR" -v cpprest_dir="\$ARCH_KIT_CPPREST_LIB_DIR" '
+        function quote(value) { gsub(/\\\\/, "\\\\\\\\", value); gsub(/"/, "\\\\\"", value); return value }
+        \$0 == "SCRIPT_DIR=\"\$(cd \"\$(dirname \"\${BASH_SOURCE[0]}\")\" && pwd)\"" { print "SCRIPT_DIR=\"" quote(kit_dir) "\""; script_dir_count++; next }
+        \$0 == "export LD_LIBRARY_PATH=\"\$SCRIPT_DIR\"" { print "export LD_LIBRARY_PATH=\"\$SCRIPT_DIR:" quote(cpprest_dir) "\""; ld_path_count++; next }
+        { print }
+        END { exit(script_dir_count == 1 && ld_path_count == 1 ? 0 : 1) }
+    ' "\$source" > "\$stage"; then
+        rm -f -- "\$stage"
+        echo "Shared KIT.sh no longer has the expected library-path layout; refusing to generate a local Arch wrapper." >&2
+        return 1
+    fi
+    chown root:root "\$stage" && chmod 0700 "\$stage" || { rm -f -- "\$stage"; return 1; }
+    if [ -f "\$ARCH_KIT_RUNTIME_WRAPPER" ] && cmp -s "\$stage" "\$ARCH_KIT_RUNTIME_WRAPPER"; then
+        rm -f -- "\$stage"
+    else
+        mv -f -- "\$stage" "\$ARCH_KIT_RUNTIME_WRAPPER"
+    fi
+    [ -f "\$ARCH_KIT_RUNTIME_WRAPPER" ] && [ ! -L "\$ARCH_KIT_RUNTIME_WRAPPER" ] && [ "\$(stat -c '%u:%a' "\$ARCH_KIT_RUNTIME_WRAPPER" 2>/dev/null || true)" = 0:700 ]
+}
+
+validate_arch_kit_runtime() {
+    local adapter expected package kit_ld_library_path
+    adapter="\$ARCH_KIT_COMPAT_DIR/dpkg-query"
+    if [ ! -f "\$adapter" ] || [ -L "\$adapter" ] || [ ! -x "\$adapter" ]; then
+        echo "Arch KIT compatibility adapter is missing or unsafe: \$adapter" >&2
+        return 1
+    fi
+    expected="\$(stat -c '%u:%a' "\$adapter" 2>/dev/null || true)"
+    case "\$expected" in 0:7[05][05]|0:7[05]0|0:750|0:700|0:755) ;; *) echo "Arch KIT compatibility adapter must be root-owned and not group/other writable: \$adapter" >&2; return 1 ;; esac
+    for package in libgtk-3-0 libgl1 libglu1-mesa libx11-6 libxext6 libxrender1 libxrandr2 libpango-1.0-0 libpangocairo-1.0-0 libcairo2 libpng16-16 libnotify4 libsm6 libexpat1 libstdc++6 libglib2.0-0 libpcre2-32-0 libglibmm-2.4-1 libcpprest2.10 libudev1 libxml++2.6-2v5 gedit cifs-utils winbind libjpeg62-turbo libtiff6 aksusbd; do
+        if ! DR_KIT_RUNTIME_DIR="\$KIT_DIR" DR_KIT_CPPREST_LIBRARY_PATH="\$ARCH_KIT_CPPREST_LIBRARY_PATH" DR_KIT_HASP_CONFIG_DIR="\$ARCH_KIT_HASP_CONFIG_DIR" DR_KIT_HASP_UDEV_RULE="\$ARCH_KIT_HASP_UDEV_RULE" DR_KIT_HASP_SBIN_DIR="\$ARCH_KIT_HASP_SBIN_DIR" DR_KIT_HASP_SYSTEMD_DIR="\$ARCH_KIT_HASP_SYSTEMD_DIR" "\$adapter" -W '-f=\${Status}' "\$package" >/dev/null; then
+            echo "Arch KIT runtime prerequisite is not satisfied: \$package" >&2
+            [ "\$package" != libcpprest2.10 ] || echo "Private approved libcpprest.so.2.10 runtime is not valid for KIT/DRIP." >&2
+            return 1
+        fi
+    done
+    [ -r "\$KIT_DIR/KIT" ] && [ -r "\$KIT_DIR/KIT.sh" ] || { echo "KIT runtime files are not readable." >&2; return 1; }
+    arch_kit_validate_private_cpprest || return 1
+    arch_kit_launcher_validate_drip_cpprest || return 1
+    kit_ld_library_path="\$ARCH_KIT_CPPREST_LIB_DIR:\$KIT_DIR:/mnt/x/DRTools/Frozen/DLL/AsyncIO-Linux/V2.00/x64:/mnt/x/DRTools/Frozen/DLL/FileIO-Linux/V6.00/x64:/mnt/x/DRTools/UA/DLL/IO-Linux/V6.00/x64:/mnt/x/DRTools/UA/DLL/Secure-Linux/V2.01/x64:/mnt/x/DRTools/UA/Imaging/DRIP/Drip.Lib-Linux/V12.00/x64:/mnt/x/DRTools/UA/Imaging/DRIP/Drip.WebApi.Backend.UnmanagedClient-Linux/V12.00/x64:/mnt/x/DRTools/Frozen/DLL/3rd/wxWidgets/V3.3.1/x64"
+    if LD_LIBRARY_PATH="\$kit_ld_library_path\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" ldd "\$KIT_DIR/KIT" 2>/dev/null | grep -Fq 'not found'; then
+        echo "Arch KIT runtime still has unresolved ELF dependencies; see ldd output for \$KIT_DIR/KIT." >&2
+        return 1
+    fi
+}
+EOF
+}
+
+render_arch_kit_post_mount_support() {
+    [ "$PLATFORM_FAMILY" = arch ] || return 0
+    cat <<EOF
+ARCH_KIT_COMPAT_DIR="$DR_KIT_ARCH_COMPAT_DIR"
+CPPREST_DEB_PATH="$DR_KIT_CPPREST_DEB_PATH"
+CPPREST_DEB_URL="$DR_KIT_CPPREST_DEB_URL"
+CPPREST_DEB_SHA256="$DR_KIT_CPPREST_DEB_SHA256"
+CPPREST_LIBRARY_OVERRIDE="$DR_KIT_CPPREST_LIBRARY_PATH"
+CPPREST_DEFAULT_LIBRARY="$DR_KIT_ARCH_COMPAT_DIR/lib/libcpprest.so.2.10"
+CPPREST_LIBRARY_PATH="${DR_KIT_CPPREST_LIBRARY_PATH:-$DR_KIT_ARCH_COMPAT_DIR/lib/libcpprest.so.2.10}"
+HASP_SOURCE_DIR="$DR_HASP_SOURCE_DIR"
+HASP_DEB_PATH="$DR_HASP_DEB_PATH"
+HASP_CONFIG_DIR="$DR_HASP_CONFIG_DIR"
+HASP_UDEV_RULE="$DR_HASP_UDEV_RULE"
+HASP_SBIN_DIR="$DR_HASP_SBIN_DIR"
+HASP_INIT_DIR="$DR_HASP_INIT_DIR"
+HASP_SYSTEMD_DIR="$DR_HASP_SYSTEMD_DIR"
+HASP_CONTROL_ARCHIVE=""
+HASP_DATA_ARCHIVE=""
+CPPREST_CONTROL_ARCHIVE=""
+CPPREST_DATA_ARCHIVE=""
+
+arch_kit_cpprest_validate_library() {
+    local candidate="\${1:-}" metadata output
+    [ -n "\$candidate" ] && [ -f "\$candidate" ] && [ ! -L "\$candidate" ] || return 1
+    metadata="\$(stat -c '%u:%a' "\$candidate" 2>/dev/null || true)"
+    case "\$metadata" in 0:4[04][04]|0:6[04][04]) ;; *) return 1 ;; esac
+    readelf -h "\$candidate" 2>/dev/null | grep -Fq 'ELF64' || return 1
+    readelf -h "\$candidate" 2>/dev/null | grep -Fq 'X86-64' || return 1
+    readelf -d "\$candidate" 2>/dev/null | grep -Eq 'SONAME.*libcpprest\\.so\\.2\\.10' || return 1
+    output="\$(ldd "\$candidate" 2>&1)" || return 1
+    printf '%s\\n' "\$output" | grep -Eiq 'not found|version .+ not found|not a dynamic executable|error' && return 1
+    return 0
+}
+
+arch_kit_post_mount_validate_drip_cpprest() {
+    local client="/mnt/x/DRTools/UA/Imaging/DRIP/Drip.WebApi.Backend.UnmanagedClient-Linux/V12.00/x64/libDrip.WebApi.Backend.UnmanagedClient.so" output
+    [ -f "\$client" ] && [ ! -L "\$client" ] || return 1
+    output="\$(LD_LIBRARY_PATH="\$(dirname "\$CPPREST_LIBRARY_PATH")\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" ldd -r "\$client" 2>&1)" || return 1
+    printf '%s\\n' "\$output" | grep -Eiq 'not found|undefined symbol|version .+ not found|not a dynamic executable|error' && return 1
+    return 0
+}
+
+arch_kit_cpprest_available() {
+    arch_kit_cpprest_validate_library "\$CPPREST_LIBRARY_PATH" && arch_kit_post_mount_validate_drip_cpprest
+}
+
+arch_kit_cpprest_archive_list() {
+    tar --zstd -tf -
+}
+
+arch_kit_cpprest_control_field() {
+    local field="\$1" metadata="\$2"
+    printf '%s\\n' "\$metadata" | awk -F ': ' -v wanted="\$field" '
+        \$1 == wanted { count++; value=substr(\$0, length(wanted) + 3) }
+        END { if (count == 1 && value != "") print value; else exit 1 }
+    '
+}
+
+arch_kit_validate_cpprest_deb() {
+    local deb="\$1" member metadata package version architecture
+    local -a members=()
+    [ -f "\$deb" ] && [ ! -L "\$deb" ] || return 1
+    [ "\$(sha256sum "\$deb" | awk '{print \$1}')" = "\$CPPREST_DEB_SHA256" ] || return 1
+    mapfile -t members < <(ar t "\$deb" 2>/dev/null) || return 1
+    [ "\${#members[@]}" -eq 3 ] || return 1
+    [ "\${members[0]}" = debian-binary ] || return 1
+    [ "\${members[1]}" = control.tar.zst ] || return 1
+    [ "\${members[2]}" = data.tar.zst ] || return 1
+    [ "\$(ar p "\$deb" debian-binary 2>/dev/null)" = 2.0 ] || return 1
+    CPPREST_CONTROL_ARCHIVE="\${members[1]}"
+    CPPREST_DATA_ARCHIVE="\${members[2]}"
+    while IFS= read -r member; do
+        case "\$member" in /*|*'..'*|*[[:cntrl:]]*) return 1 ;; esac
+    done < <(ar p "\$deb" "\$CPPREST_CONTROL_ARCHIVE" | tar --zstd -tf -)
+    ar p "\$deb" "\$CPPREST_CONTROL_ARCHIVE" | tar --zstd -tvf - | awk 'substr(\$1, 1, 1) !~ /^[d-]\$/ { bad=1 } END { exit(bad ? 1 : 0) }' || return 1
+    metadata="\$(ar p "\$deb" "\$CPPREST_CONTROL_ARCHIVE" | tar --zstd -xOf - ./control 2>/dev/null)" || return 1
+    package="\$(arch_kit_cpprest_control_field Package "\$metadata")" || return 1
+    version="\$(arch_kit_cpprest_control_field Version "\$metadata")" || return 1
+    architecture="\$(arch_kit_cpprest_control_field Architecture "\$metadata")" || return 1
+    [ "\$package" = libcpprest2.10 ] && [ "\$version" = 2.10.19-2build2 ] && [ "\$architecture" = amd64 ] || return 1
+    while IFS= read -r member; do
+        case "\$member" in
+            ./|./usr/|./usr/lib/|./usr/lib/x86_64-linux-gnu/|./usr/lib/x86_64-linux-gnu/libcpprest.so.2.10|./usr/share/|./usr/share/doc/|./usr/share/doc/libcpprest2.10/|./usr/share/doc/libcpprest2.10/changelog.Debian.gz|./usr/share/doc/libcpprest2.10/copyright) ;;
+            *) return 1 ;;
+        esac
+        case "\$member" in /*|*'..'*|*[[:cntrl:]]*) return 1 ;; esac
+    done < <(ar p "\$deb" "\$CPPREST_DATA_ARCHIVE" | arch_kit_cpprest_archive_list)
+    ar p "\$deb" "\$CPPREST_DATA_ARCHIVE" | tar --zstd -tvf - | awk 'substr(\$1, 1, 1) !~ /^[d-]\$/ { bad=1 } END { exit(bad ? 1 : 0) }'
+}
+
+arch_kit_fetch_cpprest_deb() {
+    local destination="\$1"
+    if [ -n "\$CPPREST_DEB_PATH" ]; then
+        [ -f "\$CPPREST_DEB_PATH" ] && [ ! -L "\$CPPREST_DEB_PATH" ] || return 1
+        cp -- "\$CPPREST_DEB_PATH" "\$destination"
+    elif command -v curl >/dev/null 2>&1; then
+        curl --fail --location --proto '=https' --tlsv1.2 --output "\$destination" "\$CPPREST_DEB_URL"
+    elif command -v wget >/dev/null 2>&1; then
+        wget --https-only -O "\$destination" "\$CPPREST_DEB_URL"
+    else
+        return 1
+    fi
+}
+
+install_arch_private_cpprest() {
+    local work deb archive payload source rc=1
+    if [ -n "\$CPPREST_LIBRARY_OVERRIDE" ]; then
+        arch_kit_cpprest_available || { log "Arch KIT blocker: explicit DR_KIT_CPPREST_LIBRARY_PATH is not a valid KIT/DRIP cpprest runtime."; return 1; }
+        return 0
+    fi
+    arch_kit_cpprest_available && return 0
+    work="\$(mktemp -d /var/tmp/dr-kit-cpprest.XXXXXXXX)" || return 1
+    deb="\$work/libcpprest2.10.deb"
+    archive="\$work/data.tar.zst"
+    payload="\$work/payload"
+    if arch_kit_fetch_cpprest_deb "\$deb" && arch_kit_validate_cpprest_deb "\$deb"; then
+        ar p "\$deb" "\$CPPREST_DATA_ARCHIVE" > "\$archive" && mkdir -p "\$payload" \
+            && tar --zstd -xf "\$archive" -C "\$payload" --no-same-owner --no-same-permissions ./usr/lib/x86_64-linux-gnu/libcpprest.so.2.10 \
+            && ! find "\$payload" \( -type l -o -type b -o -type c -o -type p -o -type s \) -print -quit | grep -q . \
+            && source="\$payload/usr/lib/x86_64-linux-gnu/libcpprest.so.2.10" \
+            && [ -f "\$source" ] && [ ! -L "\$source" ] \
+            && install -D -o root -g root -m 0644 "\$source" "\$CPPREST_DEFAULT_LIBRARY" \
+            && arch_kit_cpprest_available && rc=0
+    fi
+    rm -rf -- "\$work"
+    [ "\$rc" -eq 0 ] || log "Arch KIT blocker: approved private libcpprest.so.2.10 deployment or DRIP ABI validation failed."
+    return "\$rc"
+}
+
+install_arch_kit_compatibility_adapter() {
+    local stage
+    install -d -o root -g root -m 0755 "\$ARCH_KIT_COMPAT_DIR"
+    stage="\$(mktemp "\$ARCH_KIT_COMPAT_DIR/.dpkg-query.XXXXXXXX")"
+    cat > "\$stage" << 'EOF2'
+$(render_arch_kit_dpkg_query_shim)
+EOF2
+    chown root:root "\$stage"
+    chmod 0755 "\$stage"
+    mv -f -- "\$stage" "\$ARCH_KIT_COMPAT_DIR/dpkg-query"
+}
+
+arch_kit_install_native_dependencies() {
+    local package
+    local -a required=(gtk3 libglvnd glu libx11 libxext libxrender libxrandr pango cairo libpng libnotify libsm expat gcc-libs glib2 pcre2 glibmm systemd-libs libxml++2.6 libjpeg-turbo libtiff cifs-utils samba gedit)
+    local -a missing=()
+
+    for package in "\${required[@]}"; do pacman -Q "\$package" >/dev/null 2>&1 || missing+=("\$package"); done
+    if [ "\${#missing[@]}" -gt 0 ]; then
+        log "Installing missing native Arch KIT dependencies: \${missing[*]}"
+        pacman --needed --noconfirm -S "\${missing[@]}"
+    fi
+}
+
+arch_kit_tar_list() {
+    case "\$1" in
+        *.tar.gz) tar -tzf - ;;
+        *.tar.xz) tar -tJf - ;;
+        *.tar.zst) tar --zstd -tf - ;;
+        *) return 1 ;;
+    esac
+}
+
+arch_kit_tar_extract_file() {
+    local archive_name="\$1" member="\$2"
+    case "\$archive_name" in
+        *.tar.gz) ar p "\$HASP_DEB_PATH" "\$archive_name" | tar -xOzf - "\$member" ;;
+        *.tar.xz) ar p "\$HASP_DEB_PATH" "\$archive_name" | tar -xOJf - "\$member" ;;
+        *.tar.zst) ar p "\$HASP_DEB_PATH" "\$archive_name" | tar --zstd -xOf - "\$member" ;;
+        *) return 1 ;;
+    esac
+}
+
+arch_kit_metadata_field() {
+    local field="\$1" metadata="\$2"
+    printf '%s\n' "\$metadata" | awk -F ': ' -v wanted="\$field" '
+        \$1 == wanted { count++; value=substr(\$0, length(wanted) + 3) }
+        END { if (count == 1 && value != "") print value; else exit 1 }
+    '
+}
+
+arch_kit_validate_sentinel_deb() {
+    local -a members=()
+    local member metadata package version architecture
+
+    [ -f "\$HASP_DEB_PATH" ] && [ ! -L "\$HASP_DEB_PATH" ] || return 1
+    mapfile -t members < <(ar t "\$HASP_DEB_PATH" 2>/dev/null) || return 1
+    [ "\${#members[@]}" -eq 3 ] || return 1
+    [ "\${members[0]}" = debian-binary ] || return 1
+    [ "\${members[1]}" = control.tar.gz ] || return 1
+    [ "\${members[2]}" = data.tar.gz ] || return 1
+    [ "\$(ar p "\$HASP_DEB_PATH" debian-binary 2>/dev/null)" = 2.0 ] || return 1
+    HASP_CONTROL_ARCHIVE="\${members[1]}"
+    HASP_DATA_ARCHIVE="\${members[2]}"
+    metadata="\$(arch_kit_tar_extract_file "\$HASP_CONTROL_ARCHIVE" ./control 2>/dev/null)" || return 1
+    package="\$(arch_kit_metadata_field Package "\$metadata")" || return 1
+    version="\$(arch_kit_metadata_field Version "\$metadata")" || return 1
+    architecture="\$(arch_kit_metadata_field Architecture "\$metadata")" || return 1
+    [ "\$package" = aksusbd ] && [ "\$version" = 10.21-1 ] && [ "\$architecture" = amd64 ] || return 1
+    while IFS= read -r member; do
+        case "\$member" in
+            ./|./usr/|./usr/sbin/|./usr/sbin/aksusbd|./usr/sbin/aksusbd_x86_64|./usr/sbin/hasplmd|./usr/sbin/hasplmd_x86_64|./usr/share/|./usr/share/doc/|./usr/share/doc/aksusbd/|./usr/share/doc/aksusbd/copyright|./var/|./var/hasplm/|./var/hasplm/init/|./var/hasplm/init/aksusbd.rc|./var/hasplm/init/aksusbd.service|./var/hasplm/init/aksusbd_x86_64.service|./var/hasplm/init/hasplmd.service|./var/hasplm/init/hasplmd_x86_64.service|./etc/|./etc/udev/|./etc/udev/rules.d/|./etc/udev/rules.d/80-hasp.rules|./etc/hasplm/|./etc/hasplm/templates/|./etc/hasplm/templates/*.alp|./etc/hasplm/help/|./etc/hasplm/help/*) ;;
+            *) return 1 ;;
+        esac
+        case "\$member" in /*|*'..'*|*[[:cntrl:]]*) return 1 ;; esac
+    done < <(ar p "\$HASP_DEB_PATH" "\$HASP_DATA_ARCHIVE" | arch_kit_tar_list "\$HASP_DATA_ARCHIVE")
+    ar p "\$HASP_DEB_PATH" "\$HASP_DATA_ARCHIVE" | {
+        case "\$HASP_DATA_ARCHIVE" in *.tar.gz) tar -tvzf - ;; *.tar.xz) tar -tvJf - ;; *.tar.zst) tar --zstd -tvf - ;; esac
+    } | awk 'substr(\$1, 1, 1) !~ /^[d-]\$/ { bad=1 } END { exit(bad ? 1 : 0) }'
+}
+
+arch_kit_selected_sentinel_suffix() {
+    if [ ! -e /lib/ld-linux.so.2 ] || [ -e "\$HASP_INIT_DIR/force_x86_64" ]; then
+        printf '%s\n' _x86_64
+    else
+        printf '%s\n' ''
+    fi
+}
+
+arch_kit_backup_if_present() {
+    local path="\$1" stamp
+    [ -e "\$path" ] || return 0
+    stamp="\$(date +%Y%m%d%H%M%S)"
+    cp -a -- "\$path" "\$path.dr-domain-join.bak.\$stamp"
+}
+
+arch_kit_extract_allowlisted_sentinel_payload() {
+    local work="\$1" archive payload
+    archive="\$work/data.tar.gz"
+    payload="\$work/payload"
+    ar p "\$HASP_DEB_PATH" "\$HASP_DATA_ARCHIVE" > "\$archive"
+    mkdir -p "\$payload"
+    tar -xzf "\$archive" -C "\$payload" --no-same-owner --no-same-permissions \
+        ./usr/sbin/aksusbd ./usr/sbin/aksusbd_x86_64 ./usr/sbin/hasplmd ./usr/sbin/hasplmd_x86_64 \
+        ./var/hasplm/init/aksusbd.service ./var/hasplm/init/aksusbd_x86_64.service \
+        ./var/hasplm/init/hasplmd.service ./var/hasplm/init/hasplmd_x86_64.service \
+        ./etc/udev/rules.d/80-hasp.rules ./etc/hasplm/templates
+    find "\$payload" \( -type l -o -type b -o -type c -o -type p -o -type s \) -print -quit | grep -q . && return 1
+    return 0
+}
+
+arch_kit_install_vendor_sentinel_payload() {
+    local work="\$1" payload suffix unit
+    payload="\$work/payload"
+    local daemon
+    for daemon in aksusbd aksusbd_x86_64 hasplmd hasplmd_x86_64; do
+        [ -f "\$payload/usr/sbin/\$daemon" ] && [ ! -L "\$payload/usr/sbin/\$daemon" ] || return 1
+        arch_kit_backup_if_present "\$HASP_SBIN_DIR/\$daemon"
+        install -o root -g root -m 0755 "\$payload/usr/sbin/\$daemon" "\$HASP_SBIN_DIR/\$daemon"
+    done
+    install -d -o root -g root -m 0755 "\$HASP_INIT_DIR" "\$HASP_CONFIG_DIR" "\$(dirname "\$HASP_UDEV_RULE")"
+    for unit in aksusbd.service aksusbd_x86_64.service hasplmd.service hasplmd_x86_64.service; do
+        [ -f "\$payload/var/hasplm/init/\$unit" ] || return 1
+        install -o root -g root -m 0644 "\$payload/var/hasplm/init/\$unit" "\$HASP_INIT_DIR/\$unit"
+    done
+    while IFS= read -r -d '' unit; do
+        install -D -o root -g root -m 0644 "\$unit" "\$HASP_CONFIG_DIR/templates/\${unit##*/}"
+    done < <(find "\$payload/etc/hasplm/templates" -type f -print0)
+    arch_kit_backup_if_present "\$HASP_UDEV_RULE"
+    install -o root -g root -m 0644 "\$payload/etc/udev/rules.d/80-hasp.rules" "\$HASP_UDEV_RULE"
+    suffix="\$(arch_kit_selected_sentinel_suffix)"
+    for unit in aksusbd hasplmd; do
+        arch_kit_backup_if_present "\$HASP_SYSTEMD_DIR/\$unit.service"
+        install -o root -g root -m 0644 "\$HASP_INIT_DIR/\$unit\$suffix.service" "\$HASP_SYSTEMD_DIR/\$unit.service"
+    done
+}
+
+arch_kit_vendor_member_matches() {
+    local member="\$1" destination="\$2"
+    ar p "\$HASP_DEB_PATH" "\$HASP_DATA_ARCHIVE" | tar -xOzf - "\$member" | cmp -s - "\$destination"
+}
+
+arch_kit_verify_sentinel() {
+    local suffix daemon config_source
+    arch_kit_validate_sentinel_deb || return 1
+    config_source="\$HASP_SOURCE_DIR/hasplm-\$OFFICE_CODE.ini"
+    [ -f "\$config_source" ] && [ ! -L "\$config_source" ] && cmp -s "\$config_source" "\$HASP_CONFIG_DIR/hasplm.ini" || return 1
+    for daemon in "\$HASP_SBIN_DIR/aksusbd" "\$HASP_SBIN_DIR/aksusbd_x86_64" "\$HASP_SBIN_DIR/hasplmd" "\$HASP_SBIN_DIR/hasplmd_x86_64"; do
+        [ -f "\$daemon" ] && [ ! -L "\$daemon" ] && [ -x "\$daemon" ] || return 1
+    done
+    ldd "\$HASP_SBIN_DIR/aksusbd_x86_64" "\$HASP_SBIN_DIR/hasplmd_x86_64" >/dev/null 2>&1 || return 1
+    ldd "\$HASP_SBIN_DIR/aksusbd_x86_64" "\$HASP_SBIN_DIR/hasplmd_x86_64" 2>/dev/null | grep -Fq 'not found' && return 1
+    suffix="\$(arch_kit_selected_sentinel_suffix)"
+    arch_kit_vendor_member_matches ./etc/udev/rules.d/80-hasp.rules "\$HASP_UDEV_RULE" || return 1
+    cmp -s "\$HASP_INIT_DIR/aksusbd\$suffix.service" "\$HASP_SYSTEMD_DIR/aksusbd.service" || return 1
+    cmp -s "\$HASP_INIT_DIR/hasplmd\$suffix.service" "\$HASP_SYSTEMD_DIR/hasplmd.service" || return 1
+    [ "\$(systemctl show aksusbd.service -p LoadState --value 2>/dev/null)" = loaded ] || return 1
+    [ "\$(systemctl show hasplmd.service -p LoadState --value 2>/dev/null)" = loaded ] || return 1
+    systemctl is-active --quiet aksusbd.service && systemctl is-active --quiet hasplmd.service
+}
+
+install_arch_sentinel_runtime() (
+    local work config_source
+    arch_kit_validate_sentinel_deb || { log "Arch KIT blocker: approved Sentinel .deb must be a safe aksusbd 10.21-1 amd64 Debian ar package: \$HASP_DEB_PATH"; return 1; }
+    config_source="\$HASP_SOURCE_DIR/hasplm-\$OFFICE_CODE.ini"
+    [ -f "\$config_source" ] && [ ! -L "\$config_source" ] || { log "Arch KIT blocker: validated office HASP configuration is missing: \$config_source"; return 1; }
+    work="\$(mktemp -d /var/tmp/dr-hasp-deb.XXXXXXXX)"
+    trap 'rm -rf -- "\$work"' EXIT
+    arch_kit_extract_allowlisted_sentinel_payload "\$work" || { log "Arch KIT blocker: approved Sentinel payload extraction failed allowlist validation."; return 1; }
+    arch_kit_install_vendor_sentinel_payload "\$work" || { log "Arch KIT blocker: Sentinel runtime payload installation failed."; return 1; }
+    arch_kit_backup_if_present "\$HASP_CONFIG_DIR/hasplm.ini"
+    install -o root -g root -m 0644 "\$config_source" "\$HASP_CONFIG_DIR/hasplm.ini"
+    udevadm control --reload-rules
+    systemctl daemon-reload
+    systemctl enable aksusbd.service hasplmd.service
+    systemctl restart aksusbd.service hasplmd.service
+    arch_kit_verify_sentinel || { log "Sentinel runtime verification failed after vendor payload deployment."; return 1; }
+)
+
+arch_kit_verify_native_dependencies() {
+    local package
+    local -a required=(gtk3 libglvnd glu libx11 libxext libxrender libxrandr pango cairo libpng libnotify libsm expat gcc-libs glib2 pcre2 glibmm systemd-libs libxml++2.6 libjpeg-turbo libtiff cifs-utils samba gedit)
+    arch_kit_cpprest_available || return 1
+    for package in "\${required[@]}"; do pacman -Q "\$package" >/dev/null 2>&1 || return 1; done
+}
+
+arch_kit_verify_local_preflight() {
+    local package kit_dir="\$(dirname "\$KIT_INSTALLER_PATH")"
+    [ -f "\$ARCH_KIT_COMPAT_DIR/dpkg-query" ] && [ ! -L "\$ARCH_KIT_COMPAT_DIR/dpkg-query" ] && [ -x "\$ARCH_KIT_COMPAT_DIR/dpkg-query" ] || return 1
+    [ -r "\$kit_dir/KIT" ] && [ -r "\$kit_dir/KIT.sh" ] || return 1
+    for package in libgtk-3-0 libgl1 libglu1-mesa libx11-6 libxext6 libxrender1 libxrandr2 libpango-1.0-0 libpangocairo-1.0-0 libcairo2 libpng16-16 libnotify4 libsm6 libexpat1 libstdc++6 libglib2.0-0 libpcre2-32-0 libglibmm-2.4-1 libcpprest2.10 libudev1 libxml++2.6-2v5 gedit cifs-utils winbind libjpeg62-turbo libtiff6 aksusbd; do
+        DR_KIT_RUNTIME_DIR="\$kit_dir" DR_KIT_CPPREST_LIBRARY_PATH="\$CPPREST_LIBRARY_PATH" DR_KIT_HASP_CONFIG_DIR="\$HASP_CONFIG_DIR" DR_KIT_HASP_UDEV_RULE="\$HASP_UDEV_RULE" DR_KIT_HASP_SBIN_DIR="\$HASP_SBIN_DIR" DR_KIT_HASP_SYSTEMD_DIR="\$HASP_SYSTEMD_DIR" "\$ARCH_KIT_COMPAT_DIR/dpkg-query" -W '-f=\${Status}' "\$package" >/dev/null || return 1
+    done
+}
+
+install_kit_arch() {
+    [ -n "\${OFFICE_CODE:-}" ] || { log "No office code is available for Arch KIT installation."; return 1; }
+    if state_has "KIT_INSTALL_COMPLETE"; then
+        log "Arch KIT installation marker exists; validating current native runtime before reusing it."
+        install_arch_private_cpprest || { log "Arch private cpprest runtime is no longer valid; marker is not trusted."; return 1; }
+        install_arch_kit_compatibility_adapter
+        arch_kit_verify_native_dependencies || { log "Arch KIT runtime dependencies are no longer valid; marker is not trusted."; return 1; }
+        arch_kit_verify_sentinel || { log "Arch Sentinel runtime is no longer valid; marker is not trusted."; return 1; }
+        arch_kit_verify_local_preflight || { log "Arch KIT launcher prerequisites are no longer valid; marker is not trusted."; return 1; }
+        log "Existing Arch KIT installation remains valid; no package or Sentinel reinstall was performed."
+        return 0
+    fi
+    install_arch_private_cpprest || return 1
+    arch_kit_install_native_dependencies || return 1
+    install_arch_sentinel_runtime || return 1
+    install_arch_kit_compatibility_adapter
+    arch_kit_verify_native_dependencies || return 1
+    arch_kit_verify_sentinel || return 1
+    arch_kit_verify_local_preflight || return 1
+    state_mark "KIT_INSTALL_COMPLETE"
+    log "Arch KIT native dependencies, approved Sentinel runtime, and local compatibility adapter verified."
+}
+EOF
+}
 
 # ── Post-mount provisioning helper ───────────────────────────────────────────
 install_post_mount_provision_helper() {
     print_info "Installing post-mount provisioning helper for KIT installer and workstation branding..."
+    install_live_validation_helper
 
     # Install/repair the canonical root KIT launch helper now, not only after
     # post-mount provisioning runs. The desktop shortcut and sudoers rule both
@@ -2888,11 +6719,27 @@ install_post_mount_provision_helper() {
     # KIT runtime directory and launches KIT.sh.
     local kit_runtime_dir
     local escaped_kit_runtime_dir
+    local kit_cache_validator
+    local kit_credential_self_test
+    local drip_launcher_support
+    local arch_kit_launcher_support
+    local arch_kit_post_mount_support
+    local arch_root_session_activation
+    local arch_user_session_activation
     kit_runtime_dir="$(dirname "$KIT_INSTALLER_PATH")"
+    kit_cache_validator="$(render_kit_cache_validator)"
+    kit_credential_self_test="$(render_kit_credential_self_test)"
+    drip_launcher_support="$(render_drip_launcher_support)"
+    arch_kit_launcher_support="$(render_arch_kit_launcher_support)"
+    arch_kit_post_mount_support="$(render_arch_kit_post_mount_support)"
+    arch_root_session_activation="$(render_arch_root_session_activation_helper)"
+    arch_user_session_activation="$(render_arch_user_session_activation_helper)"
 
-    # Generate this helper with a quoted heredoc so runtime variables such as
-    # $LOG, $KIT_DIR, ${1:-}, and $? are preserved until dr-launch-kit runs.
-    cat > /usr/local/sbin/dr-launch-kit << 'EOF'
+    # Generate this helper with quoted heredoc segments so runtime variables
+    # such as $LOG, $KIT_DIR, ${1:-}, and $? are preserved until launch time,
+    # while the shared cache validator is inserted as generated shell code.
+    {
+    cat << 'EOF'
 #!/bin/bash
 set -u
 
@@ -2900,7 +6747,25 @@ LOG="/var/log/dr-launch-kit.log"
 KIT_DIR="__KIT_RUNTIME_DIR__"
 KIT_SCRIPT="./KIT.sh"
 
+EOF
+    printf '%s\n' "$kit_cache_validator"
+    printf '%s\n' "$kit_credential_self_test"
+    cat << 'EOF'
+
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+touch "$LOG" 2>/dev/null || true
+chmod 644 "$LOG" 2>/dev/null || true
+
 if [ "${1:-}" = "--sudo-self-test" ]; then
+    exit 0
+fi
+
+if [ "${1:-}" = "--access-self-test" ]; then
+    [ "$(id -u)" -eq 0 ] || { echo "--access-self-test must run as root" >&2; exit 1; }
+    [ -r "$KIT_DIR/KIT.sh" ] || { echo "KIT.sh is not readable: $KIT_DIR/KIT.sh" >&2; exit 1; }
+    while IFS= read -r -d '' runtime_file; do
+        [ -r "$runtime_file" ] || { echo "KIT runtime file is not readable: $runtime_file" >&2; exit 1; }
+    done < <(find "$KIT_DIR" -type f -print0)
     exit 0
 fi
 
@@ -2922,35 +6787,73 @@ if [ ! -f "$KIT_DIR/$KIT_SCRIPT" ]; then
     exit 1
 fi
 
+validate_kit_invoking_cache
+EOF
+    printf '%s\n' "$drip_launcher_support"
+    printf '%s\n' "$arch_kit_launcher_support"
+    cat << 'EOF'
+
 cd "$KIT_DIR" || exit 1
 
 # Intentionally do NOT redirect stdout/stderr. KIT behaves correctly when
 # launched like the manual known-good command:
 #   cd /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64
 #   sudo bash ./KIT.sh
-bash "$KIT_SCRIPT"
+if [ -n "${ARCH_KIT_COMPAT_DIR:-}" ]; then
+    validate_arch_kit_runtime || exit 1
+    prepare_arch_kit_runtime_wrapper || exit 1
+    DR_KIT_RUNTIME_DIR="$KIT_DIR" DR_KIT_CPPREST_LIBRARY_PATH="$ARCH_KIT_CPPREST_LIBRARY_PATH" DR_KIT_HASP_CONFIG_DIR="$ARCH_KIT_HASP_CONFIG_DIR" DR_KIT_HASP_UDEV_RULE="$ARCH_KIT_HASP_UDEV_RULE" DR_KIT_HASP_SBIN_DIR="$ARCH_KIT_HASP_SBIN_DIR" DR_KIT_HASP_SYSTEMD_DIR="$ARCH_KIT_HASP_SYSTEMD_DIR" PATH="$ARCH_KIT_COMPAT_DIR:$PATH" LD_LIBRARY_PATH="$ARCH_KIT_CPPREST_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" bash "$ARCH_KIT_RUNTIME_WRAPPER"
+else
+    bash "$KIT_SCRIPT"
+fi
 status=$?
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] KIT exited with status: $status" >> "$LOG" 2>/dev/null || true
 exit "$status"
 EOF
+    } > /usr/local/sbin/dr-launch-kit
     escaped_kit_runtime_dir="$(printf '%s
 ' "$kit_runtime_dir" | sed 's/[#&]/\&/g')"
     sed -i "s#__KIT_RUNTIME_DIR__#$escaped_kit_runtime_dir#g" /usr/local/sbin/dr-launch-kit
     chmod 755 /usr/local/sbin/dr-launch-kit
     chown root:root /usr/local/sbin/dr-launch-kit
 
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        printf '%s\n' "$arch_root_session_activation" > /usr/local/sbin/dr-workstation-session-activate
+        chmod 755 /usr/local/sbin/dr-workstation-session-activate
+        chown root:root /usr/local/sbin/dr-workstation-session-activate
+
+        printf '%s\n' "$arch_user_session_activation" > /usr/local/bin/dr-workstation-session-activate
+        chmod 755 /usr/local/bin/dr-workstation-session-activate
+        chown root:root /usr/local/bin/dr-workstation-session-activate
+
+        cat > /usr/local/bin/mount-kit-tools-autostart << 'EOF'
+#!/bin/bash
+# Arch uses a session-aware dispatcher because /mnt/x has one explicit
+# Kerberos credential owner. It refreshes the user workspace and rebinds only
+# when the existing transactional helper confirms KIT/DRIP are inactive.
+exec /usr/local/bin/dr-workstation-session-activate
+EOF
+        chmod 755 /usr/local/bin/mount-kit-tools-autostart
+        chown root:root /usr/local/bin/mount-kit-tools-autostart
+    fi
+
     cat > /usr/local/sbin/dr-post-mount-provision << EOF
 #!/bin/bash
 set -euo pipefail
 
 KIT_INSTALLER_PATH="${KIT_INSTALLER_PATH}"
+PLATFORM_FAMILY="${PLATFORM_FAMILY}"
+DR_KIT_ARCH_COMPAT_DIR="${DR_KIT_ARCH_COMPAT_DIR}"
 BRAND_WALLPAPER_SOURCE="${BRAND_WALLPAPER_SOURCE}"
 BRAND_WALLPAPER_DEST="${BRAND_WALLPAPER_DEST}"
 STATE_DIR="${STATE_DIR}"
 STATE_FILE="${STATE_FILE}"
 OFFICE_CODE="${OFFICE_CODE:-}"
+TOOLS_SOURCE="//$TOOLS_SERVER/Tools"
 LOG_FILE="/var/log/dr-post-mount-provision.log"
+
+$arch_kit_post_mount_support
 
 log() {
     echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$*" | tee -a "\$LOG_FILE"
@@ -2963,6 +6866,12 @@ state_mark() {
 
 state_has() {
     [ -f "\$STATE_DIR/\$1" ]
+}
+
+tools_mount_is_authoritative() {
+    command -v findmnt >/dev/null 2>&1 || return 1
+    findmnt --noheadings --raw --target /mnt/x --output FSTYPE,SOURCE 2>/dev/null \
+        | awk -v expected="\$TOOLS_SOURCE" '\$1 == "cifs" && \$2 == expected { found=1 } END { exit(found ? 0 : 1) }'
 }
 
 install_root_kit_launcher_helper() {
@@ -2978,6 +6887,8 @@ set -u
 LOG="/var/log/dr-launch-kit.log"
 KIT_DIR="__KIT_RUNTIME_DIR__"
 KIT_SCRIPT="./KIT.sh"
+$kit_cache_validator
+$kit_credential_self_test
 
 mkdir -p "\$(dirname "\$LOG")" 2>/dev/null || true
 touch "\$LOG" 2>/dev/null || true
@@ -2993,6 +6904,15 @@ if [ "\${1:-}" = "--sudo-self-test" ]; then
     exit 0
 fi
 
+if [ "\${1:-}" = "--access-self-test" ]; then
+    [ "\$(id -u)" -eq 0 ] || { echo "--access-self-test must run as root" >&2; exit 1; }
+    [ -r "\$KIT_DIR/KIT.sh" ] || { echo "KIT.sh is not readable: \$KIT_DIR/KIT.sh" >&2; exit 1; }
+    while IFS= read -r -d '' runtime_file; do
+        [ -r "\$runtime_file" ] || { echo "KIT runtime file is not readable: \$runtime_file" >&2; exit 1; }
+    done < <(find "\$KIT_DIR" -type f -print0)
+    exit 0
+fi
+
 if [ ! -d "\$KIT_DIR" ]; then
     echo "KIT directory not found: \$KIT_DIR" | tee -a "\$LOG" >&2
     echo "Verify Tool Server is mounted at /mnt/x, then try again." >&2
@@ -3005,13 +6925,23 @@ if [ ! -f "\$KIT_DIR/KIT.sh" ]; then
     exit 1
 fi
 
+validate_kit_invoking_cache
+$drip_launcher_support
+$arch_kit_launcher_support
+
 cd "\$KIT_DIR" || exit 1
 
 # Intentionally do NOT redirect stdout/stderr. KIT behaves correctly when
 # launched like the manual known-good command:
 #   cd /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64
 #   sudo bash ./KIT.sh
-bash "\$KIT_SCRIPT"
+if [ -n "\${ARCH_KIT_COMPAT_DIR:-}" ]; then
+    validate_arch_kit_runtime || exit 1
+    prepare_arch_kit_runtime_wrapper || exit 1
+    DR_KIT_RUNTIME_DIR="\$KIT_DIR" DR_KIT_CPPREST_LIBRARY_PATH="\$ARCH_KIT_CPPREST_LIBRARY_PATH" DR_KIT_HASP_CONFIG_DIR="\$ARCH_KIT_HASP_CONFIG_DIR" DR_KIT_HASP_UDEV_RULE="\$ARCH_KIT_HASP_UDEV_RULE" DR_KIT_HASP_SBIN_DIR="\$ARCH_KIT_HASP_SBIN_DIR" DR_KIT_HASP_SYSTEMD_DIR="\$ARCH_KIT_HASP_SYSTEMD_DIR" PATH="\$ARCH_KIT_COMPAT_DIR:\$PATH" LD_LIBRARY_PATH="\$ARCH_KIT_CPPREST_LIB_DIR\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" bash "\$ARCH_KIT_RUNTIME_WRAPPER"
+else
+    bash "\$KIT_SCRIPT"
+fi
 status=\$?
 
 echo "[\$(date '+%Y-%m-%d %H:%M:%S')] KIT exited with status: \$status" >> "\$LOG" 2>/dev/null || true
@@ -3025,6 +6955,13 @@ EOF2
 }
 
 if [ "\${1:-}" = "--sudo-self-test" ]; then
+    exit 0
+fi
+
+if [ "\${1:-}" = "--access-self-test" ]; then
+    [ "\$(id -u)" -eq 0 ] || { echo "--access-self-test must run as root" >&2; exit 1; }
+    [ -r "\$KIT_INSTALLER_PATH" ] || { echo "KIT installer is not readable: \$KIT_INSTALLER_PATH" >&2; exit 1; }
+    [ -r "\$(dirname "\$KIT_INSTALLER_PATH")/KIT.sh" ] || { echo "KIT.sh is not readable" >&2; exit 1; }
     exit 0
 fi
 
@@ -3051,14 +6988,14 @@ else
     log "No saved office code found in \$STATE_FILE."
 fi
 
-if ! mountpoint -q /mnt/x; then
-    log "DR Tools share is not mounted at /mnt/x; skipping post-mount provisioning."
-    exit 0
+if ! tools_mount_is_authoritative; then
+    log "DR Tools share is not an authoritative CIFS mount at /mnt/x; refusing post-mount provisioning."
+    exit 1
 fi
 
 install_root_kit_launcher_helper
 
-install_kit() {
+install_kit_debian() {
     local kit_dir
     local kit_script
     local rc
@@ -3101,6 +7038,14 @@ install_kit() {
     fi
 }
 
+install_kit() {
+    case "\$PLATFORM_FAMILY" in
+        debian) install_kit_debian ;;
+        arch) install_kit_arch ;;
+        *) log "No KIT installation adapter exists for platform family: \$PLATFORM_FAMILY"; return 1 ;;
+    esac
+}
+
 install_kit_desktop_shortcut_for_user() {
     local user="\$1"
     local home="\$2"
@@ -3130,9 +7075,33 @@ install_kit_desktop_shortcut_for_user() {
 #!/bin/bash
 set +e
 
+rc=1
+x11_root_access_granted=0
+
+cleanup_x11_root_access() {
+    if [ "\$x11_root_access_granted" -eq 1 ]; then
+        /usr/bin/xhost -SI:localuser:root >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+trap cleanup_x11_root_access EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 echo "Launching KIT..."
-sudo -n /usr/local/sbin/dr-launch-kit "\$@"
-rc=\$?
+if [ -z "\${DISPLAY:-}" ]; then
+    echo "KIT requires an active graphical X11 display." >&2
+elif [ ! -x /usr/bin/xhost ]; then
+    echo "KIT requires /usr/bin/xhost to authorize the root GUI process." >&2
+elif /usr/bin/xhost +SI:localuser:root >/dev/null 2>&1; then
+    x11_root_access_granted=1
+    sudo -n /usr/local/sbin/dr-launch-kit "\$@"
+    rc=\$?
+else
+    echo "Unable to authorize the root KIT process for this X11 session." >&2
+fi
 
 if [ -z "\${rc:-}" ]; then
     rc=1
@@ -3458,27 +7427,41 @@ applications_dir="\$user_home/.local/share/applications"
 bin_dir="\$user_home/.local/bin"
 resources_dir="\$desktop_dir/Ontrack Resources"
 notes_dir="\$user_home/Recovery Notes"
-mkdir -p "\$desktop_dir" "\$applications_dir" "\$bin_dir" "\$resources_dir" "\$notes_dir" "\$ONTRACK_LOG_DIR"
 
-# Keep the top-level desktop intentionally sparse. Manual mount lives inside Ontrack Resources.
-rm -f "\$desktop_dir/Mount DR Tools.desktop" 2>/dev/null || true
-rm -f "\$desktop_dir/Home.desktop" "\$desktop_dir/home.desktop" "\$desktop_dir/Computer.desktop" "\$desktop_dir/Trash.desktop" 2>/dev/null || true
-
-# Hide GNOME desktop special icons where the extension/schema supports it.
-if command -v gsettings >/dev/null 2>&1; then
-    gsettings set org.gnome.shell.extensions.ding show-home false >/dev/null 2>&1 || true
-    gsettings set org.gnome.shell.extensions.ding show-trash false >/dev/null 2>&1 || true
-    gsettings set org.gnome.desktop.background show-desktop-icons false >/dev/null 2>&1 || true
-fi
-
-wrapper="\$bin_dir/dr-launch-kit"
-cat > "\$wrapper" << 'EOF2'
+write_kit_user_launcher() {
+    local wrapper="\$bin_dir/dr-launch-kit"
+    mkdir -p "\$bin_dir"
+    cat > "\$wrapper" << 'EOF2'
 #!/bin/bash
 set +e
 
+rc=1
+x11_root_access_granted=0
+
+cleanup_x11_root_access() {
+    if [ "\$x11_root_access_granted" -eq 1 ]; then
+        /usr/bin/xhost -SI:localuser:root >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+trap cleanup_x11_root_access EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 echo "Launching KIT..."
-sudo -n /usr/local/sbin/dr-launch-kit "\$@"
-rc=\$?
+if [ -z "\${DISPLAY:-}" ]; then
+    echo "KIT requires an active graphical X11 display." >&2
+elif [ ! -x /usr/bin/xhost ]; then
+    echo "KIT requires /usr/bin/xhost to authorize the root GUI process." >&2
+elif /usr/bin/xhost +SI:localuser:root >/dev/null 2>&1; then
+    x11_root_access_granted=1
+    sudo -n /usr/local/sbin/dr-launch-kit "\$@"
+    rc=\$?
+else
+    echo "Unable to authorize the root KIT process for this X11 session." >&2
+fi
 
 if [ -z "\${rc:-}" ]; then
     rc=1
@@ -3494,7 +7477,33 @@ fi
 
 exit "\$rc"
 EOF2
-chmod 755 "\$wrapper"
+    chmod 755 "\$wrapper"
+}
+
+if [ "\${1:-}" = "--refresh-kit-launcher" ]; then
+    write_kit_user_launcher
+    exit 0
+fi
+
+session_activate=0
+[ "\${1:-}" = "--session-activate" ] && session_activate=1
+
+mkdir -p "\$desktop_dir" "\$applications_dir" "\$bin_dir" "\$resources_dir" "\$notes_dir" "\$ONTRACK_LOG_DIR"
+
+if [ "\$session_activate" -eq 0 ]; then
+    # Keep the top-level desktop intentionally sparse. Manual mount lives inside Ontrack Resources.
+    rm -f "\$desktop_dir/Mount DR Tools.desktop" 2>/dev/null || true
+    rm -f "\$desktop_dir/Home.desktop" "\$desktop_dir/home.desktop" "\$desktop_dir/Computer.desktop" "\$desktop_dir/Trash.desktop" 2>/dev/null || true
+
+    # Hide GNOME desktop special icons where the extension/schema supports it.
+    if command -v gsettings >/dev/null 2>&1; then
+        gsettings set org.gnome.shell.extensions.ding show-home false >/dev/null 2>&1 || true
+        gsettings set org.gnome.shell.extensions.ding show-trash false >/dev/null 2>&1 || true
+        gsettings set org.gnome.desktop.background show-desktop-icons false >/dev/null 2>&1 || true
+    fi
+fi
+
+write_kit_user_launcher
 
 kit_app="\$applications_dir/dr-kit.desktop"
 kit_desktop="\$desktop_dir/KIT.desktop"
@@ -3529,9 +7538,9 @@ link_resource() {
 }
 
 link_resource "Tool Server" "/mnt/x"
-rm -rf "$resources_dir/Logical Recovery Tools" 2>/dev/null || true
+rm -rf "\$resources_dir/Logical Recovery Tools" 2>/dev/null || true
 link_resource "DRTools" "/mnt/x/DRTools"
-rm -rf "$resources_dir/Physical Recovery Tools" 2>/dev/null || true
+rm -rf "\$resources_dir/Physical Recovery Tools" 2>/dev/null || true
 link_resource "CRTools" "/mnt/x/CRTools"
 link_resource "Firmware" "/mnt/x/Firmware"
 link_resource "Audit Resources" "/mnt/x/Audit"
@@ -3563,9 +7572,13 @@ If the Tool Server is not connected, run:
 
 For workstation diagnostics, run:
   hostnamectl
-  realm list
+  net ads testjoin 2>/dev/null || realm list
   findmnt /mnt/x
 EOF2
+
+if [ "\$session_activate" -eq 1 ]; then
+    exit 0
+fi
 
 repair_bookmarks
 repair_aliases
@@ -3615,10 +7628,7 @@ EOF
     rm -f /etc/sudoers.d/dr_launch_kit /etc/sudoers.d/99-dr_launch_kit
     if [ -n "$kit_user" ] && [ "$kit_user" != "root" ]; then
         local kit_sudoers_file="/etc/sudoers.d/zz-dr_launch_kit"
-        cat > "$kit_sudoers_file" << EOF
-# Managed by DR Domain Join
-$kit_user ALL=(root) NOPASSWD: /usr/local/sbin/dr-launch-kit
-EOF
+        render_kit_launcher_sudoers "$kit_user" > "$kit_sudoers_file"
         chmod 440 "$kit_sudoers_file"
         chown root:root "$kit_sudoers_file"
         if visudo -cf "$kit_sudoers_file" >/dev/null 2>&1; then
@@ -3633,9 +7643,1334 @@ EOF
 }
 
 
+render_autofs_master_maps() {
+    cat << 'EOF'
+/smb    /etc/auto.net.cifs    --timeout=300 --ghost
+/net    /etc/auto.net.cifs    --timeout=300 --ghost
+EOF
+}
+
+render_autofs_cifs_map() {
+    cat << 'EOF'
+#!/bin/bash
+key="$1"
+[ -z "$key" ] && exit 1
+mapfile="/etc/autofs.d/$key"
+mkdir -p /etc/autofs.d
+if [ ! -f "$mapfile" ]; then
+    printf '*\t-fstype=cifs,sec=krb5,cruid=${UID},vers=3.0\t://%s/&\n' "$key" > "$mapfile"
+fi
+printf -- '-fstype=autofs\tfile:%s\n' "$mapfile"
+EOF
+}
+
+tools_mount_unit_name() {
+    command -v systemd-escape >/dev/null 2>&1 || return 1
+    systemd-escape --path --suffix=mount "${1:-/mnt/x}"
+}
+
+tools_automount_unit_name() {
+    command -v systemd-escape >/dev/null 2>&1 || return 1
+    systemd-escape --path --suffix=automount "${1:-/mnt/x}"
+}
+
+resolve_domain_user_uid() {
+    local user="${1:-}" passwd_line resolved_name resolved_uid resolved_home resolved_shell separators
+    local -a records
+    [ -n "$user" ] || return 1
+    mapfile -t records < <(getent passwd "$user" 2>/dev/null || true)
+    [ "${#records[@]}" -eq 1 ] || return 1
+    passwd_line="${records[0]}"
+    separators="${passwd_line//[^:]/}"
+    [ "${#separators}" -eq 6 ] || return 1
+    IFS=: read -r resolved_name _ resolved_uid _ _ resolved_home resolved_shell <<< "$passwd_line"
+    [ -n "$resolved_name" ] || return 1
+    case "$resolved_uid" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$(id -u "$resolved_name" 2>/dev/null || true)" = "$resolved_uid" ] || return 1
+    # A local account with the same name is not proof of an SSSD/domain
+    # identity. Never bind a Kerberos CIFS mount to that local UID.
+    if awk -F: -v user="$resolved_name" '$1 == user { found=1 } END { exit(found ? 0 : 1) }' /etc/passwd 2>/dev/null; then
+        return 1
+    fi
+    [ -n "$resolved_home" ] || return 1
+    platform_login_shell_is_acceptable "$resolved_shell" || return 1
+    printf '%s\n' "$resolved_uid"
+}
+
+diagnose_selected_domain_user_login_identity() {
+    local user="${1:-}" passwd_line resolved_name resolved_uid resolved_home resolved_shell separators
+    local -a records
+    [ -n "$user" ] || return 1
+    mapfile -t records < <(getent passwd "$user" 2>/dev/null || true)
+    [ "${#records[@]}" -eq 1 ] || return 1
+    passwd_line="${records[0]}"
+    separators="${passwd_line//[^:]/}"
+    [ "${#separators}" -eq 6 ] || return 1
+    IFS=: read -r resolved_name _ resolved_uid _ _ resolved_home resolved_shell <<< "$passwd_line"
+    [ -n "$resolved_name" ] || return 1
+    case "$resolved_uid" in ''|*[!0-9]*) return 1 ;; esac
+    if [ -z "$resolved_home" ]; then
+        print_error "Selected domain user $user has an empty home directory in the normal NSS passwd record"
+        return 1
+    fi
+    if [ -z "$resolved_shell" ]; then
+        print_error "Selected domain user $user has an empty login shell in the normal NSS passwd record"
+        return 1
+    fi
+    if ! platform_login_shell_is_acceptable "$resolved_shell"; then
+        print_error "Selected domain user $user has an unavailable or unsupported login shell '$resolved_shell'"
+        return 1
+    fi
+    return 0
+}
+
+diagnose_sss_direct_user_uid() {
+    local user="${1:-}" passwd_line resolved_uid separators
+    local -a records
+    [ -n "$user" ] || return 1
+    mapfile -t records < <(getent -s sss passwd "$user" 2>/dev/null || true)
+    [ "${#records[@]}" -eq 1 ] || return 1
+    passwd_line="${records[0]}"
+    separators="${passwd_line//[^:]/}"
+    [ "${#separators}" -eq 6 ] || return 1
+    IFS=: read -r _ _ resolved_uid _ _ _ _ <<< "$passwd_line"
+    case "$resolved_uid" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$resolved_uid"
+}
+
+tools_mount_cruid() {
+    local uid="${DR_TOOLS_MOUNT_CRUID:-}"
+    if [ "$PLATFORM_FAMILY" = arch ]; then
+        local resolved_domain_uid
+        resolved_domain_uid="$(resolve_domain_user_uid "${DOMAIN_SUDO_USER:-}" || true)"
+        [ -n "$resolved_domain_uid" ] || {
+            print_error "Selected Arch domain user '${DOMAIN_SUDO_USER:-}' does not resolve through NSS/SSSD"
+            print_error "No local UID or SUDO_UID fallback will be used for /mnt/x"
+            return 1
+        }
+        if [ -n "$uid" ] && [ "$uid" != "$resolved_domain_uid" ]; then
+            print_error "Persisted Tool Server cruid=$uid does not match resolved domain-user UID $resolved_domain_uid"
+            return 1
+        fi
+        uid="$resolved_domain_uid"
+    else
+        # Preserve the established Debian behavior. Arch deliberately does
+        # not use these fallbacks because a local UID must never stand in for
+        # an unresolved domain identity.
+        if [ -z "$uid" ] && [ -n "${DOMAIN_SUDO_USER:-}" ]; then
+            uid="$(id -u "$DOMAIN_SUDO_USER" 2>/dev/null || true)"
+        fi
+        if [ -z "$uid" ] && [ -n "${SUDO_UID:-}" ] && [ "${SUDO_UID}" != 0 ]; then
+            uid="$SUDO_UID"
+        fi
+    fi
+    case "$uid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    printf '%s\n' "$uid"
+}
+
+render_arch_tools_mount_unit() {
+    local mount_point="${1:-/mnt/x}"
+    local server="${2:-$TOOLS_SERVER}"
+    local cruid="${3:-${DR_TOOLS_MOUNT_CRUID:-}}"
+    case "$cruid" in
+        ''|*[!0-9]*)
+            print_error "Arch Tool Server unit requires the logged-in domain user's numeric UID as cruid" >&2
+            return 1
+            ;;
+    esac
+    cat << EOF
+[Unit]
+Description=DR Tool Server CIFS mount
+Wants=network-online.target
+After=network-online.target
+
+[Mount]
+What=//$server/Tools
+Where=$mount_point
+Type=cifs
+Options=_netdev,nofail,sec=krb5,cruid=$cruid,vers=3.0
+TimeoutSec=30s
+EOF
+}
+
+render_arch_tools_automount_unit() {
+    local mount_point="${1:-/mnt/x}"
+    cat << EOF
+[Unit]
+Description=On-demand DR Tool Server CIFS automount
+
+[Automount]
+Where=$mount_point
+TimeoutIdleSec=300s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+drip_mount_unit_name() {
+    local entry="${1:-}"
+    command -v systemd-escape >/dev/null 2>&1 || return 1
+    systemd-escape --path --suffix=mount "/smb/$entry"
+}
+
+drip_automount_unit_name() {
+    local entry="${1:-}"
+    command -v systemd-escape >/dev/null 2>&1 || return 1
+    systemd-escape --path --suffix=automount "/smb/$entry"
+}
+
+render_arch_drip_mount_unit() {
+    local entry="${1:-}"
+    local server share
+    validate_drip_search_root_entry "$entry" || return 1
+    server="${entry%%/*}"
+    share="${entry#*/}"
+    cat << EOF
+[Unit]
+Description=Configured DRIP search CIFS mount //$server/$share
+
+[Mount]
+What=//$server/$share
+Where=/smb/$server/$share
+Type=cifs
+Options=_netdev,nofail,sec=krb5,cruid=0,vers=3.0
+TimeoutSec=30s
+EOF
+}
+
+render_arch_drip_automount_unit() {
+    local entry="${1:-}"
+    validate_drip_search_root_entry "$entry" || return 1
+    cat << EOF
+[Unit]
+Description=On-demand configured DRIP search automount /smb/$entry
+
+[Automount]
+Where=/smb/$entry
+TimeoutIdleSec=300s
+EOF
+}
+
+render_drip_search_mount_helper() {
+    cat << EOF
+#!/bin/bash
+set -euo pipefail
+
+MANIFEST="${DR_DRIP_MANIFEST}"
+UNIT_DIR="${DR_DRIP_UNIT_DIR}"
+
+require_root() {
+    [ "\$(id -u)" -eq 0 ] || { echo "This DRIP search helper requires root." >&2; exit 1; }
+}
+
+read_manifest() {
+    [ -r "\$MANIFEST" ] || return 0
+    while IFS=$'\\t' read -r entry mount_unit automount_unit; do
+        [ -n "\$entry" ] || continue
+        printf '%s\\t%s\\t%s\\n' "\$entry" "\$mount_unit" "\$automount_unit"
+    done < "\$MANIFEST"
+}
+
+start_roots() {
+    require_root
+    local entry mount_unit automount_unit
+    while IFS=$'\\t' read -r entry mount_unit automount_unit; do
+        [ -n "\$entry" ] || continue
+        if ! systemctl start "\$automount_unit" || ! systemctl is-active --quiet "\$automount_unit"; then
+            echo "DRIP search start failed for \$automount_unit; attempting safe cleanup." >&2
+            cleanup_roots || true
+            return 1
+        fi
+    done < <(read_manifest)
+}
+
+cleanup_roots() {
+    require_root
+    local -a entries=() mounts=() automounts=()
+    local entry mount_unit automount_unit i failed=0
+    while IFS=$'\\t' read -r entry mount_unit automount_unit; do
+        [ -n "\$entry" ] || continue
+        entries+=("\$entry")
+        mounts+=("\$mount_unit")
+        automounts+=("\$automount_unit")
+    done < <(read_manifest)
+
+    # Stop automounts first so no new target-path trigger can occur.
+    for ((i=\${#automounts[@]}-1; i>=0; i--)); do
+        if ! systemctl stop "\${automounts[i]}"; then
+            echo "BUSY: could not stop DRIP automount \${automounts[i]}; preserving diagnostics." >&2
+            failed=1
+        fi
+    done
+    for ((i=\${#mounts[@]}-1; i>=0; i--)); do
+        if ! systemctl stop "\${mounts[i]}"; then
+            echo "BUSY: could not stop DRIP mount \${mounts[i]}; preserving diagnostics." >&2
+            failed=1
+        fi
+    done
+    return "\$failed"
+}
+
+status_roots() {
+    require_root
+    local entry mount_unit automount_unit
+    while IFS=$'\\t' read -r entry mount_unit automount_unit; do
+        [ -n "\$entry" ] || continue
+        printf 'entry=%s mount=%s automount=%s active=' "\$entry" "\$mount_unit" "\$automount_unit"
+        if systemctl is-active --quiet "\$automount_unit"; then echo yes; else echo no; fi
+    done < <(read_manifest)
+}
+
+case "\${1:---status}" in
+    start) start_roots ;;
+    cleanup) cleanup_roots ;;
+    status) status_roots ;;
+    --dry-run)
+        while IFS=$'\\t' read -r entry mount_unit automount_unit; do
+            [ -n "\$entry" ] || continue
+            echo "WOULD START/STOP \$automount_unit and \$mount_unit for /smb/\$entry"
+        done < <(read_manifest)
+        ;;
+    *) echo "Usage: dr-drip-search {start|cleanup|status|--dry-run}" >&2; exit 2 ;;
+esac
+EOF
+}
+
+render_drip_launcher_support() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+    cat << EOF
+DRIP_REQUIRED="$DRIP_REQUIRED"
+DRIP_SEARCH_HELPER="\${DRIP_SEARCH_HELPER:-$DR_DRIP_HELPER_PATH}"
+DRIP_MANIFEST="$DR_DRIP_MANIFEST"
+DRIP_UNIT_DIR="$DR_DRIP_UNIT_DIR"
+DRIP_SEARCH_ROOTS="$DR_DRIP_SEARCH_ROOTS"
+DRIP_SEARCH_STARTED=0
+
+drip_validate_root_entry() {
+    local entry="\$1" server share extra
+    case "\$entry" in
+        ''|*..*) return 1 ;;
+    esac
+    [[ "\$entry" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?/[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
+    IFS=/ read -r server share extra <<< "\$entry"
+    [ -n "\$server" ] && [ -n "\$share" ] && [ -z "\${extra:-}" ]
+}
+
+drip_configured_root() {
+    local configured
+    read -r -a configured_roots <<< "\$DRIP_SEARCH_ROOTS"
+    for configured in "\${configured_roots[@]}"; do
+        [ "\$configured" = "\$1" ] && return 0
+    done
+    return 1
+}
+
+drip_validate_root_file() {
+    local path="\$1" mode owner mode_value
+    [ -f "\$path" ] && [ ! -L "\$path" ] || return 1
+    owner="\$(stat -c '%u' -- "\$path" 2>/dev/null || true)"
+    mode="\$(stat -c '%a' -- "\$path" 2>/dev/null || true)"
+    [ "\$owner" = 0 ] || return 1
+    case "\$mode" in ''|*[!0-7]*) return 1 ;; esac
+    mode_value=\$((8#\$mode))
+    if [ "\$path" = "\$DRIP_SEARCH_HELPER" ]; then
+        [ \$((mode_value & 0111)) -ne 0 ] || return 1
+        [ \$((mode_value & 0022)) -eq 0 ] || return 1
+    else
+        [ \$((mode_value & 07177)) -eq 0 ] || return 1
+    fi
+}
+
+drip_validate_manifest() {
+    local entry mount_unit automount_unit extra expected_mount expected_automount server share
+    local count=0
+    [ -f "\$DRIP_MANIFEST" ] && [ ! -L "\$DRIP_MANIFEST" ] || return 1
+    drip_validate_root_file "\$DRIP_MANIFEST" || return 1
+    while IFS=\$'\t' read -r entry mount_unit automount_unit extra; do
+        [ -n "\$entry" ] || continue
+        [ -z "\${extra:-}" ] || return 1
+        drip_validate_root_entry "\$entry" || return 1
+        drip_configured_root "\$entry" || return 1
+        expected_mount="\$(systemd-escape --path --suffix=mount "/smb/\$entry" 2>/dev/null)" || return 1
+        expected_automount="\$(systemd-escape --path --suffix=automount "/smb/\$entry" 2>/dev/null)" || return 1
+        [ "\$mount_unit" = "\$expected_mount" ] && [ "\$automount_unit" = "\$expected_automount" ] || return 1
+        [ -f "\$DRIP_UNIT_DIR/\$mount_unit" ] && [ ! -L "\$DRIP_UNIT_DIR/\$mount_unit" ] || return 1
+        [ -f "\$DRIP_UNIT_DIR/\$automount_unit" ] && [ ! -L "\$DRIP_UNIT_DIR/\$automount_unit" ] || return 1
+        server="\${entry%%/*}"
+        share="\${entry#*/}"
+        grep -Fxq "What=//\$server/\$share" "\$DRIP_UNIT_DIR/\$mount_unit" || return 1
+        grep -Fxq "Where=/smb/\$entry" "\$DRIP_UNIT_DIR/\$mount_unit" || return 1
+        grep -Fxq 'Options=_netdev,nofail,sec=krb5,cruid=0,vers=3.0' "\$DRIP_UNIT_DIR/\$mount_unit" || return 1
+        grep -Fxq "Where=/smb/\$entry" "\$DRIP_UNIT_DIR/\$automount_unit" || return 1
+        systemd-analyze verify "\$DRIP_UNIT_DIR/\$mount_unit" "\$DRIP_UNIT_DIR/\$automount_unit" >/dev/null 2>&1 || return 1
+        count=\$((count + 1))
+    done < "\$DRIP_MANIFEST"
+    [ "\$count" -gt 0 ]
+}
+
+drip_search_cleanup() {
+    if [ "\$DRIP_SEARCH_STARTED" -eq 1 ] && [ -x "\$DRIP_SEARCH_HELPER" ]; then
+        if ! "\$DRIP_SEARCH_HELPER" cleanup; then
+            echo "WARNING: configured DRIP search cleanup was incomplete; inspect systemd state and the manifest." >&2
+        fi
+    fi
+}
+trap 'kit_status=\$?; drip_search_cleanup; exit "\$kit_status"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [ "\$DRIP_REQUIRED" = true ]; then
+    drip_validate_root_file "\$DRIP_SEARCH_HELPER" || {
+        echo "Required DRIP search helper is missing, unsafe, or not root-owned." >&2
+        exit 1
+    }
+    drip_validate_manifest || {
+        echo "Required DRIP manifest or configured units are missing or invalid." >&2
+        exit 1
+    }
+elif [ ! -e "\$DRIP_SEARCH_HELPER" ]; then
+    echo "WARNING: DRIP_REQUIRED=false; launching KIT without configured DRIP search mounts." >&2
+else
+    drip_validate_root_file "\$DRIP_SEARCH_HELPER" || {
+        echo "DRIP helper is present but unsafe; refusing KIT-only launch." >&2
+        exit 1
+    }
+fi
+
+if [ -x "\$DRIP_SEARCH_HELPER" ]; then
+    DRIP_SEARCH_STARTED=1
+    if ! "\$DRIP_SEARCH_HELPER" start; then
+        echo "Configured DRIP search automounts could not be started; KIT launch is blocked." >&2
+        exit 1
+    fi
+    if [ "\$DRIP_REQUIRED" = true ]; then
+        while IFS=\$'\t' read -r entry mount_unit automount_unit extra; do
+            [ -n "\$entry" ] || continue
+            systemctl is-active --quiet "\$automount_unit" || {
+                echo "Required DRIP automount is not active: \$automount_unit" >&2
+                exit 1
+            }
+        done < "\$DRIP_MANIFEST"
+    fi
+fi
+EOF
+}
+
+platform_install_drip_search() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+    platform_validate_drip_search_roots || {
+        print_error "Configured Arch DRIP search roots are invalid"
+        return 1
+    }
+
+    local manifest_dir transaction_dir staging_dir unit_backup_dir
+    local manifest_stage helper_stage helper_path entry mount_unit automount_unit
+    local old_manifest_exists=0 old_helper_exists=0 fail_stage
+    local stale_mount stale_automount
+    local -a old_entries=() new_entries=() new_mounts=() new_automounts=() touched_units=()
+    manifest_dir="$(dirname "$DR_DRIP_MANIFEST")"
+    helper_path="${DR_DRIP_HELPER_PATH:-/usr/local/sbin/dr-drip-search}"
+    fail_stage="${DR_DRIP_INSTALL_FAIL_STAGE:-}"
+
+    if [ "${DR_DRIP_SKIP_MOUNT_ROOT:-false}" != true ]; then
+        mkdir -p /smb || return 1
+    fi
+    mkdir -p "$manifest_dir" "$DR_DRIP_UNIT_DIR" || return 1
+    transaction_dir="$(mktemp -d "$manifest_dir/.drip-install.XXXXXX")" || return 1
+    staging_dir="$transaction_dir/staged"
+    unit_backup_dir="$transaction_dir/unit-backups"
+    mkdir -p "$staging_dir" "$unit_backup_dir" || {
+        rm -rf -- "$transaction_dir"
+        return 1
+    }
+    manifest_stage="$staging_dir/drip-units.manifest"
+    helper_stage="$staging_dir/dr-drip-search"
+    : > "$manifest_stage"
+    chmod 600 "$manifest_stage"
+    chown root:root "$manifest_stage" 2>/dev/null || true
+
+    drip_install_add_unit() {
+        local candidate="$1" existing
+        for existing in "${touched_units[@]}"; do
+            [ "$existing" = "$candidate" ] && return 0
+        done
+        touched_units+=("$candidate")
+    }
+
+    drip_install_new_entry() {
+        local candidate="$1" existing
+        for existing in "${new_entries[@]}"; do
+            [ "$existing" = "$candidate" ] && return 0
+        done
+        return 1
+    }
+
+    drip_install_rollback() {
+        local unit target
+        for unit in "${touched_units[@]}"; do
+            target="$DR_DRIP_UNIT_DIR/$unit"
+            if [ -e "$unit_backup_dir/$unit" ] || [ -L "$unit_backup_dir/$unit" ]; then
+                rm -f -- "$target"
+                cp -a -- "$unit_backup_dir/$unit" "$target"
+            else
+                rm -f -- "$target"
+            fi
+        done
+        if [ "$old_manifest_exists" -eq 1 ]; then
+            rm -f -- "$DR_DRIP_MANIFEST"
+            cp -a -- "$transaction_dir/previous.manifest" "$DR_DRIP_MANIFEST"
+        else
+            rm -f -- "$DR_DRIP_MANIFEST"
+        fi
+        if [ "$old_helper_exists" -eq 1 ]; then
+            rm -f -- "$helper_path"
+            cp -a -- "$transaction_dir/previous.helper" "$helper_path"
+        else
+            rm -f -- "$helper_path"
+        fi
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        rm -rf -- "$transaction_dir"
+    }
+
+    if [ -e "$DR_DRIP_MANIFEST" ] || [ -L "$DR_DRIP_MANIFEST" ]; then
+        old_manifest_exists=1
+        cp -a -- "$DR_DRIP_MANIFEST" "$transaction_dir/previous.manifest" || {
+            rm -rf -- "$transaction_dir"
+            return 1
+        }
+        while IFS=$'\t' read -r entry mount_unit automount_unit extra; do
+            [ -n "$entry" ] || continue
+            [ -z "${extra:-}" ] || {
+                drip_install_rollback
+                return 1
+            }
+            [ "$(drip_mount_unit_name "$entry")" = "$mount_unit" ] || {
+                drip_install_rollback
+                return 1
+            }
+            [ "$(drip_automount_unit_name "$entry")" = "$automount_unit" ] || {
+                drip_install_rollback
+                return 1
+            }
+            old_entries+=("$entry")
+        done < "$DR_DRIP_MANIFEST"
+    fi
+
+    if [ -e "$helper_path" ] || [ -L "$helper_path" ]; then
+        old_helper_exists=1
+        cp -a -- "$helper_path" "$transaction_dir/previous.helper" || {
+            drip_install_rollback
+            return 1
+        }
+    fi
+
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        mount_unit="$(drip_mount_unit_name "$entry")" || {
+            drip_install_rollback
+            return 1
+        }
+        automount_unit="$(drip_automount_unit_name "$entry")" || {
+            drip_install_rollback
+            return 1
+        }
+        new_entries+=("$entry")
+        new_mounts+=("$mount_unit")
+        new_automounts+=("$automount_unit")
+        drip_install_add_unit "$mount_unit"
+        drip_install_add_unit "$automount_unit"
+    done < <(platform_drip_search_entries)
+    for entry in "${old_entries[@]}"; do
+        drip_install_add_unit "$(drip_mount_unit_name "$entry")"
+        drip_install_add_unit "$(drip_automount_unit_name "$entry")"
+    done
+
+    for unit in "${touched_units[@]}"; do
+        if [ -e "$DR_DRIP_UNIT_DIR/$unit" ] || [ -L "$DR_DRIP_UNIT_DIR/$unit" ]; then
+            cp -a -- "$DR_DRIP_UNIT_DIR/$unit" "$unit_backup_dir/$unit" || {
+                drip_install_rollback
+                return 1
+            }
+        fi
+    done
+
+    for entry in "${new_entries[@]}"; do
+        mount_unit="$(drip_mount_unit_name "$entry")"
+        automount_unit="$(drip_automount_unit_name "$entry")"
+        if [ "$fail_stage" = render ]; then
+            print_error "Injected DRIP installation failure at render"
+            drip_install_rollback
+            return 1
+        fi
+        render_arch_drip_mount_unit "$entry" > "$staging_dir/$mount_unit" || {
+            drip_install_rollback
+            return 1
+        }
+        render_arch_drip_automount_unit "$entry" > "$staging_dir/$automount_unit" || {
+            drip_install_rollback
+            return 1
+        }
+        chmod 644 "$staging_dir/$mount_unit" "$staging_dir/$automount_unit"
+        chown root:root "$staging_dir/$mount_unit" "$staging_dir/$automount_unit" 2>/dev/null || true
+        if [ "$fail_stage" = verify ] || ! systemd-analyze verify "$staging_dir/$mount_unit" "$staging_dir/$automount_unit"; then
+            print_error "Configured DRIP systemd unit verification failed"
+            drip_install_rollback
+            return 1
+        fi
+        printf '%s\t%s\t%s\n' "$entry" "$mount_unit" "$automount_unit" >> "$manifest_stage"
+    done
+
+    render_drip_search_mount_helper > "$helper_stage" || {
+        drip_install_rollback
+        return 1
+    }
+    chmod 755 "$helper_stage"
+    chown root:root "$helper_stage" 2>/dev/null || true
+
+    for entry in "${old_entries[@]}"; do
+        drip_install_new_entry "$entry" && continue
+        stale_mount="$(drip_mount_unit_name "$entry")"
+        stale_automount="$(drip_automount_unit_name "$entry")"
+        if systemctl is-active --quiet "$stale_mount" 2>/dev/null || \
+           { command -v mountpoint >/dev/null 2>&1 && mountpoint -q "/smb/$entry"; }; then
+            print_error "Stale DRIP mount is active or busy; preserving it: /smb/$entry"
+            drip_install_rollback
+            return 1
+        fi
+        if systemctl is-active --quiet "$stale_automount" 2>/dev/null; then
+            print_error "Stale DRIP automount is active; preserving it: $stale_automount"
+            drip_install_rollback
+            return 1
+        fi
+    done
+
+    if [ "$fail_stage" = unit-install ]; then
+        print_error "Injected DRIP installation failure at unit-install"
+        drip_install_rollback
+        return 1
+    fi
+    for mount_unit in "${new_mounts[@]}"; do
+        backup_config_file "$DR_DRIP_UNIT_DIR/$mount_unit"
+        mv -f -- "$staging_dir/$mount_unit" "$DR_DRIP_UNIT_DIR/$mount_unit" || {
+            drip_install_rollback
+            return 1
+        }
+    done
+    for automount_unit in "${new_automounts[@]}"; do
+        backup_config_file "$DR_DRIP_UNIT_DIR/$automount_unit"
+        mv -f -- "$staging_dir/$automount_unit" "$DR_DRIP_UNIT_DIR/$automount_unit" || {
+            drip_install_rollback
+            return 1
+        }
+    done
+    for entry in "${old_entries[@]}"; do
+        drip_install_new_entry "$entry" && continue
+        rm -f -- "$DR_DRIP_UNIT_DIR/$(drip_mount_unit_name "$entry")" \
+            "$DR_DRIP_UNIT_DIR/$(drip_automount_unit_name "$entry")" || {
+            drip_install_rollback
+            return 1
+        }
+    done
+
+    backup_config_file "$helper_path"
+    mv -f -- "$helper_stage" "$helper_path" || {
+        drip_install_rollback
+        return 1
+    }
+    if [ "$fail_stage" = manifest ]; then
+        print_error "Injected DRIP installation failure at manifest"
+        drip_install_rollback
+        return 1
+    fi
+    mv -f -- "$manifest_stage" "$DR_DRIP_MANIFEST" || {
+        drip_install_rollback
+        return 1
+    }
+    chmod 600 "$DR_DRIP_MANIFEST"
+    chown root:root "$DR_DRIP_MANIFEST" 2>/dev/null || true
+    if [ "$fail_stage" = daemon-reload ] || ! systemctl daemon-reload; then
+        print_error "DRIP systemd daemon reload failed"
+        drip_install_rollback
+        return 1
+    fi
+    rm -rf -- "$transaction_dir"
+    print_info "Installed configured Arch DRIP search units without enabling them at boot"
+}
+
+platform_verify_drip_automount_unit_file_state() {
+    local automount_unit="${1:-}" unit_file_state
+    [ -n "$automount_unit" ] || return 1
+    if ! unit_file_state="$(systemctl show "$automount_unit" -p UnitFileState --value 2>/dev/null)"; then
+        print_error "Could not determine UnitFileState for DRIP search automount $automount_unit"
+        return 1
+    fi
+
+    # Managed Arch DRIP automounts intentionally omit [Install], so systemd
+    # reports `static` (and `is-enabled` exits 0). Static is exactly what lets
+    # the KIT lifecycle start/stop the units explicitly without a boot target.
+    case "$unit_file_state" in
+        static) return 0 ;;
+        enabled|enabled-runtime)
+            print_error "DRIP search automount must not be enabled globally: $automount_unit (UnitFileState=$unit_file_state)"
+            return 1
+            ;;
+        masked|masked-runtime)
+            print_error "DRIP search automount is masked and unusable: $automount_unit (UnitFileState=$unit_file_state)"
+            return 1
+            ;;
+        *)
+            print_error "DRIP search automount has unexpected UnitFileState '${unit_file_state:-<empty>}': $automount_unit"
+            return 1
+            ;;
+    esac
+}
+
+platform_verify_drip_search() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+    [ -r "$DR_DRIP_MANIFEST" ] && [ ! -L "$DR_DRIP_MANIFEST" ] || return 1
+    local entry mount_unit automount_unit extra count=0 server share
+    while IFS=$'\t' read -r entry mount_unit automount_unit extra; do
+        [ -n "$entry" ] || continue
+        [ -z "${extra:-}" ] || return 1
+        validate_drip_search_root_entry "$entry" || return 1
+        [ "$(drip_mount_unit_name "$entry")" = "$mount_unit" ] || return 1
+        [ "$(drip_automount_unit_name "$entry")" = "$automount_unit" ] || return 1
+        [ -f "$DR_DRIP_UNIT_DIR/$mount_unit" ] && [ ! -L "$DR_DRIP_UNIT_DIR/$mount_unit" ] || return 1
+        [ -f "$DR_DRIP_UNIT_DIR/$automount_unit" ] && [ ! -L "$DR_DRIP_UNIT_DIR/$automount_unit" ] || return 1
+        server="${entry%%/*}"
+        share="${entry#*/}"
+        grep -Fxq "What=//$server/$share" "$DR_DRIP_UNIT_DIR/$mount_unit" || return 1
+        grep -Fxq "Where=/smb/$entry" "$DR_DRIP_UNIT_DIR/$mount_unit" || return 1
+        grep -Fxq 'Options=_netdev,nofail,sec=krb5,cruid=0,vers=3.0' "$DR_DRIP_UNIT_DIR/$mount_unit" || return 1
+        grep -Fxq "Where=/smb/$entry" "$DR_DRIP_UNIT_DIR/$automount_unit" || return 1
+        systemd-analyze verify "$DR_DRIP_UNIT_DIR/$mount_unit" "$DR_DRIP_UNIT_DIR/$automount_unit" >/dev/null 2>&1 || return 1
+        platform_verify_drip_automount_unit_file_state "$automount_unit" || return 1
+        count=$((count + 1))
+    done < "$DR_DRIP_MANIFEST"
+    [ "$count" -gt 0 ]
+}
+
+platform_remove_drip_search() {
+    [ "$PLATFORM_FAMILY" = "arch" ] || return 0
+    local entry mount_unit automount_unit
+    if [ -r "$DR_DRIP_MANIFEST" ]; then
+        while IFS=$'\t' read -r entry mount_unit automount_unit; do
+            [ -n "$entry" ] || continue
+            systemctl stop "$automount_unit" >/dev/null 2>&1 || true
+            systemctl stop "$mount_unit" >/dev/null 2>&1 || true
+            rm -f -- "$DR_DRIP_UNIT_DIR/$mount_unit" "$DR_DRIP_UNIT_DIR/$automount_unit"
+        done < "$DR_DRIP_MANIFEST"
+    fi
+    rm -f -- "$DR_DRIP_MANIFEST" /usr/local/sbin/dr-drip-search
+    systemctl daemon-reload
+}
+
+render_arch_tools_rebind_helper() {
+    local mount_unit automount_unit server
+    mount_unit="$(tools_mount_unit_name)" || return 1
+    automount_unit="$(tools_automount_unit_name)" || return 1
+    server="$TOOLS_SERVER"
+    cat << EOF
+#!/bin/bash
+set -euo pipefail
+
+MOUNT_UNIT="$mount_unit"
+AUTOMOUNT_UNIT="$automount_unit"
+UNIT_DIR="\${DR_REBIND_UNIT_DIR:-/etc/systemd/system}"
+UNIT_PATH="\$UNIT_DIR/\$MOUNT_UNIT"
+STATE_FILE="\${DR_REBIND_STATE_FILE:-$STATE_FILE}"
+LOCK_DIR="\${DR_REBIND_LOCK_DIR:-/run/dr-tools-rebind.lock}"
+STAGE_ROOT="\${DR_REBIND_STAGE_ROOT:-\$UNIT_DIR/.dr-tools-rebind}"
+FAIL_STAGE="\${DR_REBIND_FAIL_STAGE:-}"
+TRANSACTION_ACTIVE=0
+COMMITTED=0
+ORIGINAL_UNIT=""
+ORIGINAL_STATE=""
+ORIGINAL_STATE_EXISTS=0
+ORIGINAL_MOUNT_ACTIVE="inactive"
+ORIGINAL_MOUNT_ENABLED="disabled"
+ORIGINAL_AUTOMOUNT_ACTIVE="inactive"
+ORIGINAL_AUTOMOUNT_ENABLED="disabled"
+STAGED_UNIT=""
+
+failpoint() {
+    if [ "\$FAIL_STAGE" = "\$1" ]; then
+        echo "Injected rebind failure at \$1" >&2
+        return 1
+    fi
+}
+
+unit_active_state() {
+    systemctl is-active "\$1" 2>/dev/null || echo inactive
+}
+
+unit_enabled_state() {
+    systemctl is-enabled "\$1" 2>/dev/null || echo disabled
+}
+
+restore_enabled_state() {
+    local unit="\$1" state="\$2"
+    case "\$state" in
+        enabled|enabled-runtime|linked|linked-runtime) systemctl enable "\$unit" >/dev/null 2>&1 || true ;;
+        masked) systemctl mask "\$unit" >/dev/null 2>&1 || true ;;
+        *) systemctl disable "\$unit" >/dev/null 2>&1 || true ;;
+    esac
+}
+
+restore_active_state() {
+    local unit="\$1" state="\$2"
+    if [ "\$state" = active ]; then
+        systemctl start "\$unit" >/dev/null 2>&1 || true
+    else
+        systemctl stop "\$unit" >/dev/null 2>&1 || true
+    fi
+}
+
+restore_original_state() {
+    local restored_state="\$STATE_FILE.restore.\$\$"
+    if [ -n "\$ORIGINAL_UNIT" ] && [ -f "\$ORIGINAL_UNIT" ]; then
+        cp -- "\$ORIGINAL_UNIT" "\$UNIT_PATH"
+        chmod 644 "\$UNIT_PATH"
+    fi
+    if [ "\$ORIGINAL_STATE_EXISTS" -eq 1 ] && [ -f "\$ORIGINAL_STATE" ]; then
+        mkdir -p "\$(dirname -- "\$STATE_FILE")"
+        cp -- "\$ORIGINAL_STATE" "\$restored_state"
+        chmod 600 "\$restored_state"
+        chown root:root "\$restored_state" 2>/dev/null || true
+        mv -f -- "\$restored_state" "\$STATE_FILE"
+    elif [ "\$ORIGINAL_STATE_EXISTS" -eq 0 ]; then
+        rm -f -- "\$STATE_FILE"
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    restore_enabled_state "\$MOUNT_UNIT" "\$ORIGINAL_MOUNT_ENABLED"
+    restore_enabled_state "\$AUTOMOUNT_UNIT" "\$ORIGINAL_AUTOMOUNT_ENABLED"
+    restore_active_state "\$MOUNT_UNIT" "\$ORIGINAL_MOUNT_ACTIVE"
+    restore_active_state "\$AUTOMOUNT_UNIT" "\$ORIGINAL_AUTOMOUNT_ACTIVE"
+}
+
+finish() {
+    local rc=\$?
+    if [ "\$TRANSACTION_ACTIVE" -eq 1 ] && [ "\$COMMITTED" -eq 0 ]; then
+        echo "Rebind failed; restoring the original unit, UID state, and service state." >&2
+        restore_original_state || true
+    fi
+    rm -rf -- "\$STAGE_ROOT" "\$ORIGINAL_UNIT" "\$ORIGINAL_STATE"
+    rmdir "\$LOCK_DIR" 2>/dev/null || true
+    exit "\$rc"
+}
+
+require_root() {
+    if [ "\$(id -u)" -ne 0 ]; then
+        echo "Tool Server credential-owner changes require a local administrator." >&2
+        echo "Run: sudo /usr/local/sbin/dr-tools-rebind \${1:-<domain-user-uid>}" >&2
+        exit 1
+    fi
+}
+
+read_persisted_cruid() {
+    [ -r "\$STATE_FILE" ] || return 0
+    awk -F= '/^DR_TOOLS_MOUNT_CRUID=/ {gsub(/^[" ]|[" ]$/, "", \$2); print \$2; exit}' "\$STATE_FILE"
+}
+
+atomic_update_cruid() {
+    local tmp="\$STATE_FILE.tmp.\$\$"
+    mkdir -p "\$(dirname -- "\$STATE_FILE")"
+    if [ -f "\$STATE_FILE" ]; then
+        awk -v value="\$NEW_CRUID" '
+            BEGIN { updated = 0 }
+            /^DR_TOOLS_MOUNT_CRUID=/ {
+                if (!updated) { print "DR_TOOLS_MOUNT_CRUID=\"" value "\""; updated = 1 }
+                next
+            }
+            { print }
+            END { if (!updated) print "DR_TOOLS_MOUNT_CRUID=\"" value "\"" }
+        ' "\$STATE_FILE" > "\$tmp"
+    else
+        printf 'DR_TOOLS_MOUNT_CRUID="%s"\n' "\$NEW_CRUID" > "\$tmp"
+    fi
+    chmod 600 "\$tmp"
+    chown root:root "\$tmp" 2>/dev/null || true
+    mv -f -- "\$tmp" "\$STATE_FILE"
+    [ "\$(stat -c '%u:%a' -- "\$STATE_FILE")" = "0:600" ]
+}
+
+verify_unit_cruid() {
+    local unit_file="\$1"
+    local expected="\${2:-}"
+    local line options token value
+    local -a values=()
+
+    [ -r "\$unit_file" ] || return 1
+    while IFS= read -r line; do
+        case "\$line" in
+            Options=*)
+                options="\${line#Options=}"
+                IFS=, read -r -a tokens <<< "\$options"
+                for token in "\${tokens[@]}"; do
+                    case "\$token" in
+                        cruid=*) values+=("\${token#cruid=}") ;;
+                    esac
+                done
+                ;;
+        esac
+    done < "\$unit_file"
+
+    [ "\${#values[@]}" -eq 1 ] || return 1
+    value="\${values[0]}"
+    [[ "\$value" =~ ^[0-9]+$ ]] || return 1
+    if [ -n "\$expected" ]; then
+        [[ "\$expected" =~ ^[0-9]+$ ]] || return 1
+        [ "\$((10#\$value))" -eq "\$((10#\$expected))" ] || return 1
+    fi
+    printf '%s\n' "\$((10#\$value))"
+}
+
+validate_target_uid() {
+    case "\$NEW_CRUID" in
+        ''|0|*[!0-9]*) echo "Usage: dr-tools-rebind [--dry-run|--status] <non-root-domain-user-uid>" >&2; return 1 ;;
+    esac
+    local passwd_line resolved_username resolved_uid
+    local -a passwd_records passwd_fields
+    mapfile -t passwd_records < <(getent passwd "\$NEW_CRUID" 2>/dev/null || true)
+    [ "\${#passwd_records[@]}" -eq 1 ] || {
+        echo "UID \$NEW_CRUID did not resolve to exactly one passwd record." >&2
+        return 1
+    }
+    passwd_line="\${passwd_records[0]}"
+    IFS=: read -r -a passwd_fields <<< "\$passwd_line"
+    [ "\${#passwd_fields[@]}" -eq 7 ] || {
+        echo "UID \$NEW_CRUID returned a malformed passwd record." >&2
+        return 1
+    }
+    resolved_username="\${passwd_fields[0]}"
+    resolved_uid="\${passwd_fields[2]}"
+    [ -n "\$resolved_username" ] && [ -n "\$resolved_uid" ] || {
+        echo "UID \$NEW_CRUID returned an incomplete passwd record." >&2
+        return 1
+    }
+    case "\$resolved_uid" in
+        ''|*[!0-9]*) echo "UID \$NEW_CRUID returned a nonnumeric passwd UID." >&2; return 1 ;;
+    esac
+    [ "\$resolved_uid" = "\$NEW_CRUID" ] || {
+        echo "NSS passwd UID \$resolved_uid does not match requested UID \$NEW_CRUID." >&2
+        return 1
+    }
+    [ "\$(id -u "\$resolved_username" 2>/dev/null || true)" = "\$NEW_CRUID" ] || {
+        echo "NSS could not confirm username \$resolved_username as UID \$NEW_CRUID." >&2
+        return 1
+    }
+}
+
+refuse_if_busy() {
+    local pattern
+    for pattern in \
+        '(^|/)KIT([[:space:]]|$)' \
+        '(^|/)KIT\\.sh([[:space:]]|$)' \
+        '(^|/)dr-launch-kit([[:space:]]|$)' \
+        '(^|/)dr-post-mount-provision([[:space:]]|$)'; do
+        if pgrep -f "\$pattern" >/dev/null 2>&1; then
+            echo "A protected KIT/provisioning process is active; rebind refused." >&2
+            return 1
+        fi
+    done
+    if mountpoint -q /mnt/p 2>/dev/null; then
+        echo "/mnt/p is mounted; rebind refused because KIT activation owns that lifecycle." >&2
+        return 1
+    fi
+}
+
+show_status() {
+    local unit_cruid persisted_cruid
+    require_root
+    printf 'mount_unit=%s active=%s enabled=%s\n' "\$MOUNT_UNIT" "\$(unit_active_state "\$MOUNT_UNIT")" "\$(unit_enabled_state "\$MOUNT_UNIT")"
+    printf 'automount_unit=%s active=%s enabled=%s\n' "\$AUTOMOUNT_UNIT" "\$(unit_active_state "\$AUTOMOUNT_UNIT")" "\$(unit_enabled_state "\$AUTOMOUNT_UNIT")"
+    persisted_cruid="\$(read_persisted_cruid)"
+    unit_cruid="\$(verify_unit_cruid "\$UNIT_PATH" "\$persisted_cruid")" || {
+        echo "unit_cruid=invalid" >&2
+        return 1
+    }
+    printf 'unit_cruid=%s\n' "\$unit_cruid"
+    printf 'persisted_cruid=%s\n' "\$(read_persisted_cruid)"
+}
+
+require_root "\${1:-}"
+case "\${1:-}" in
+    --status)
+        show_status
+        exit 0
+        ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    *) DRY_RUN=0 ;;
+esac
+
+NEW_CRUID="\${1:-}"
+validate_target_uid || exit 1
+[ -f "\$UNIT_PATH" ] || { echo "Tool Server mount unit not found: \$UNIT_PATH" >&2; exit 1; }
+command -v systemd-analyze >/dev/null 2>&1 || { echo "systemd-analyze is required." >&2; exit 1; }
+
+if [ "\$DRY_RUN" -eq 1 ]; then
+    mkdir -p "\$STAGE_ROOT"
+    STAGED_UNIT="\$STAGE_ROOT/\$MOUNT_UNIT"
+    cat > "\$STAGED_UNIT" << UNIT
+[Unit]
+Description=DR Tool Server CIFS mount
+Wants=network-online.target
+After=network-online.target
+
+[Mount]
+What=//$server/Tools
+Where=/mnt/x
+Type=cifs
+Options=_netdev,nofail,sec=krb5,cruid=\$NEW_CRUID,vers=3.0
+TimeoutSec=30s
+UNIT
+    systemd-analyze verify "\$STAGED_UNIT"
+    verify_unit_cruid "\$STAGED_UNIT" "\$NEW_CRUID" >/dev/null
+    echo "WOULD CHANGE \$UNIT_PATH cruid=\$NEW_CRUID"
+    exit 0
+fi
+
+mkdir "\$LOCK_DIR" 2>/dev/null || { echo "Another Tool Server rebind is active." >&2; exit 1; }
+TRANSACTION_ACTIVE=1
+ORIGINAL_UNIT="\$(mktemp)"
+cp -- "\$UNIT_PATH" "\$ORIGINAL_UNIT"
+if [ -f "\$STATE_FILE" ]; then
+    ORIGINAL_STATE_EXISTS=1
+    ORIGINAL_STATE="\$(mktemp)"
+    cp -- "\$STATE_FILE" "\$ORIGINAL_STATE"
+fi
+ORIGINAL_MOUNT_ACTIVE="\$(unit_active_state "\$MOUNT_UNIT")"
+ORIGINAL_MOUNT_ENABLED="\$(unit_enabled_state "\$MOUNT_UNIT")"
+ORIGINAL_AUTOMOUNT_ACTIVE="\$(unit_active_state "\$AUTOMOUNT_UNIT")"
+ORIGINAL_AUTOMOUNT_ENABLED="\$(unit_enabled_state "\$AUTOMOUNT_UNIT")"
+trap finish EXIT HUP INT TERM
+
+refuse_if_busy
+failpoint automount-stop
+systemctl stop "\$AUTOMOUNT_UNIT"
+failpoint mount-stop
+systemctl stop "\$MOUNT_UNIT"
+
+mkdir -p "\$STAGE_ROOT"
+STAGED_UNIT="\$STAGE_ROOT/\$MOUNT_UNIT"
+rm -f -- "\$STAGED_UNIT"
+failpoint render
+cat > "\$STAGED_UNIT" << UNIT
+[Unit]
+Description=DR Tool Server CIFS mount
+Wants=network-online.target
+After=network-online.target
+
+[Mount]
+What=//$server/Tools
+Where=/mnt/x
+Type=cifs
+Options=_netdev,nofail,sec=krb5,cruid=\$NEW_CRUID,vers=3.0
+TimeoutSec=30s
+UNIT
+chmod 644 "\$STAGED_UNIT"
+chown root:root "\$STAGED_UNIT" 2>/dev/null || true
+failpoint verify
+systemd-analyze verify "\$STAGED_UNIT"
+verify_unit_cruid "\$STAGED_UNIT" "\$NEW_CRUID" >/dev/null
+
+failpoint replace
+mv -f -- "\$STAGED_UNIT" "\$UNIT_PATH"
+failpoint daemon-reload
+systemctl daemon-reload
+
+restore_enabled_state "\$MOUNT_UNIT" "\$ORIGINAL_MOUNT_ENABLED"
+failpoint automount-enable
+restore_enabled_state "\$AUTOMOUNT_UNIT" "\$ORIGINAL_AUTOMOUNT_ENABLED"
+failpoint automount-start
+restore_active_state "\$MOUNT_UNIT" "\$ORIGINAL_MOUNT_ACTIVE"
+restore_active_state "\$AUTOMOUNT_UNIT" "\$ORIGINAL_AUTOMOUNT_ACTIVE"
+
+verify_unit_cruid "\$UNIT_PATH" "\$NEW_CRUID" >/dev/null
+failpoint state-update
+atomic_update_cruid
+COMMITTED=1
+echo "Tool Server automount rebound transactionally to Kerberos credential owner UID \$NEW_CRUID."
+EOF
+}
+
+platform_verify_tools_mount() {
+    local mount_unit automount_unit
+    mount_unit="$(tools_mount_unit_name)" || return 1
+    automount_unit="$(tools_automount_unit_name)" || return 1
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        [ -f "/etc/systemd/system/$mount_unit" ] || return 1
+        [ -f "/etc/systemd/system/$automount_unit" ] || return 1
+        systemd-analyze verify "/etc/systemd/system/$mount_unit" "/etc/systemd/system/$automount_unit" >/dev/null 2>&1
+        systemctl is-enabled --quiet "$automount_unit" 2>/dev/null || return 1
+        platform_tools_mount_is_authoritative
+    else
+        command -v automount >/dev/null 2>&1 && systemctl is-active --quiet autofs
+    fi
+}
+
+platform_tools_mount_is_authoritative() {
+    local expected="//$TOOLS_SERVER/Tools"
+    command -v findmnt >/dev/null 2>&1 || return 1
+    findmnt --noheadings --raw --target /mnt/x --output FSTYPE,SOURCE 2>/dev/null \
+        | awk -v expected="$expected" '$1 == "cifs" && $2 == expected { found=1 } END { exit(found ? 0 : 1) }'
+}
+
+platform_start_tools_mount() {
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        local automount_unit
+        automount_unit="$(tools_automount_unit_name)" || return 1
+        systemctl start "$automount_unit"
+        return 0
+    fi
+    systemctl start autofs
+}
+
+platform_stop_tools_mount() {
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        local mount_unit automount_unit
+        mount_unit="$(tools_mount_unit_name)" || return 1
+        automount_unit="$(tools_automount_unit_name)" || return 1
+        systemctl stop "$mount_unit" "$automount_unit"
+        return 0
+    fi
+    systemctl stop autofs
+}
+
+platform_remove_tools_mount() {
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        local mount_unit automount_unit
+        mount_unit="$(tools_mount_unit_name)" || return 1
+        automount_unit="$(tools_automount_unit_name)" || return 1
+        systemctl disable --now "$automount_unit" >/dev/null 2>&1 || true
+        systemctl stop "$mount_unit" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/$mount_unit" "/etc/systemd/system/$automount_unit" \
+            /usr/local/sbin/dr-tools-rebind
+        systemctl daemon-reload
+        print_info "Removed Arch Tool Server systemd mount, automount, and rebind helper"
+        return 0
+    fi
+    systemctl disable --now autofs
+}
+
+platform_validate_selected_domain_user() {
+    [ "$PLATFORM_FAMILY" = arch ] || return 0
+    local uid direct_sss_uid
+    if [ -z "${DOMAIN_SUDO_USER:-}" ]; then
+        print_error "No Arch domain user was selected for the Tool Server mount"
+        print_error "Post-mount provisioning is blocked until a domain identity is selected and resolved"
+        return 1
+    fi
+    if uid="$(resolve_domain_user_uid "$DOMAIN_SUDO_USER")"; then
+        print_info "Selected domain user $DOMAIN_SUDO_USER resolves through NSS/SSSD as UID $uid"
+        return 0
+    fi
+    print_error "NSS/SSSD identity resolution failed for selected domain user $DOMAIN_SUDO_USER"
+    print_error "Normal getent passwd, id, home-directory, and login-shell validation must all succeed; no local UID will be substituted"
+    diagnose_selected_domain_user_login_identity "$DOMAIN_SUDO_USER" || true
+    direct_sss_uid="$(diagnose_sss_direct_user_uid "$DOMAIN_SUDO_USER" || true)"
+    if [ -n "$direct_sss_uid" ]; then
+        print_error "SSSD's direct NSS service resolves $DOMAIN_SUDO_USER as UID $direct_sss_uid, but the normal libc/NSS path does not"
+        print_error "Check that the passwd, group, and shadow databases in /etc/nsswitch.conf include the standalone sss service"
+    else
+        print_error "SSSD may still be failing domain/site discovery; the workstation remains at a resumable post-join stage"
+    fi
+    if command -v sssctl >/dev/null 2>&1; then
+        sssctl domain-status "$DOMAIN" 2>&1 | sed 's/^/  /' || true
+    fi
+    return 1
+}
+
+platform_install_tools_mount() {
+    if [ "$PLATFORM_FAMILY" != "arch" ]; then
+        return 0
+    fi
+
+    platform_cifs_kernel_is_ready || {
+        print_error "Cannot configure the Arch Tool Server mount because CIFS is unavailable for the running kernel"
+        print_error "Run --preflight and reboot into the installed kernel when its module tree is required"
+        return 1
+    }
+
+    local mount_unit automount_unit cruid
+    cruid="$(tools_mount_cruid)" || {
+        print_error "Cannot configure Arch Tool Server mount without a verified logged-in domain-user UID"
+        print_error "Set DR_TOOLS_MOUNT_CRUID to that UID or select DOMAIN_SUDO_USER before the modifying checkpoint"
+        return 1
+    }
+    DR_TOOLS_MOUNT_CRUID="$cruid"
+    mount_unit="$(tools_mount_unit_name)" || {
+        print_error "systemd-escape is required to name the Tool Server mount unit"
+        return 1
+    }
+    automount_unit="$(tools_automount_unit_name)" || return 1
+    mkdir -p /mnt/x
+    backup_config_file "/etc/systemd/system/$mount_unit"
+    backup_config_file "/etc/systemd/system/$automount_unit"
+    backup_config_file "/usr/local/sbin/dr-tools-rebind"
+    render_arch_tools_mount_unit "/mnt/x" "$TOOLS_SERVER" "$cruid" > "/etc/systemd/system/$mount_unit"
+    render_arch_tools_automount_unit "/mnt/x" > "/etc/systemd/system/$automount_unit"
+    render_arch_tools_rebind_helper > /usr/local/sbin/dr-tools-rebind
+    chmod 644 "/etc/systemd/system/$mount_unit" "/etc/systemd/system/$automount_unit"
+    chmod 755 /usr/local/sbin/dr-tools-rebind
+    chown root:root /usr/local/sbin/dr-tools-rebind
+    systemd-analyze verify "/etc/systemd/system/$mount_unit" "/etc/systemd/system/$automount_unit"
+    systemctl daemon-reload
+    systemctl enable "$automount_unit" >/dev/null
+    if [ -f "$STATE_FILE" ]; then
+        save_state "${STAGE:-POSTJOIN_AWAITING_LIVE_VALIDATION}"
+    fi
+    print_info "Installed on-demand systemd CIFS units: $mount_unit, $automount_unit"
+}
+
+render_arch_tools_mount_helper() {
+    local configured_cruid="${1:-${DR_TOOLS_MOUNT_CRUID:-}}"
+    local mount_unit automount_unit server
+    mount_unit="$(tools_mount_unit_name)" || return 1
+    automount_unit="$(tools_automount_unit_name)" || return 1
+    server="$TOOLS_SERVER"
+    case "$configured_cruid" in
+        ''|*[!0-9]*)
+            print_error "Arch Tool Server helper requires a configured domain-user UID as cruid" >&2
+            return 1
+            ;;
+    esac
+    cat << EOF
+#!/bin/bash
+set -euo pipefail
+
+MOUNT_POINT="\${DR_TOOLS_MOUNT_POINT:-/mnt/x}"
+TOOLS_SOURCE="//$server/Tools"
+MOUNT_UNIT="$mount_unit"
+AUTOMOUNT_UNIT="$automount_unit"
+CONFIGURED_CRUID="$configured_cruid"
+
+verify_tools_mount() {
+    command -v findmnt >/dev/null 2>&1 || return 1
+    findmnt --noheadings --raw --target "\$MOUNT_POINT" --output FSTYPE,SOURCE 2>/dev/null \
+        | awk -v expected="\$TOOLS_SOURCE" '\$1 == "cifs" && \$2 == expected { found=1 } END { exit(found ? 0 : 1) }'
+}
+
+if [ "\${1:-}" = "--sudo-self-test" ]; then
+    exit 0
+fi
+
+if [ "\${1:-}" = "--access-self-test" ]; then
+    [ "\$(id -u)" -eq 0 ] || { echo "--access-self-test must run as root" >&2; exit 1; }
+    verify_tools_mount || { echo "Tool Server is not an authoritative CIFS mount at \$MOUNT_POINT" >&2; exit 1; }
+    timeout 30s ls -la "\$MOUNT_POINT" >/dev/null
+    exit 0
+fi
+
+CRUID="\$CONFIGURED_CRUID"
+if [ "\${1:-}" = "--cruid" ]; then
+    CRUID="\${2:-}"
+fi
+case "\$CRUID" in
+    ''|*[!0-9]*) echo "Invalid Kerberos credential-cache UID" >&2; exit 1 ;;
+esac
+CURRENT_CONFIGURED_CRUID="\$(sed -n 's/.*cruid=\([0-9][0-9]*\).*/\1/p' "/etc/systemd/system/\$MOUNT_UNIT" | head -n 1)"
+CURRENT_CONFIGURED_CRUID="\${CURRENT_CONFIGURED_CRUID:-\$CONFIGURED_CRUID}"
+if [ "\$CRUID" != "\$CURRENT_CONFIGURED_CRUID" ]; then
+    echo "This mount unit is bound to domain-user UID \$CURRENT_CONFIGURED_CRUID; refusing a different credential owner" >&2
+    echo "A local administrator must explicitly rebind it: sudo /usr/local/sbin/dr-tools-rebind \$CRUID" >&2
+    exit 1
+fi
+
+if [ "\$(id -u)" -ne 0 ]; then
+    if ! sudo -n /usr/local/bin/mount-kit-tools --sudo-self-test >/dev/null 2>&1; then
+        CURRENT_USER="\$(id -un)"
+        echo "This domain account does not have permission to mount the Tool Server." >&2
+        echo "Run: su - $DR_LOCAL_ADMIN_USER; sudo dr-workstation add-user \$CURRENT_USER; exit" >&2
+        exit 1
+    fi
+    USER_UID="\$(id -u)"
+    sudo -n /usr/local/bin/mount-kit-tools --cruid "\$USER_UID"
+    if ! verify_tools_mount || ! timeout 30s ls -la "\$MOUNT_POINT" >/dev/null 2>&1; then
+        echo "Tool Server access failed. Ensure the logged-in user has a valid Kerberos ticket." >&2
+        exit 1
+    fi
+    verify_tools_mount
+    exit 0
+fi
+
+mkdir -p "\$MOUNT_POINT"
+if ! KRB5CCNAME="FILE:/tmp/krb5cc_\$CURRENT_CONFIGURED_CRUID" klist -s 2>/dev/null && ! klist -s 2>/dev/null; then
+    echo "No valid Kerberos ticket found for configured domain-user UID \$CRUID" >&2
+    exit 1
+fi
+systemctl start "\$AUTOMOUNT_UNIT"
+if verify_tools_mount; then
+    exit 0
+fi
+
+if ! timeout 30s ls -la "\$MOUNT_POINT" >/dev/null 2>&1 || ! verify_tools_mount; then
+    echo "Tool Server access failed. Ensure the logged-in user has a valid Kerberos ticket." >&2
+    exit 1
+fi
+verify_tools_mount
+EOF
+}
+
+render_kit_root_access_test_plan() {
+    local domain_user="${1:-DOMAIN_USER}"
+    cat << EOF
+KIT Kerberos ownership and root-cache lifecycle test plan (staged; not executed by preflight):
+  1. Before launch, as the domain user: printenv KRB5CCNAME; klist -s -c "\$KRB5CCNAME"; ls -la /mnt/x
+  2. Across sudo: sudo -n env | grep '^KRB5CCNAME=FILE:'; confirm the exact FILE cache path is preserved, with SUDO_USER and nonzero SUDO_UID
+  3. Root KIT process: sudo -n /usr/local/sbin/dr-launch-kit --access-self-test; capture only UID/SUDO_UID/KRB5CCNAME metadata in a harmless fixture and confirm UID 0 plus the invoking-user cache
+  4. KIT.sh lifecycle: launch the approved KIT test mode; confirm KIT.sh creates /tmp/krb5cc_0 as root:root mode 0600, with the invoking user's TGT principal
+  5. DRIP ticket lifecycle: search /smb/<server>/Images and confirm cifs/<server>@DR.KODR.LOCAL is added to /tmp/krb5cc_0; activate and verify /mnt/p uses sec=krb5,cruid=0
+  6. Bounded root checks: sudo -n sh -c 'ls -la /mnt/x; bash -n /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/KIT.sh'; sudo -n /usr/local/sbin/dr-post-mount-provision --access-self-test; sudo -n /usr/local/sbin/dr-launch-kit --access-self-test; then root executes only an approved harmless fixture and reads all runtime libraries
+  7. Deactivate the DRIP share, confirm /mnt/p is removed, then confirm KIT.sh EXIT cleanup removes /tmp/krb5cc_0
+  8. For another Arch domain user, stop/unmount first and have a local administrator run: sudo /usr/local/sbin/dr-tools-rebind <new-domain-user-uid>; verify the unit's cruid changes before access
+  Mount must show sec=krb5,cruid=<logged-in-domain-user-uid>,vers=3.0; a normal-user ls alone is insufficient.
+EOF
+}
+
+render_debian_kit_compatibility_contract() {
+    cat << 'EOF'
+Ubuntu/Debian KIT compatibility contract (KIT.sh is shared and unchanged):
+  User login: KRB5CCNAME=FILE:/tmp/krb5cc_<domain-uid>_<random>
+  sudo launch: preserve that exact KRB5CCNAME; SUDO_UID identifies the domain user
+  KIT.sh: copy the user cache to /tmp/krb5cc_0, chown root:root, mode 0600, remove on EXIT
+  DRIP /smb and /mnt/p: sec=krb5,cruid=0; CIFS service tickets accumulate in /tmp/krb5cc_0
+  KIT /mnt/x: sec=krb5,cruid=<domain-user-uid>,vers=3.0
+  Debian DRIP paths: dynamic autofs /smb/<server>/<share>/ and /net/<server>/<share>/
+  Required live checks: root KIT read/execute, DRIP activation/deactivation, bounded read, and cache cleanup
+EOF
+}
+
+install_arch_tools_mount_helper() {
+    local cruid
+    cruid="$(tools_mount_cruid)" || {
+        print_error "Cannot install Arch Tool Server helper without a verified domain-user UID"
+        return 1
+    }
+    render_arch_tools_mount_helper "$cruid" > /usr/local/bin/mount-kit-tools
+    chmod 755 /usr/local/bin/mount-kit-tools
+    chown root:root /usr/local/bin/mount-kit-tools
+}
+
 configure_autofs_cifs() {
     print_info "Configuring CIFS access for DRIP and KIT tools..."
 
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        platform_validate_selected_domain_user || return 1
+        platform_install_tools_mount || return 1
+        if platform_validate_drip_search_roots; then
+            platform_install_drip_search || return 1
+        elif [ "$DRIP_REQUIRED" = true ]; then
+            print_error "Configured Arch DRIP search roots are invalid; core completion is blocked"
+            return 1
+        else
+            print_warning "Skipping invalid optional Arch DRIP search roots because DRIP_REQUIRED=false"
+        fi
+    else
     # DRIP image paths still use dynamic autofs maps:
     #   /smb/<server>/<share>/...
     #   /net/<server>/<share>/...
@@ -3650,38 +8985,32 @@ configure_autofs_cifs() {
     mkdir -p /mnt/x
 
     # Remove old /mnt/x autofs configuration from earlier script versions.
+    backup_config_file /etc/auto.master.d/mnt.autofs
+    backup_config_file /etc/auto.mnt.direct
+    backup_config_file /etc/auto.mnt
+    backup_config_file /etc/auto.master.d/smb.autofs
+    backup_config_file /etc/auto.master.d/net.autofs
+    backup_config_file /etc/auto.net.cifs
     rm -f /etc/auto.master.d/mnt.autofs /etc/auto.mnt.direct /etc/auto.mnt
 
-    cat > /etc/auto.master.d/smb.autofs << 'EOF'
-/smb    /etc/auto.net.cifs    --timeout=300 --ghost
-EOF
-    cat > /etc/auto.master.d/net.autofs << 'EOF'
-/net    /etc/auto.net.cifs    --timeout=300 --ghost
-EOF
+    render_autofs_master_maps | awk 'NR == 1' > /etc/auto.master.d/smb.autofs
+    render_autofs_master_maps | awk 'NR == 2' > /etc/auto.master.d/net.autofs
 
     # Executable map: called by autofs with the server hostname as $1.
     # Creates a per-server wildcard share map and returns a nested autofs mount.
     # cruid=${UID} tells the CIFS kernel module to use the accessing user's
     # Kerberos ticket — no root credentials or share enumeration required.
-    cat > /etc/auto.net.cifs << 'EOF'
-#!/bin/bash
-key="$1"
-[ -z "$key" ] && exit 1
-
-mkdir -p /etc/autofs.d
-mapfile="/etc/autofs.d/$key"
-if [ ! -f "$mapfile" ]; then
-    printf '*\t-fstype=cifs,sec=krb5,cruid=${UID},vers=3.0\t://%s/&\n' "$key" > "$mapfile"
-fi
-
-printf -- '-fstype=autofs\tfile:%s\n' "$mapfile"
-EOF
+    render_autofs_cifs_map > /etc/auto.net.cifs
 
     chmod +x /etc/auto.net.cifs
+    fi
 
     # Fixed KIT tools mount helper. This preserves the expected path:
     #   /mnt/x -> //TOOLS_SERVER/Tools
     # but avoids depending on autofs for the fixed mount point.
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        install_arch_tools_mount_helper
+    else
     cat > /usr/local/bin/mount-kit-tools << EOF
 #!/bin/bash
 set -e
@@ -3706,7 +9035,7 @@ if [ "\$(id -u)" -ne 0 ]; then
         echo "This domain account does not have permission to mount the Tool Server." >&2
         echo "" >&2
         echo "Run the following commands:" >&2
-        echo "  su - drone" >&2
+        echo "  su - $DR_LOCAL_ADMIN_USER" >&2
         echo "  sudo dr-workstation add-user \$CURRENT_USER" >&2
         echo "  exit" >&2
         echo "" >&2
@@ -3743,9 +9072,10 @@ if ! KRB5CCNAME="FILE:/tmp/krb5cc_\$CRUID" klist -s 2>/dev/null && ! klist -s 2>
     exit 1
 fi
 
-mount -t cifs "\$SHARE" "\$MOUNT_POINT" -o sec=krb5,cruid=\$CRUID,vers=3.0
+    mount -t cifs "\$SHARE" "\$MOUNT_POINT" -o sec=krb5,cruid=\$CRUID,vers=3.0
 EOF
     chmod +x /usr/local/bin/mount-kit-tools
+    fi
 
     # User-facing wrapper. The post-join script installs a tightly scoped
     # sudoers rule that allows only /usr/local/bin/mount-kit-tools to run
@@ -3781,6 +9111,10 @@ EOF
 # Quiet login-time Tool Server/workspace verifier. Successful runs produce no UI.
 # If anything fails, show the captured diagnostics in a terminal and leave it open.
 set -u
+
+if [ -x /usr/local/bin/dr-workstation-session-activate ]; then
+    exec /usr/local/bin/dr-workstation-session-activate
+fi
 
 RUNNER="/usr/local/bin/mount-kit-tools-desktop-runner"
 LOG_DIR="${XDG_RUNTIME_DIR:-/tmp}"
@@ -3885,7 +9219,7 @@ else
     if ! sudo -n /usr/local/bin/mount-kit-tools --sudo-self-test >/dev/null 2>&1; then
         current_user="$(id -un)"
         echo "If this account is not yet authorized, run:"
-        echo "  su - drone"
+        echo "  su - $DR_LOCAL_ADMIN_USER"
         echo "  sudo dr-workstation add-user $current_user"
         echo "  exit"
         echo "Then log out and back in."
@@ -4048,27 +9382,35 @@ EOF
         fi
     fi
 
-    # Ensure 'files' is first in the automount nsswitch lookup order.
-    # realm join often sets "automount: sss", which causes autofs to query LDAP
-    # for the master map and ignore /etc/auto.master.d/ entirely.
-    local nsswitch="/etc/nsswitch.conf"
-    local automount_line
-    automount_line=$(grep '^automount:' "$nsswitch" 2>/dev/null || true)
-    if [ -z "$automount_line" ]; then
-        echo "automount: files" >> "$nsswitch"
-        print_info "Added 'automount: files' to $nsswitch"
-    elif ! echo "$automount_line" | grep -qE '^automount:\s*files'; then
-        sed -i 's/^automount:.*/automount: files sss/' "$nsswitch"
-        print_info "Reordered automount lookup in $nsswitch — files first"
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        platform_start_tools_mount
+        if platform_verify_tools_mount; then
+            print_info "Systemd Tool Server automount is enabled and unit verification passed"
+        else
+            print_warning "Systemd Tool Server unit is installed but could not be fully verified"
+        fi
     else
-        print_info "automount lookup order already correct in $nsswitch"
+        # Ensure 'files' is first in the automount nsswitch lookup order.
+        # realm join often sets "automount: sss", which causes autofs to query LDAP
+        # for the master map and ignore /etc/auto.master.d/ entirely.
+        local nsswitch="/etc/nsswitch.conf"
+        local automount_line
+        automount_line=$(grep '^automount:' "$nsswitch" 2>/dev/null || true)
+        if [ -z "$automount_line" ]; then
+            echo "automount: files" >> "$nsswitch"
+            print_info "Added 'automount: files' to $nsswitch"
+        elif ! echo "$automount_line" | grep -qE '^automount:\s*files'; then
+            sed -i 's/^automount:.*/automount: files sss/' "$nsswitch"
+            print_info "Reordered automount lookup in $nsswitch — files first"
+        else
+            print_info "automount lookup order already correct in $nsswitch"
+        fi
+
+        systemctl daemon-reload
+        systemctl enable autofs > /dev/null 2>&1
+        systemctl restart autofs
+        print_info "DRIP autofs configured — /smb/<server>/<share>/ and /net/<server>/<share>/"
     fi
-
-    systemctl daemon-reload
-    systemctl enable autofs > /dev/null 2>&1
-    systemctl restart autofs
-
-    print_info "DRIP autofs configured — /smb/<server>/<share>/ and /net/<server>/<share>/"
     print_info "KIT tools mount helper configured — run: mount-kit-tools"
     print_info "KIT tools path after helper runs: /mnt/x (${TOOLS_SERVER}/Tools)"
 
@@ -4113,6 +9455,11 @@ configure_dns_search_domains() {
     local current
     current=$(nmcli -g ipv4.dns-search connection show "$connection" 2>/dev/null || true)
 
+    if [ "$PLATFORM_FAMILY" = arch ] && platform_ad_dns_discovery_current && printf '%s\n' "$current" | tr ',' '\n' | awk '{$1=$1; print}' | grep -Fxq "$DOMAIN"; then
+        print_info "Preserving already-valid AD DNS search configuration on '$connection'"
+        return 0
+    fi
+
     local missing_domain=false
     local domain
     for domain in $(echo "$DNS_SEARCH" | tr ',' ' '); do
@@ -4127,6 +9474,7 @@ configure_dns_search_domains() {
         return 0
     fi
 
+    backup_config_file /etc/NetworkManager/system-connections
     print_info "Applying DNS search domains to connection '$connection'..."
     nmcli connection modify "$connection" ipv4.dns-search "$DNS_SEARCH"
     nmcli connection up "$connection" > /dev/null
@@ -4172,11 +9520,33 @@ configure_samba() {
     local smb_conf="/etc/samba/smb.conf"
     print_info "Configuring $smb_conf..."
 
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        backup_config_file "$smb_conf"
+        mkdir -p "$(dirname "$smb_conf")"
+        render_arch_smb_conf > "$smb_conf"
+        chmod 644 "$smb_conf"
+        chown root:root "$smb_conf"
+        if ! testparm -s "$smb_conf" >/dev/null 2>&1; then
+            print_error "Generated Arch Samba configuration failed testparm"
+            return 1
+        fi
+        platform_install_machine_account_renewal
+        print_info "Installed Samba ADS configuration with documented 4.21+ keytab synchronization"
+        return 0
+    fi
+
+    if [ ! -f "$smb_conf" ]; then
+        mkdir -p "$(dirname "$smb_conf")"
+        printf '[global]\n' > "$smb_conf"
+    fi
+
     if grep -q "^[[:space:]]*workgroup = $WORKGROUP" "$smb_conf" 2>/dev/null && \
        grep -q "^[[:space:]]*realm = $REALM" "$smb_conf" 2>/dev/null; then
         print_info "smb.conf is already configured — skipping"
         return 0
     fi
+
+    backup_config_file "$smb_conf"
 
     # Set workgroup
     if grep -q "^[[:space:]]*workgroup" "$smb_conf"; then
@@ -4205,6 +9575,10 @@ configure_samba() {
 # ── Configure NetBIOS name resolution via winbind ─────────────────────────────
 
 configure_wins_resolution() {
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        print_info "Arch backend leaves NSS host resolution unchanged; winbind/WINS is not required"
+        return 0
+    fi
     local nsswitch="/etc/nsswitch.conf"
     print_info "Configuring NetBIOS name resolution..."
 
@@ -4213,6 +9587,7 @@ configure_wins_resolution() {
         return 0
     fi
 
+    backup_config_file "$nsswitch"
     if sed -i '/^hosts:/s/dns/wins dns/' "$nsswitch"; then
         print_info "Added wins to hosts resolution in $nsswitch"
     else
@@ -4223,6 +9598,10 @@ configure_wins_resolution() {
 # ── Enable and start winbind ──────────────────────────────────────────────────
 
 enable_winbind() {
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        print_info "Arch backend does not enable winbind; SSSD provides NSS, PAM, identity, and group resolution"
+        return 0
+    fi
     print_info "Enabling winbind service..."
     systemctl enable winbind > /dev/null 2>&1
     systemctl restart winbind
@@ -4296,17 +9675,33 @@ EOF
 
     print_info "Local accounts remain available by typing the username manually"
 }
+# ── Desktop integration adapter ─────────────────────────────────────────────
+
+configure_desktop_integration() {
+    case "$PLATFORM_DESKTOP" in
+        "GNOME")
+            configure_gdm_login_prompt
+            ;;
+        "KDE Plasma")
+            print_info "KDE Plasma detected; preserving user preferences and installing only shared desktop launchers"
+            ;;
+        *)
+            print_warning "Desktop '$PLATFORM_DESKTOP' is not supported by the customization adapter; core provisioning continues"
+            ;;
+    esac
+}
+
 # ── Check display manager ─────────────────────────────────────────────────────
-# Do NOT restart the display manager automatically. Restarting GDM or LightDM
+# Do NOT restart the display manager automatically. Restarting a login manager
 # while the script is running inside a desktop session kills that session,
 # which terminates the terminal and aborts the script mid-execution — leaving
-# the machine in a partially configured state. Instead, note whether a display
-# manager is running so we can prompt the user to log out manually at the end.
+# the machine in a partially configured state. Use systemd's generic alias so
+# KDE Plasma Login Manager, GDM, LightDM, and future implementations are not
+# conflated with the desktop environment.
 
 check_display_manager() {
-    if systemctl is-active --quiet gdm3 2>/dev/null || \
-       systemctl is-active --quiet gdm 2>/dev/null || \
-       systemctl is-active --quiet lightdm 2>/dev/null; then
+    platform_detect_display_manager
+    if systemctl is-active --quiet display-manager.service 2>/dev/null; then
         DISPLAY_MANAGER_RUNNING=true
     else
         DISPLAY_MANAGER_RUNNING=false
@@ -4318,11 +9713,26 @@ check_display_manager() {
 verify_join() {
     print_info "Verifying domain join..."
 
-    if ! realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
+    if ! platform_drip_requirement_satisfied; then
+        print_error "Completion is blocked because configured Arch DRIP roots are not available"
+        print_error "Arch claims only configured /smb roots; arbitrary dynamic /smb and /net paths remain unsupported"
+        return 1
+    fi
+
+    if ! platform_domain_is_joined; then
         print_error "Domain join verification failed — machine does not appear to be joined"
         return 1
     fi
     print_info "Domain join verified: $DOMAIN"
+
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        platform_validate_selected_domain_user || return 1
+        platform_validate_machine_keytab || return 1
+        platform_verify_machine_account_renewal || {
+            print_error "Arch machine-account renewal timer/helper is missing or invalid"
+            return 1
+        }
+    fi
 
     if ! systemctl is-active --quiet sssd 2>/dev/null; then
         print_error "SSSD is not running — domain logins will fail"
@@ -4330,6 +9740,21 @@ verify_join() {
         return 1
     fi
     print_info "SSSD is running"
+
+    if [ "$PLATFORM_FAMILY" = "arch" ]; then
+        if command -v sssctl >/dev/null 2>&1; then
+            sssctl config-check
+            print_info "SSSD configuration validated with sssctl"
+        else
+            print_error "sssctl is unavailable after the Arch sssd package checkpoint"
+            return 1
+        fi
+        platform_verify_drip_search || {
+            print_error "Configured Arch DRIP systemd units are missing, invalid, or globally enabled"
+            return 1
+        }
+        print_info "Configured Arch DRIP search units validated; live KIT/DRIP lifecycle remains unverified"
+    fi
 
     print_info "Testing short name resolution..."
     if nslookup "$(echo "$DOMAIN" | cut -d. -f1)-tools" > /dev/null 2>&1; then
@@ -4361,8 +9786,19 @@ prompt_office_code() {
 }
 
 parse_args() {
+    local requested_office=""
+    local persisted_office="${OFFICE_CODE:-}"
     while [ "$#" -gt 0 ]; do
         case "$1" in
+            --platform-report)
+                PLATFORM_REPORT_ONLY=true
+                ;;
+            --preflight)
+                PREFLIGHT_ONLY=true
+                ;;
+            --dry-run)
+                DRY_RUN_ONLY=true
+                ;;
             --dns-test)
                 DNS_TEST_ONLY=true
                 ;;
@@ -4371,8 +9807,11 @@ parse_args() {
                 ;;
             -h|--help)
                 echo 'Usage: wget -qO- http://ontrack.link/joindomain | sudo bash'
-                echo 'Args:  wget -qO- http://ontrack.link/joindomain | sudo bash -s -- [OFFICE_CODE] [--dns-test]'
+                echo 'Args:  wget -qO- http://ontrack.link/joindomain | sudo bash -s -- [OFFICE_CODE] [--platform-report|--preflight|--dry-run|--dns-test]'
                 echo "  If no office code has been saved, you will be prompted for it."
+                echo "  --platform-report   Read-only platform, package, service, PAM, and desktop report."
+                echo "  --preflight         Read-only readiness validation; blockers return nonzero."
+                echo "  --dry-run           Read-only ordered plan; blockers return nonzero."
                 echo "  --dns-test          Apply DNS/search settings and test realm discovery only."
                 echo "  --full-reconfigure  Engineering override for a completed workstation."
                 exit 0
@@ -4383,8 +9822,8 @@ parse_args() {
                 exit 1
                 ;;
             *)
-                if [ -z "$OFFICE_CODE" ]; then
-                    OFFICE_CODE="$1"
+                if [ -z "$requested_office" ]; then
+                    requested_office="$1"
                 else
                     print_error "Unexpected argument: $1"
                     echo 'Usage: wget -qO- http://ontrack.link/joindomain | sudo bash'
@@ -4395,15 +9834,23 @@ parse_args() {
         shift
     done
 
-    # If the office was not provided on the command line, reuse the value saved
-    # during the first run. This prevents the post-join rerun from asking again.
-    if [ -z "$OFFICE_CODE" ] && [ -f "$STATE_FILE" ]; then
-        # shellcheck disable=SC1090
-        . "$STATE_FILE"
-        OFFICE_CODE="${OFFICE_CODE:-}"
-        if [ -n "$OFFICE_CODE" ]; then
-            print_info "Using saved office code: $OFFICE_CODE"
+    if [ -n "$requested_office" ]; then
+        requested_office="$(echo "$requested_office" | tr '[:lower:]' '[:upper:]' | xargs)"
+        persisted_office="$(echo "$persisted_office" | tr '[:lower:]' '[:upper:]' | xargs)"
+        if [ -n "$persisted_office" ] && [ "$requested_office" != "$persisted_office" ]; then
+            print_error "Office code $requested_office conflicts with persisted office code $persisted_office."
+            print_error "Rerun with the persisted code or resolve the state explicitly before continuing."
+            return 1
         fi
+        OFFICE_CODE="$requested_office"
+    elif [ -n "$persisted_office" ]; then
+        OFFICE_CODE="$persisted_office"
+        print_info "Using saved office code: $OFFICE_CODE"
+    fi
+
+    # The inspection modes must not prompt for office selection or save state.
+    if [ "$PLATFORM_REPORT_ONLY" = true ] || [ "$PREFLIGHT_ONLY" = true ] || [ "$DRY_RUN_ONLY" = true ]; then
+        return 0
     fi
 
     # If no saved value exists, prompt interactively.
@@ -4419,13 +9866,9 @@ parse_args() {
     fi
 
     # Normalize and persist the selected office code for future reruns without
-    # clobbering the installer state machine.
+    # clobbering the installer state machine. The actual state write is delayed
+    # until the read-only preflight has passed in main().
     OFFICE_CODE="$(echo "$OFFICE_CODE" | tr '[:lower:]' '[:upper:]' | xargs)"
-    if [ ! -f "$STATE_FILE" ]; then
-        save_state "OFFICE_CODE_SELECTED"
-    else
-        save_state "${STAGE:-OFFICE_CODE_SELECTED}"
-    fi
 
     case "$OFFICE_CODE" in
         PL|PL1)
@@ -4438,6 +9881,21 @@ parse_args() {
     print_info "Office: $OFFICE_CODE — tools server: $TOOLS_SERVER"
 }
 
+# Parse only the mode/override flags before the completed-workstation guard.
+# This function intentionally performs no prompts, state writes, package
+# checks, service operations, or configuration changes.
+parse_mode_args() {
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --platform-report) PLATFORM_REPORT_ONLY=true ;;
+            --preflight) PREFLIGHT_ONLY=true ;;
+            --dry-run) DRY_RUN_ONLY=true ;;
+            --full-reconfigure) FULL_RECONFIGURE=true ;;
+        esac
+    done
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 main() {
@@ -4447,32 +9905,55 @@ main() {
   echo "=========================================="
     echo ""
 
-    check_privileges
+    check_privileges "$@"
     load_state || true
+    parse_mode_args "$@"
     completed_workstation_rerun_guard "$@"
     parse_args "$@"
-    print_resume_state
-    ensure_local_pam_survives_sssd_failure
-    disable_sssd_if_not_joined
-    print_machine_status
-    validate_or_fix_hostname || exit 1
 
-if [ -f "$STATE_FILE" ] && grep -q 'STAGE="REBOOT_REQUIRED_AFTER_HOSTNAME"' "$STATE_FILE" 2>/dev/null; then
-    current_hn="$(hostnamectl --static 2>/dev/null || hostname)"
-    if [ -n "${DOMAIN_TARGET_HOSTNAME:-}" ] && [ "$current_hn" = "$DOMAIN_TARGET_HOSTNAME" ]; then
-        print_info "Hostname reboot requirement satisfied for $current_hn"
-        save_state "PREJOIN_AFTER_HOSTNAME_REBOOT"
+    if [ "$PLATFORM_REPORT_ONLY" = true ] || [ "$PREFLIGHT_ONLY" = true ] || [ "$DRY_RUN_ONLY" = true ]; then
+        if ! detect_os; then
+            if [ "$PLATFORM_REPORT_ONLY" = true ]; then
+                platform_report
+                exit 0
+            fi
+            if [ "$PREFLIGHT_ONLY" = true ]; then
+                platform_preflight
+                exit $?
+            fi
+            platform_dry_run
+            exit $?
+        fi
+        load_config
+        if [ "$PLATFORM_REPORT_ONLY" = true ]; then
+            platform_report
+            exit 0
+        elif [ "$PREFLIGHT_ONLY" = true ]; then
+            platform_preflight
+            exit $?
+        else
+            platform_dry_run
+            exit $?
+        fi
     fi
-fi
 
-
-    # --- Checks and upfront prompts (interactive) ---
-    detect_os
+    # Detect the platform before any normal-run prompt or modifying helper.
+    # This also ensures the initial live checkpoint is preceded by a complete
+    # read-only platform/preflight pass.
+    detect_os || exit 1
     load_config
 
+    if state_requires_recovery; then
+        recover_stale_state
+        exit 2
+    fi
+
+    print_resume_state
+    print_machine_status
+
     # --- Summary ---
-    if realm list 2>/dev/null | grep -q "configured: kerberos-member"; then
-    validate_existing_join || exit 1
+    if platform_domain_is_joined; then
+        validate_existing_join || exit 1
         echo "  This machine is already joined to $DOMAIN."
         echo "  This run will complete all remaining post-join configuration."
         echo "  You will be prompted once during the run to optionally grant"
@@ -4509,6 +9990,33 @@ fi
     esac
     echo ""
 
+    if ! platform_preflight; then
+        print_error "Read-only preflight did not pass; no hostname, DNS, package, PAM, SSSD, sudoers, mount, or domain-membership changes will be made."
+        exit 2
+    fi
+
+    validate_or_fix_hostname || exit 1
+
+    if [ -f "$STATE_FILE" ] && grep -q 'STAGE="REBOOT_REQUIRED_AFTER_HOSTNAME"' "$STATE_FILE" 2>/dev/null; then
+        current_hn="$(hostnamectl --static 2>/dev/null || hostname)"
+        if [ -n "${DOMAIN_TARGET_HOSTNAME:-}" ] && [ "$current_hn" = "$DOMAIN_TARGET_HOSTNAME" ]; then
+            print_info "Hostname reboot requirement satisfied for $current_hn"
+            save_state "PREJOIN_AFTER_HOSTNAME_REBOOT"
+        fi
+    fi
+
+    if [ ! -f "$STATE_FILE" ]; then
+        save_state "OFFICE_CODE_SELECTED"
+    else
+        save_state "${STAGE:-OFFICE_CODE_SELECTED}"
+    fi
+
+    # This is the first modifying phase of a normal run. Keep these safeguards
+    # out of --platform-report/--preflight/--dry-run and out of the initial
+    # repository-only validation path.
+    ensure_local_pam_survives_sssd_failure
+    disable_sssd_if_not_joined
+
     # --- Automated steps (no further input required) ---
     # Time/DNS must be healthy on every run — including post-join reruns —
     # before apt, Kerberos, SSSD, or domain configuration is touched.
@@ -4516,10 +10024,12 @@ fi
     install_time_sync_prerequisites
     configure_dns_servers
     configure_dns_search_domains
-    bootstrap_time_before_apt || true
+    bootstrap_time_before_packages || exit 2
 
-    print_info "Pre-flight package manager check: verifying apt/dpkg are not locked before installation..."
-    wait_for_apt_locks || exit 1
+    if [ "$PLATFORM_FAMILY" = "debian" ]; then
+        print_info "Pre-flight package manager check: verifying apt/dpkg are not locked before installation..."
+        wait_for_apt_locks || exit 1
+    fi
 
     if [ "$DNS_TEST_ONLY" = true ]; then
         verify_ad_discovery
@@ -4528,7 +10038,9 @@ fi
     fi
 
     install_domain_packages
-    configure_chrony
+    if [ "$PLATFORM_FAMILY" = debian ] || [ "$(platform_time_provider selected)" = chronyd ] || [ "$(platform_time_provider selected)" = chrony ]; then
+        configure_chrony
+    fi
     sync_time
     configure_no_reboot_policy
     verify_krb5_conf
@@ -4539,7 +10051,9 @@ fi
     configure_realm_permissions
     configure_sssd_settings
     enable_sssd
-    configure_gdm_login_prompt
+    platform_configure_nss
+    platform_validate_selected_domain_user
+    configure_desktop_integration
     install_dr_workstation_manager
     configure_autofs_cifs
     configure_sudoers
@@ -4550,9 +10064,12 @@ fi
 
     if verify_join; then
         echo ""
-        save_state "POSTJOIN_COMPLETE"
+        platform_initialize_machine_account_renewal_state
+        save_state "POSTJOIN_AWAITING_LIVE_VALIDATION"
         rm -f /etc/motd 2>/dev/null || true
-        print_info "Domain join completed successfully!"
+        print_info "Static domain provisioning completed; live validation is still required."
+        print_info "State: POSTJOIN_AWAITING_LIVE_VALIDATION"
+        print_info "Record validated phases with: sudo /usr/local/sbin/dr-domain-join-live-validate --record STATE"
         echo ""
         echo "  Log in as a domain user with:"
         echo "    username@$DOMAIN"
@@ -4576,4 +10093,6 @@ fi
     fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

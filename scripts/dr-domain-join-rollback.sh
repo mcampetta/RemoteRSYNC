@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  dr-domain-join-rollback.sh --dry-run BACKUP_DIR
+  dr-domain-join-rollback.sh --apply BACKUP_DIR [--restart-services]
+
+Apply restores backed-up configuration and hostname state. It does not leave
+the AD realm, delete a keytab, remove users, or remove the drone account.
+Realm cleanup is a separate human-approved action.
+USAGE
+}
+
+mode="${1:-}"
+backup_dir="${2:-}"
+restart_services=false
+[ "${3:-}" = "--restart-services" ] && restart_services=true
+
+case "$mode" in
+    --dry-run|--apply) ;;
+    *) usage >&2; exit 2 ;;
+esac
+[ -n "$backup_dir" ] || { usage >&2; exit 2; }
+[ -d "$backup_dir/files" ] || { echo "Invalid backup directory: $backup_dir" >&2; exit 1; }
+[ -f "$backup_dir/manifest" ] || { echo "Backup manifest is missing" >&2; exit 1; }
+
+restore_files=(
+    etc/sssd/sssd.conf
+    etc/krb5.conf
+    etc/samba/smb.conf
+    etc/nsswitch.conf
+    etc/hosts
+    etc/hostname
+    etc/chrony.conf
+    etc/chrony/chrony.conf
+    etc/autofs.conf
+    etc/auto.master
+    etc/auto.master.d
+    etc/auto.net.cifs
+    etc/sudoers
+    etc/sudoers.d
+    etc/pam.d
+    etc/NetworkManager
+    etc/systemd/system/mnt-x.mount
+    etc/systemd/system/mnt-x.automount
+    etc/systemd/system/dr-domain-machine-password-renew.service
+    etc/systemd/system/dr-domain-machine-password-renew.timer
+    usr/local/sbin/dr-domain-machine-password-renew
+    usr/local/sbin/dr-tools-rebind
+    usr/local/sbin/dr-drip-search
+    usr/local/sbin/dr-domain-join-live-validate
+    var/lib/dr-domain-join/state
+    var/lib/dr-domain-join/drip-units.manifest
+    var/lib/dr-domain-join/machine-password-last-success
+    var/lib/dr-domain-join/machine-password-keytab-repair-needed
+    var/lib/dr-domain-join/live-validation
+)
+
+if [ "$mode" = "--dry-run" ]; then
+    echo "WOULD RESTORE files from $backup_dir/files"
+    for relative in "${restore_files[@]}"; do
+        [ -e "$backup_dir/files/$relative" ] && echo "WOULD RESTORE /$relative"
+    done
+    echo "WOULD VALIDATE sudoers before any service action"
+    echo "WOULD DISABLE/STOP candidate mnt-x.automount and mnt-x.mount units"
+    echo "WOULD DISABLE/STOP dr-domain-machine-password-renew.timer"
+    echo "WOULD NOT leave the realm, delete /etc/krb5.keytab, remove users, remove drone, reboot, or log out"
+    if [ "$restart_services" = true ]; then
+        echo "WOULD RESTART only explicitly requested services after restore"
+    fi
+    exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || { echo "--apply requires root" >&2; exit 1; }
+echo "Applying configuration rollback from: $backup_dir"
+echo "This restores files but does not leave the domain or remove local accounts."
+
+for unit in mnt-x.automount mnt-x.mount dr-domain-machine-password-renew.timer dr-domain-machine-password-renew.service; do
+    if systemctl list-unit-files --no-legend "$unit" 2>/dev/null | grep -q .; then
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    fi
+done
+
+drip_manifest="/var/lib/dr-domain-join/drip-units.manifest"
+if [ -r "$drip_manifest" ]; then
+    tab="$(printf '\t')"
+    while IFS="$tab" read -r entry mount_unit automount_unit; do
+        [ -n "$mount_unit" ] || continue
+        systemctl stop "$automount_unit" >/dev/null 2>&1 || true
+        systemctl stop "$mount_unit" >/dev/null 2>&1 || true
+        rm -f -- "/etc/systemd/system/$mount_unit" "/etc/systemd/system/$automount_unit"
+    done < "$drip_manifest"
+    rm -f -- "$drip_manifest" /usr/local/sbin/dr-drip-search
+fi
+
+for relative in "${restore_files[@]}"; do
+    source_path="$backup_dir/files/$relative"
+    target_path="/$relative"
+    [ -e "$source_path" ] || continue
+
+    if [ -d "$source_path" ]; then
+        mkdir -p "$target_path"
+        cp -a -- "$source_path/." "$target_path/"
+    else
+        mkdir -p "$(dirname "$target_path")"
+        cp -a -- "$source_path" "$target_path"
+    fi
+done
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+# If an Arch candidate unit did not exist in the backup, it was created by the
+# candidate and must be removed during this explicit rollback.
+for relative in etc/systemd/system/mnt-x.mount etc/systemd/system/mnt-x.automount; do
+    if [ ! -e "$backup_dir/files/$relative" ] && [ -e "/$relative" ]; then
+        rm -f -- "/$relative"
+    fi
+done
+
+for relative in \
+    etc/systemd/system/dr-domain-machine-password-renew.service \
+    etc/systemd/system/dr-domain-machine-password-renew.timer \
+    usr/local/sbin/dr-domain-machine-password-renew \
+    usr/local/sbin/dr-tools-rebind; do
+    if [ ! -e "$backup_dir/files/$relative" ] && [ -e "/$relative" ]; then
+        rm -f -- "/$relative"
+    fi
+done
+
+if [ -f /etc/sudoers ]; then
+    visudo -cf /etc/sudoers >/dev/null
+fi
+
+if [ -f "$backup_dir/hostname" ]; then
+    restored_hostname="$(head -n1 "$backup_dir/hostname")"
+    if [ -n "$restored_hostname" ]; then
+        hostnamectl set-hostname "$restored_hostname"
+    fi
+fi
+
+if [ "$restart_services" = true ]; then
+    systemctl daemon-reload
+    for service in NetworkManager systemd-resolved chronyd chrony systemd-timesyncd sssd winbind autofs; do
+        if systemctl is-active --quiet "$service" 2>/dev/null; then
+            systemctl restart "$service"
+        fi
+    done
+else
+    echo "Configuration restored. Services were not restarted. Review and restart each affected service during an approved maintenance step."
+fi
+
+echo "PASS Rollback file restore completed"
