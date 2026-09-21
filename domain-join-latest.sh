@@ -43,7 +43,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.1.2"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
@@ -65,6 +65,7 @@ DNS_TEST_ONLY=false
 FULL_RECONFIGURE=false
 KIT_PROCESS_PATTERN="${KIT_PROCESS_PATTERN:-KIT}"
 KIT_INSTALLER_PATH="${KIT_INSTALLER_PATH:-/mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64/KIT-installer-modified.sh}"
+KIT_LAUNCHER_PATH="${KIT_LAUNCHER_PATH:-/mnt/x/DRTools/frozen/Imaging/KIT-Linux.sh}"
 BRAND_WALLPAPER_SOURCE="${BRAND_WALLPAPER_SOURCE:-/mnt/x/CRtools/Frozen/Branding/Wallpaper/1080p_ontrackwallpaper.jpg}"
 BRAND_WALLPAPER_DEST="/usr/share/backgrounds/dr-company-wallpaper"
 OFFICE_CODE=""
@@ -230,6 +231,12 @@ completed_workstation_rerun_guard() {
         print_info "Workstation management commands and permissions are up to date."
     else
         print_warning "Could not refresh workstation management components."
+    fi
+
+    if install_root_kit_launcher; then
+        print_info "KIT runtime launcher is up to date."
+    else
+        print_warning "Could not refresh the KIT runtime launcher."
     fi
 
     show_completed_workstation_message
@@ -2879,26 +2886,19 @@ EOF
 
 
 # ── Post-mount provisioning helper ───────────────────────────────────────────
-install_post_mount_provision_helper() {
-    print_info "Installing post-mount provisioning helper for KIT installer and workstation branding..."
 
-    # Install/repair the canonical root KIT launch helper now, not only after
-    # post-mount provisioning runs. The desktop shortcut and sudoers rule both
-    # target this one helper. It is intentionally narrow: it only cd's into the
-    # KIT runtime directory and launches KIT.sh.
-    local kit_runtime_dir
-    local escaped_kit_runtime_dir
-    kit_runtime_dir="$(dirname "$KIT_INSTALLER_PATH")"
+install_root_kit_launcher() {
+    local escaped_kit_launcher_path
 
-    # Generate this helper with a quoted heredoc so runtime variables such as
-    # $LOG, $KIT_DIR, ${1:-}, and $? are preserved until dr-launch-kit runs.
+    # The desktop and shell entrypoints always target this local root-owned
+    # helper. Runtime build selection lives on the Tool Server so Development
+    # can publish newer Frozen/UA builds without reprovisioning workstations.
     cat > /usr/local/sbin/dr-launch-kit << 'EOF'
 #!/bin/bash
 set -u
 
 LOG="/var/log/dr-launch-kit.log"
-KIT_DIR="__KIT_RUNTIME_DIR__"
-KIT_SCRIPT="./KIT.sh"
+KIT_LAUNCHER="__KIT_LAUNCHER_PATH__"
 
 if [ "${1:-}" = "--sudo-self-test" ]; then
     exit 0
@@ -2906,45 +2906,47 @@ fi
 
 {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Launch requested by: ${SUDO_USER:-unknown}"
-    echo "KIT_DIR=$KIT_DIR"
-    echo "KIT_SCRIPT=$KIT_DIR/$KIT_SCRIPT"
+    echo "KIT_LAUNCHER=$KIT_LAUNCHER"
 } >> "$LOG" 2>/dev/null || true
 
-if [ ! -d "$KIT_DIR" ]; then
-    echo "KIT directory not found: $KIT_DIR" | tee -a "$LOG" >&2
+if [ ! -f "$KIT_LAUNCHER" ]; then
+    echo "KIT launcher not found: $KIT_LAUNCHER" | tee -a "$LOG" >&2
     echo "Verify Tool Server is mounted at /mnt/x, then try again." >&2
     exit 1
 fi
 
-if [ ! -f "$KIT_DIR/$KIT_SCRIPT" ]; then
-    echo "KIT script not found: $KIT_DIR/$KIT_SCRIPT" | tee -a "$LOG" >&2
-    echo "Verify Tool Server is mounted at /mnt/x, then try again." >&2
+if [ ! -r "$KIT_LAUNCHER" ]; then
+    echo "KIT launcher is not readable: $KIT_LAUNCHER" | tee -a "$LOG" >&2
     exit 1
 fi
 
-cd "$KIT_DIR" || exit 1
-
-# Intentionally do NOT redirect stdout/stderr. KIT behaves correctly when
-# launched like the manual known-good command:
-#   cd /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64
-#   sudo bash ./KIT.sh
-bash "$KIT_SCRIPT"
+cd "$(dirname "$KIT_LAUNCHER")" || exit 1
+bash "$KIT_LAUNCHER" "$@"
 status=$?
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] KIT exited with status: $status" >> "$LOG" 2>/dev/null || true
 exit "$status"
 EOF
-    escaped_kit_runtime_dir="$(printf '%s
-' "$kit_runtime_dir" | sed 's/[#&]/\&/g')"
-    sed -i "s#__KIT_RUNTIME_DIR__#$escaped_kit_runtime_dir#g" /usr/local/sbin/dr-launch-kit
+
+    escaped_kit_launcher_path="$(printf '%s\n' "$KIT_LAUNCHER_PATH" | sed 's/[#&]/\&/g')"
+    sed -i "s#__KIT_LAUNCHER_PATH__#$escaped_kit_launcher_path#g" /usr/local/sbin/dr-launch-kit
     chmod 755 /usr/local/sbin/dr-launch-kit
     chown root:root /usr/local/sbin/dr-launch-kit
+}
+
+install_post_mount_provision_helper() {
+    print_info "Installing post-mount provisioning helper for KIT installer and workstation branding..."
+
+    # Install/repair the canonical root launcher immediately. The launcher
+    # delegates build selection to KIT_LAUNCHER_PATH on the Tool Server.
+    install_root_kit_launcher
 
     cat > /usr/local/sbin/dr-post-mount-provision << EOF
 #!/bin/bash
 set -euo pipefail
 
 KIT_INSTALLER_PATH="${KIT_INSTALLER_PATH}"
+KIT_LAUNCHER_PATH="${KIT_LAUNCHER_PATH}"
 BRAND_WALLPAPER_SOURCE="${BRAND_WALLPAPER_SOURCE}"
 BRAND_WALLPAPER_DEST="${BRAND_WALLPAPER_DEST}"
 STATE_DIR="${STATE_DIR}"
@@ -2966,18 +2968,16 @@ state_has() {
 }
 
 install_root_kit_launcher_helper() {
-    local kit_dir
-    kit_dir="\$(dirname "\$KIT_INSTALLER_PATH")"
+    local escaped_kit_launcher_path
 
-    # Quote the nested heredoc so variables like $LOG and $1 are not
-    # expanded by dr-post-mount-provision while it is generating the helper.
+    # Quote the nested heredoc so runtime variables are not expanded by
+    # dr-post-mount-provision while it is generating the helper.
     cat > /usr/local/sbin/dr-launch-kit << 'EOF2'
 #!/bin/bash
 set -u
 
 LOG="/var/log/dr-launch-kit.log"
-KIT_DIR="__KIT_RUNTIME_DIR__"
-KIT_SCRIPT="./KIT.sh"
+KIT_LAUNCHER="__KIT_LAUNCHER_PATH__"
 
 mkdir -p "\$(dirname "\$LOG")" 2>/dev/null || true
 touch "\$LOG" 2>/dev/null || true
@@ -2985,40 +2985,33 @@ chmod 644 "\$LOG" 2>/dev/null || true
 
 {
     echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Launch requested by: \${SUDO_USER:-unknown}"
-    echo "KIT_DIR=\$KIT_DIR"
-    echo "KIT_SCRIPT=\$KIT_DIR/KIT.sh"
+    echo "KIT_LAUNCHER=\$KIT_LAUNCHER"
 } >> "\$LOG" 2>/dev/null || true
 
 if [ "\${1:-}" = "--sudo-self-test" ]; then
     exit 0
 fi
 
-if [ ! -d "\$KIT_DIR" ]; then
-    echo "KIT directory not found: \$KIT_DIR" | tee -a "\$LOG" >&2
+if [ ! -f "\$KIT_LAUNCHER" ]; then
+    echo "KIT launcher not found: \$KIT_LAUNCHER" | tee -a "\$LOG" >&2
     echo "Verify Tool Server is mounted at /mnt/x, then try again." >&2
     exit 1
 fi
 
-if [ ! -f "\$KIT_DIR/KIT.sh" ]; then
-    echo "KIT script not found: \$KIT_DIR/KIT.sh" | tee -a "\$LOG" >&2
-    echo "Verify Tool Server is mounted at /mnt/x, then try again." >&2
+if [ ! -r "\$KIT_LAUNCHER" ]; then
+    echo "KIT launcher is not readable: \$KIT_LAUNCHER" | tee -a "\$LOG" >&2
     exit 1
 fi
 
-cd "\$KIT_DIR" || exit 1
-
-# Intentionally do NOT redirect stdout/stderr. KIT behaves correctly when
-# launched like the manual known-good command:
-#   cd /mnt/x/DRTools/UA/Imaging/KIT-Linux/V10.00/x64
-#   sudo bash ./KIT.sh
-bash "\$KIT_SCRIPT"
+cd "\$(dirname "\$KIT_LAUNCHER")" || exit 1
+bash "\$KIT_LAUNCHER" "\$@"
 status=\$?
 
 echo "[\$(date '+%Y-%m-%d %H:%M:%S')] KIT exited with status: \$status" >> "\$LOG" 2>/dev/null || true
 exit "\$status"
 EOF2
-    escaped_kit_dir="\$(printf '%s\n' "\$kit_dir" | sed 's/[#&]/\\&/g')"
-    sed -i "s#__KIT_RUNTIME_DIR__#\$escaped_kit_dir#g" /usr/local/sbin/dr-launch-kit
+    escaped_kit_launcher_path="\$(printf '%s\n' "\$KIT_LAUNCHER_PATH" | sed 's/[#&]/\\&/g')"
+    sed -i "s#__KIT_LAUNCHER_PATH__#\$escaped_kit_launcher_path#g" /usr/local/sbin/dr-launch-kit
 
     chmod 755 /usr/local/sbin/dr-launch-kit
     chown root:root /usr/local/sbin/dr-launch-kit
@@ -3105,15 +3098,13 @@ install_kit_desktop_shortcut_for_user() {
     local user="\$1"
     local home="\$2"
     local uid="\$3"
-    local kit_dir
     local kit_launcher
     local wrapper
     local desktop_file
     local desktop_copy
 
     [ -d "\$home" ] || return 0
-    kit_dir="\$(dirname "\$KIT_INSTALLER_PATH")"
-    kit_launcher="\$kit_dir/KIT.sh"
+    kit_launcher="\$KIT_LAUNCHER_PATH"
 
     if [ ! -f "\$kit_launcher" ]; then
         log "KIT launcher not found for \$user at \$kit_launcher; shortcut not installed."
@@ -3124,7 +3115,7 @@ install_kit_desktop_shortcut_for_user() {
 
     # The vendor KIT installer may create a desktop file that points back at
     # KIT-installer-modified.sh. Replace/repair it with a deterministic launcher
-    # that always starts the real runtime entrypoint: KIT.sh.
+    # that always starts the canonical local KIT launcher.
     wrapper="\$home/.local/bin/dr-launch-kit"
     cat > "\$wrapper" << 'EOF2'
 #!/bin/bash
@@ -3189,8 +3180,8 @@ EOF2
 }
 
 install_kit_desktop_shortcuts() {
-    if [ ! -f "\$(dirname "\$KIT_INSTALLER_PATH")/KIT.sh" ]; then
-        log "KIT launcher not found at \$(dirname "\$KIT_INSTALLER_PATH")/KIT.sh; desktop shortcut not installed."
+    if [ ! -f "\$KIT_LAUNCHER_PATH" ]; then
+        log "KIT launcher not found at \$KIT_LAUNCHER_PATH; desktop shortcut not installed."
         return 0
     fi
 
