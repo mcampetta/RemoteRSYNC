@@ -210,7 +210,7 @@ show_completed_workstation_message() {
     fi
 
     echo ""
-    echo "  No domain provisioning or network changes were made."
+    echo "  No hostname, DNS, network, Kerberos, SSSD, Samba, PAM, or domain membership changes were made."
     echo "=========================================="
 }
 
