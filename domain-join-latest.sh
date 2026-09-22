@@ -43,9 +43,10 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.1.2"
+SCRIPT_VERSION="1.1.3"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
+APT_RUNTIME_MASKED_UNITS=""
 STATE_DIR="/var/lib/dr-domain-join"
 STATE_FILE="$STATE_DIR/state"
 DOMAIN_TARGET_HOSTNAME=""
@@ -284,7 +285,7 @@ wait_for_apt_locks() {
     local interval="${APT_LOCK_POLL_INTERVAL:-10}"
     local quiet_wait="${APT_LOCK_QUIET_WAIT:-10}"
     local pid_detail_wait="${APT_LOCK_PID_WAIT:-20}"
-    local offer_clear_wait="${APT_LOCK_OVERRIDE_WAIT:-30}"
+    local offer_clear_wait="${APT_LOCK_OVERRIDE_WAIT:-90}"
     local showed_update_msg=0
 
     # Test/development override support:
@@ -296,7 +297,7 @@ wait_for_apt_locks() {
             interval=10
             quiet_wait=10
             pid_detail_wait=20
-            offer_clear_wait=30
+            offer_clear_wait=90
             ;;
     esac
 
@@ -422,12 +423,22 @@ wait_for_apt_locks() {
 
         for unit in packagekit.service packagekit.socket packagekit-offline-update.service; do
             if systemctl list-unit-files "$unit" >/dev/null 2>&1 || systemctl list-units "$unit" >/dev/null 2>&1; then
-                print_warning "Temporarily masking $unit to prevent PackageKit respawn"
-                systemctl stop "$unit" >/dev/null 2>&1 || true
-                systemctl mask "$unit" >/dev/null 2>&1 || true
-                case " $APT_BACKGROUND_STOPPED_UNITS " in
-                    *" $unit "*) ;;
-                    *) APT_BACKGROUND_STOPPED_UNITS="$APT_BACKGROUND_STOPPED_UNITS $unit" ;;
+                local mask_state
+                mask_state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+                case "$mask_state" in
+                    masked|masked-runtime)
+                        print_info "$unit is already masked; leaving the existing administrator state unchanged"
+                        ;;
+                    *)
+                        print_warning "Temporarily runtime-masking $unit to prevent PackageKit respawn"
+                        systemctl stop "$unit" >/dev/null 2>&1 || true
+                        if systemctl mask --runtime "$unit" >/dev/null 2>&1; then
+                            case " $APT_RUNTIME_MASKED_UNITS " in
+                                *" $unit "*) ;;
+                                *) APT_RUNTIME_MASKED_UNITS="$APT_RUNTIME_MASKED_UNITS $unit" ;;
+                            esac
+                        fi
+                        ;;
                 esac
             fi
         done
@@ -436,14 +447,12 @@ wait_for_apt_locks() {
     restore_apt_respawn_units() {
         local unit
 
-        [ -z "$APT_BACKGROUND_STOPPED_UNITS" ] && return 0
+        [ -z "$APT_BACKGROUND_STOPPED_UNITS" ] && [ -z "$APT_RUNTIME_MASKED_UNITS" ] && return 0
 
-        print_info "Restoring apt/PackageKit timers and services that were paused by this script..."
+        print_info "Restoring apt/PackageKit state paused by this script..."
 
-        for unit in packagekit.service packagekit.socket packagekit-offline-update.service; do
-            if systemctl list-unit-files "$unit" >/dev/null 2>&1 || systemctl list-units "$unit" >/dev/null 2>&1; then
-                systemctl unmask "$unit" >/dev/null 2>&1 || true
-            fi
+        for unit in $APT_RUNTIME_MASKED_UNITS; do
+            systemctl unmask --runtime "$unit" >/dev/null 2>&1 || true
         done
 
         for unit in $APT_BACKGROUND_STOPPED_UNITS; do
@@ -467,6 +476,7 @@ wait_for_apt_locks() {
         done
 
         APT_BACKGROUND_STOPPED_UNITS=""
+        APT_RUNTIME_MASKED_UNITS=""
     }
 
     force_clear_apt_locks() {
@@ -556,6 +566,75 @@ wait_for_apt_locks() {
     fi
 
     return 0
+}
+
+cleanup_apt_background_guard() {
+    if [ "${APT_BACKGROUND_GUARD_ACTIVE:-0}" -eq 1 ]; then
+        if declare -F restore_apt_respawn_units >/dev/null 2>&1; then
+            restore_apt_respawn_units || true
+        fi
+        APT_BACKGROUND_GUARD_ACTIVE=0
+    fi
+}
+
+apt_update_with_retry() {
+    local max_attempts="${APT_UPDATE_ATTEMPTS:-4}"
+    local retry_delay="${APT_UPDATE_RETRY_DELAY:-10}"
+    local attempt=1
+    local output_file
+
+    case "$max_attempts:$retry_delay" in
+        *[!0-9:]*|:*|*::*)
+            max_attempts=4
+            retry_delay=10
+            ;;
+    esac
+    [ "$max_attempts" -ge 1 ] || max_attempts=4
+
+    output_file="$(mktemp /tmp/dr-apt-update.XXXXXXXX)" || return 1
+
+    while [ "$attempt" -le "$max_attempts" ]; do
+        print_info "Refreshing Ubuntu package indexes (attempt $attempt/$max_attempts)..."
+        wait_for_apt_locks || { rm -f "$output_file"; return 1; }
+
+        if apt-get \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::No-Cache=true \
+            -o Acquire::https::No-Cache=true \
+            update >"$output_file" 2>&1; then
+            cat "$output_file"
+            rm -f "$output_file"
+            print_info "Ubuntu package indexes refreshed successfully"
+            return 0
+        fi
+
+        cat "$output_file" >&2
+        print_warning "Ubuntu package index refresh failed on attempt $attempt/$max_attempts."
+
+        if grep -Eiq 'Hash Sum mismatch|File has unexpected size|authenticationrequired|401 Unauthorized|401 authenticationrequired|Failed to fetch|Temporary failure resolving|Could not connect|Connection failed|Release file .* is not valid yet' "$output_file"; then
+            print_warning "The failure looks transient (mirror/cache/network/time metadata); APT lists will be refreshed before retrying."
+        fi
+
+        apt-get clean >/dev/null 2>&1 || true
+        if [ "$attempt" -eq 1 ]; then
+            rm -rf /var/lib/apt/lists/partial/* 2>/dev/null || true
+            mkdir -p /var/lib/apt/lists/partial
+        else
+            rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+            mkdir -p /var/lib/apt/lists/partial
+        fi
+
+        if [ "$attempt" -lt "$max_attempts" ]; then
+            print_info "Waiting ${retry_delay}s before retrying package index refresh..."
+            sleep "$retry_delay"
+        fi
+        attempt=$((attempt + 1))
+    done
+
+    print_error "Ubuntu package indexes could not be refreshed after $max_attempts attempts."
+    print_error "Check system time, DNS/network access, and the configured Ubuntu archive before retrying."
+    rm -f "$output_file"
+    return 1
 }
 
 install_package() {
@@ -1804,10 +1883,20 @@ $/, ""); print; exit}')
 
 install_domain_packages() {
     print_info "Installing domain packages..."
-    trap 'if [ "$APT_BACKGROUND_GUARD_ACTIVE" -eq 1 ]; then restore_apt_respawn_units; APT_BACKGROUND_GUARD_ACTIVE=0; fi' RETURN
 
     wait_for_apt_locks || return 1
-    apt-get update -qq
+
+    # If lock recovery paused background package services, always restore them
+    # even if a later package command exits the script unexpectedly.
+    trap 'cleanup_apt_background_guard' EXIT
+    trap 'cleanup_apt_background_guard; exit 130' INT
+    trap 'cleanup_apt_background_guard; exit 143' TERM
+
+    if ! apt_update_with_retry; then
+        cleanup_apt_background_guard
+        trap - EXIT INT TERM
+        return 1
+    fi
 
     install_package "realmd"
     install_package "sssd"
@@ -1843,10 +1932,8 @@ install_domain_packages() {
         install_package "libpam-mkhomedir"
     fi
 
-    if [ "$APT_BACKGROUND_GUARD_ACTIVE" -eq 1 ]; then
-        restore_apt_respawn_units
-        APT_BACKGROUND_GUARD_ACTIVE=0
-    fi
+    cleanup_apt_background_guard
+    trap - EXIT INT TERM
 }
 
 
@@ -2217,8 +2304,10 @@ sync_time() {
         count=$((count + 1))
     done
 
-    print_warning "Clock synchronization not confirmed after 30 seconds — proceeding anyway"
-    print_warning "If the join or login fails, verify with: timedatectl && chronyc tracking && chronyc sources -v"
+    print_error "Clock synchronization not confirmed after 30 seconds."
+    print_error "Refusing to continue because Active Directory/Kerberos requires accurate time."
+    print_error "Verify with: timedatectl && chronyc tracking && chronyc sources -v"
+    return 1
 }
 
 # ── Kerberos configuration ────────────────────────────────────────────────────
@@ -4507,10 +4596,12 @@ fi
     install_time_sync_prerequisites
     configure_dns_servers
     configure_dns_search_domains
-    bootstrap_time_before_apt || true
-
-    print_info "Pre-flight package manager check: verifying apt/dpkg are not locked before installation..."
-    wait_for_apt_locks || exit 1
+    if ! bootstrap_time_before_apt; then
+        print_error "System clock could not be synchronized before APT access."
+        print_error "Refusing to continue because incorrect time can break Ubuntu repository validation and Kerberos."
+        print_error "Check: timedatectl status"
+        exit 1
+    fi
 
     if [ "$DNS_TEST_ONLY" = true ]; then
         verify_ad_discovery
@@ -4520,7 +4611,7 @@ fi
 
     install_domain_packages
     configure_chrony
-    sync_time
+    sync_time || exit 1
     configure_no_reboot_policy
     verify_krb5_conf
     configure_fqdn
