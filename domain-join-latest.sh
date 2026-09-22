@@ -43,7 +43,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.1.5"
+SCRIPT_VERSION="1.1.6"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 APT_RUNTIME_MASKED_UNITS=""
@@ -405,15 +405,29 @@ wait_for_apt_locks() {
     }
 
     stop_apt_respawn_units() {
-        local unit
+        local unit mask_state
+        local trigger_units=(
+            apt-daily.timer
+            apt-daily-upgrade.timer
+            packagekit.socket
+        )
+        local service_units=(
+            apt-daily.service
+            apt-daily-upgrade.service
+            unattended-upgrades.service
+            packagekit.service
+            packagekit-offline-update.service
+        )
 
         print_warning "Pausing apt/unattended-upgrade/PackageKit services for this deployment step..."
 
-        for unit in "${apt_units[@]}"; do
+        # Disable the triggers first so no new package job is started while we
+        # are taking control of the currently-running transaction.
+        for unit in "${trigger_units[@]}"; do
             if systemctl list-unit-files "$unit" >/dev/null 2>&1 || systemctl list-units "$unit" >/dev/null 2>&1; then
                 if systemctl is-active --quiet "$unit" 2>/dev/null || systemctl is-enabled --quiet "$unit" 2>/dev/null; then
-                    print_info "Stopping $unit"
-                    systemctl stop "$unit" >/dev/null 2>&1 || true
+                    print_info "Requesting trigger $unit to stop"
+                    systemctl stop --no-block "$unit" >/dev/null 2>&1 || true
                     case " $APT_BACKGROUND_STOPPED_UNITS " in
                         *" $unit "*) ;;
                         *) APT_BACKGROUND_STOPPED_UNITS="$APT_BACKGROUND_STOPPED_UNITS $unit" ;;
@@ -422,9 +436,25 @@ wait_for_apt_locks() {
             fi
         done
 
+        # Ask running services to stop, but never block the provisioning shell
+        # inside systemctl. The PID/lock-holder logic below owns the timeout.
+        for unit in "${service_units[@]}"; do
+            if systemctl list-unit-files "$unit" >/dev/null 2>&1 || systemctl list-units "$unit" >/dev/null 2>&1; then
+                if systemctl is-active --quiet "$unit" 2>/dev/null; then
+                    print_info "Requesting service $unit to stop"
+                    systemctl stop --no-block "$unit" >/dev/null 2>&1 || true
+                    case " $APT_BACKGROUND_STOPPED_UNITS " in
+                        *" $unit "*) ;;
+                        *) APT_BACKGROUND_STOPPED_UNITS="$APT_BACKGROUND_STOPPED_UNITS $unit" ;;
+                    esac
+                fi
+            fi
+        done
+
+        # PackageKit can respawn through D-Bus/socket activation. Runtime masks
+        # disappear automatically at reboot and are removed by our cleanup path.
         for unit in packagekit.service packagekit.socket packagekit-offline-update.service; do
             if systemctl list-unit-files "$unit" >/dev/null 2>&1 || systemctl list-units "$unit" >/dev/null 2>&1; then
-                local mask_state
                 mask_state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
                 case "$mask_state" in
                     masked|masked-runtime)
@@ -432,7 +462,7 @@ wait_for_apt_locks() {
                         ;;
                     *)
                         print_warning "Temporarily runtime-masking $unit to prevent PackageKit respawn"
-                        systemctl stop "$unit" >/dev/null 2>&1 || true
+                        systemctl stop --no-block "$unit" >/dev/null 2>&1 || true
                         if systemctl mask --runtime "$unit" >/dev/null 2>&1; then
                             case " $APT_RUNTIME_MASKED_UNITS " in
                                 *" $unit "*) ;;
@@ -443,6 +473,18 @@ wait_for_apt_locks() {
                 esac
             fi
         done
+    }
+
+    wait_for_lock_holders_to_exit() {
+        local timeout="${1:-10}"
+        local elapsed=0
+
+        while apt_locks_held && [ "$elapsed" -lt "$timeout" ]; do
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+
+        ! apt_locks_held
     }
 
     restore_apt_respawn_units() {
@@ -481,15 +523,16 @@ wait_for_apt_locks() {
     }
 
     force_clear_apt_locks() {
-        local pids
+        local pids pid
 
         print_warning "Package manager lock has persisted for ${offer_clear_wait} seconds."
         print_warning "This is commonly caused by Ubuntu automatic updates on fresh installs."
-        print_warning "To avoid repeating this delay for every package, the script can pause Ubuntu's background package services until domain-package installation is complete."
+        print_warning "You can let the provisioning script take control of the package manager now."
         echo ""
         print_warning "Current lock holder(s):"
         get_lock_holders
-        read -r -p "  Pause background package services, terminate lock holder(s), and repair dpkg? [y/N]: " answer
+        echo ""
+        read -r -p "  Take control now, stop the background update, and repair dpkg? [y/N]: " answer
 
         case "$answer" in
             y|Y|yes|YES)
@@ -502,40 +545,44 @@ wait_for_apt_locks() {
 
         APT_BACKGROUND_GUARD_ACTIVE=1
         stop_apt_respawn_units
-        sleep 2
 
-        pids="$(get_lock_holder_pids)"
-
-        if [ -z "$pids" ]; then
-            print_info "No active apt/dpkg lock holders found after pausing background services."
+        print_info "Waiting up to 10 seconds for the background package job to stop cleanly..."
+        if wait_for_lock_holders_to_exit 10; then
+            print_info "Background package job stopped cleanly."
         else
-            local pid
-            for pid in $pids; do
-                if kill -0 "$pid" 2>/dev/null; then
-                    print_warning "Requesting process $pid to stop..."
-                    kill "$pid" 2>/dev/null || true
-                fi
-            done
-
-            sleep 5
-
             pids="$(get_lock_holder_pids)"
             for pid in $pids; do
                 if kill -0 "$pid" 2>/dev/null; then
-                    print_warning "Process $pid did not stop; sending SIGKILL..."
-                    kill -9 "$pid" 2>/dev/null || true
+                    print_warning "Sending SIGTERM to package-manager process $pid..."
+                    kill -TERM "$pid" 2>/dev/null || true
                 fi
             done
-        fi
 
-        sleep 2
+            print_info "Waiting up to 10 seconds for package-manager processes to exit..."
+            if ! wait_for_lock_holders_to_exit 10; then
+                pids="$(get_lock_holder_pids)"
+                for pid in $pids; do
+                    if kill -0 "$pid" 2>/dev/null; then
+                        print_warning "Process $pid did not stop after SIGTERM; sending SIGKILL..."
+                        kill -KILL "$pid" 2>/dev/null || true
+                    fi
+                done
+
+                if ! wait_for_lock_holders_to_exit 5; then
+                    print_error "Package-manager lock holder survived the bounded takeover attempt."
+                    print_error "Remaining holder(s):"
+                    get_lock_holders
+                    return 1
+                fi
+            fi
+        fi
 
         print_info "Repairing package manager state..."
         dpkg --configure -a || return 1
         apt-get -f install -y || return 1
 
         if apt_locks_held; then
-            print_error "Package manager still appears locked after force clear."
+            print_error "Package manager still appears locked after repair."
             print_error "Remaining holder(s):"
             get_lock_holders
             return 1
@@ -1907,13 +1954,18 @@ bootstrap_time_before_apt() {
 install_domain_packages() {
     print_info "Installing domain packages..."
 
-    wait_for_apt_locks || return 1
-
-    # If lock recovery paused background package services, always restore them
-    # even if a later package command exits the script unexpectedly.
+    # Install cleanup before the first lock wait. This guarantees that a user
+    # interrupt or failure during package-manager takeover restores any runtime
+    # masks/triggers created by this provisioning run.
     trap 'cleanup_apt_background_guard' EXIT
     trap 'cleanup_apt_background_guard; exit 130' INT
     trap 'cleanup_apt_background_guard; exit 143' TERM
+
+    if ! wait_for_apt_locks; then
+        cleanup_apt_background_guard
+        trap - EXIT INT TERM
+        return 1
+    fi
 
     if ! apt_update_with_retry; then
         cleanup_apt_background_guard
