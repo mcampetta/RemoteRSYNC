@@ -43,7 +43,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.1.3"
+SCRIPT_VERSION="1.1.4"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 APT_RUNTIME_MASKED_UNITS=""
@@ -62,6 +62,7 @@ REALM="DR.KODR.LOCAL"
 WORKGROUP="DR"
 WINS_SERVER="10.40.249.101"
 DNS_SEARCH="dr.kodr.local,corp.altegrity.com,corp.eddom.org,corp.kroll.com,ontrack.com,ccp.edp.local"
+NTP_SERVERS="${NTP_SERVERS:-}"
 DNS_TEST_ONLY=false
 FULL_RECONFIGURE=false
 KIT_PROCESS_PATTERN="${KIT_PROCESS_PATTERN:-KIT}"
@@ -1813,10 +1814,67 @@ install_time_sync_prerequisites() {
 }
 
 
+get_trusted_http_date() {
+    local url http_date=""
+
+    for url in \
+        http://security.ubuntu.com/ubuntu/ \
+        http://archive.ubuntu.com/ubuntu/; do
+        if command -v curl >/dev/null 2>&1; then
+            http_date="$(curl -fsSI --max-time 10 "$url" 2>/dev/null \
+                | tr -d '\r' \
+                | awk 'BEGIN{IGNORECASE=1} /^Date:/ {sub(/^Date:[[:space:]]*/, ""); print; exit}')"
+        elif command -v wget >/dev/null 2>&1; then
+            http_date="$(wget -S --spider -T 10 -t 1 "$url" 2>&1 \
+                | tr -d '\r' \
+                | awk 'BEGIN{IGNORECASE=1} /^[[:space:]]*Date:/ {sub(/^[[:space:]]*Date:[[:space:]]*/, ""); print; exit}')"
+        fi
+
+        if [ -n "$http_date" ]; then
+            printf '%s\n' "$http_date"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+validate_or_correct_clock_from_http() {
+    local tolerance="${CLOCK_HTTP_TOLERANCE_SECONDS:-240}"
+    local http_date http_epoch local_epoch delta
+
+    case "$tolerance" in
+        ''|*[!0-9]*) tolerance=240 ;;
+    esac
+
+    http_date="$(get_trusted_http_date 2>/dev/null || true)"
+    [ -n "$http_date" ] || return 1
+
+    http_epoch="$(date -u -d "$http_date" +%s 2>/dev/null || true)"
+    [ -n "$http_epoch" ] || return 1
+    local_epoch="$(date -u +%s)"
+    delta=$((local_epoch - http_epoch))
+    [ "$delta" -ge 0 ] || delta=$((-delta))
+
+    if [ "$delta" -le "$tolerance" ]; then
+        print_info "System clock is within ${delta}s of trusted HTTP time"
+        return 0
+    fi
+
+    print_warning "System clock differs from trusted HTTP time by ${delta}s."
+    print_warning "Correcting system time from Canonical HTTP Date header: $http_date"
+    if date -u -s "@$http_epoch" >/dev/null 2>&1; then
+        hwclock --systohc >/dev/null 2>&1 || true
+        print_info "System clock corrected from trusted HTTP time"
+        return 0
+    fi
+
+    return 1
+}
+
 bootstrap_time_before_apt() {
-    # Repair/verify time before apt-get update. On fresh installs, chrony may
-    # not be installed yet, so try systemd-timesyncd first and only use chrony
-    # if it is already present.
+    # Repair/verify time before apt-get update. A fresh Ubuntu image may not
+    # have chrony yet, and DHCP DNS resolvers are not assumed to be NTP servers.
     print_info "Bootstrapping system clock before apt..."
 
     if systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd.service'; then
@@ -1825,7 +1883,7 @@ bootstrap_time_before_apt() {
         timedatectl set-ntp true >/dev/null 2>&1 || true
 
         local count=0
-        while [ "$count" -lt 6 ]; do
+        while [ "$count" -lt 4 ]; do
             if timedatectl show --property=NTPSynchronized --value 2>/dev/null | grep -q '^yes$'; then
                 print_info "Clock synchronized via systemd-timesyncd"
                 hwclock --systohc >/dev/null 2>&1 || true
@@ -1836,47 +1894,12 @@ bootstrap_time_before_apt() {
         done
     fi
 
-    if command -v chronyc >/dev/null 2>&1; then
-        print_info "Trying existing chrony..."
-        configure_chrony || true
-        systemctl enable --now chrony >/dev/null 2>&1 || true
-        chronyc -a burst 4/4 >/dev/null 2>&1 || true
-        sleep 2
-        chronyc -a makestep >/dev/null 2>&1 || true
-
-        if chronyc tracking 2>/dev/null | grep -qE '^Leap status[[:space:]]*:[[:space:]]*Normal'; then
-            print_info "Clock synchronized via chrony"
-            hwclock --systohc >/dev/null 2>&1 || true
-            return 0
-        fi
-
-        if force_step_from_chrony_offset; then
-            print_info "Clock stepped from chrony NTP offset"
-            systemctl restart chrony >/dev/null 2>&1 || true
-            hwclock --systohc >/dev/null 2>&1 || true
-            return 0
-        fi
+    print_info "NTP synchronization is not yet confirmed; validating clock against trusted HTTP time..."
+    if validate_or_correct_clock_from_http; then
+        return 0
     fi
 
-    print_info "Trying HTTP Date header fallback..."
-    local http_date=""
-    if command -v wget >/dev/null 2>&1; then
-        http_date=$(wget -S --spider -T 10 -t 1 http://security.ubuntu.com/ 2>&1             | awk '/^[[:space:]]*Date:/ {sub(/^[[:space:]]*Date:[[:space:]]*/, ""); print; exit}')
-    elif command -v curl >/dev/null 2>&1; then
-        http_date=$(curl -I --max-time 10 http://security.ubuntu.com/ 2>/dev/null             | awk 'BEGIN{IGNORECASE=1} /^Date:/ {sub(/^Date:[[:space:]]*/, ""); sub(/
-$/, ""); print; exit}')
-    fi
-
-    if [ -n "$http_date" ]; then
-        print_warning "Setting system clock from HTTP Date header: $http_date"
-        if date -u -s "$http_date" >/dev/null 2>&1; then
-            hwclock --systohc >/dev/null 2>&1 || true
-            print_info "Clock set from HTTP Date header"
-            return 0
-        fi
-    fi
-
-    print_warning "Clock synchronization could not be confirmed before apt"
+    print_warning "Clock could not be validated or corrected before apt"
     print_warning "Current time: $(date -R)"
     return 1
 }
@@ -2154,6 +2177,16 @@ configure_dns_servers() {
 # currently active on the interface. If none can be determined, leave chrony
 # defaults in place and allow sync_time() to warn rather than hard-fail.
 
+get_ad_ntp_servers() {
+    command -v dig >/dev/null 2>&1 || return 1
+    dig +short SRV "_kerberos._udp.$DOMAIN" 2>/dev/null \
+        | awk '{print $4}' \
+        | sed 's/\.$//' \
+        | grep -E '^[A-Za-z0-9.-]+$' \
+        | awk 'NF && !seen[$0]++' \
+        | head -4
+}
+
 configure_chrony() {
     local chrony_conf
     if [ -f "/etc/chrony/chrony.conf" ]; then
@@ -2165,47 +2198,54 @@ configure_chrony() {
         return 0
     fi
 
-    local raw_servers=""
-    if [ -n "$DNS_SERVERS" ]; then
-        raw_servers="$DNS_SERVERS"
-    else
-        raw_servers="$(get_current_dns_servers | tr '\n' ' ')"
+    local had_managed_block=0
+    if grep -q '^# BEGIN domain-join chrony sources$' "$chrony_conf" 2>/dev/null; then
+        had_managed_block=1
     fi
 
-    local ntp_servers=""
-    local server
-    for server in $raw_servers; do
-        if is_valid_ip_literal "$server"; then
-            ntp_servers="$ntp_servers $server"
-        else
-            print_warning "Ignoring invalid NTP/DNS server token from resolver state: $server"
-        fi
-    done
-    ntp_servers="$(echo "$ntp_servers" | xargs 2>/dev/null || true)"
+    # Remove any prior block generated by this script. Earlier versions could
+    # incorrectly use a DHCP DNS forwarder (for example a VM NAT resolver) as NTP.
+    sed -i '/^# BEGIN domain-join chrony sources$/,/^# END domain-join chrony sources$/d' "$chrony_conf"
 
-    if [ -z "$ntp_servers" ]; then
-        print_warning "No valid DHCP/VPN DNS servers found to use as NTP sources — leaving chrony defaults in place"
+    if [ "$had_managed_block" -eq 1 ]; then
+        # Restore pool/server lines that older versions disabled with "# ".
+        sed -i -E \
+            -e 's/^#[[:space:]]+(pool[[:space:]])/\1/' \
+            -e 's/^#[[:space:]]+(server[[:space:]])/\1/' \
+            "$chrony_conf"
+    fi
+
+    local raw_servers=""
+    local source_label=""
+    if [ -n "${NTP_SERVERS:-}" ]; then
+        raw_servers="$NTP_SERVERS"
+        source_label="configured NTP override"
+    else
+        raw_servers="$(get_ad_ntp_servers 2>/dev/null | tr '\n' ' ')"
+        source_label="Active Directory domain controllers"
+    fi
+
+    raw_servers="$(echo "$raw_servers" | xargs 2>/dev/null || true)"
+    if [ -z "$raw_servers" ]; then
+        print_warning "No explicit NTP override or AD DC NTP targets were discovered."
+        print_info "Leaving chrony package/default NTP sources in place."
+        systemctl restart chrony >/dev/null 2>&1 || true
         return 0
     fi
 
-    print_info "Configuring chrony to use current domain DNS/DC servers as NTP sources: $ntp_servers"
+    print_info "Configuring chrony to use $source_label: $raw_servers"
 
-    # Clean up bad/duplicate entries from earlier test runs. This keeps the
-    # function idempotent and removes malformed lines such as: server | iburst.
+    # Keep only one managed block and one makestep/rtcsync policy.
     sed -i \
-        -e '/^[[:space:]]*server[[:space:]]*|[[:space:]]/d' \
         -e '/^[[:space:]]*makestep[[:space:]]/d' \
         -e '/^[[:space:]]*rtcsync[[:space:]]*$/d' \
         "$chrony_conf"
 
-    # Remove any previous managed block from this script.
-    sed -i '/^# BEGIN domain-join chrony sources$/,/^# END domain-join chrony sources$/d' "$chrony_conf"
-
-    # Disable active pool/server lines outside our managed block so the local
-    # corporate time sources are preferred where public NTP is blocked.
-    sed -i \
-        -e 's/^[[:space:]]*pool[[:space:]]/# &/' \
-        -e 's/^[[:space:]]*server[[:space:]]/# &/' \
+    # Prefer the AD/explicit sources over package defaults, while retaining the
+    # original lines as comments for recovery/debugging.
+    sed -i -E \
+        -e 's/^([[:space:]]*pool[[:space:]])/# \1/' \
+        -e 's/^([[:space:]]*server[[:space:]])/# \1/' \
         "$chrony_conf"
 
     {
@@ -2214,13 +2254,20 @@ configure_chrony() {
         echo "# Added by domain-join.sh for Kerberos/AD time synchronization"
         echo "rtcsync"
         echo "makestep 1.0 3"
-        for server in $ntp_servers; do
+        local server
+        for server in $raw_servers; do
+            case "$server" in
+                -*|*/*|*:*:*:*:*:*:*:*:*|*[!A-Za-z0-9_.:-]*)
+                    print_warning "Ignoring unsafe NTP server token: $server"
+                    continue
+                    ;;
+            esac
             echo "server $server iburst prefer"
         done
         echo "# END domain-join chrony sources"
     } >> "$chrony_conf"
 
-    systemctl restart chrony > /dev/null 2>&1 || true
+    systemctl restart chrony >/dev/null 2>&1 || true
     print_info "chrony NTP sources configured"
 }
 
@@ -2304,7 +2351,14 @@ sync_time() {
         count=$((count + 1))
     done
 
-    print_error "Clock synchronization not confirmed after 30 seconds."
+    print_warning "NTP synchronization not confirmed after 30 seconds."
+    print_info "Validating current clock independently against trusted HTTP time..."
+    if validate_or_correct_clock_from_http; then
+        print_warning "Proceeding with a clock verified/corrected from trusted HTTP time; NTP synchronization should still be reviewed."
+        return 0
+    fi
+
+    print_error "Clock accuracy could not be confirmed."
     print_error "Refusing to continue because Active Directory/Kerberos requires accurate time."
     print_error "Verify with: timedatectl && chronyc tracking && chronyc sources -v"
     return 1
