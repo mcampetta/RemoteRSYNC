@@ -43,7 +43,7 @@
 #   - Ubuntu 22.04 or newer
 #
 
-SCRIPT_VERSION="1.1.4"
+SCRIPT_VERSION="1.1.5"
 APT_BACKGROUND_GUARD_ACTIVE=0
 APT_BACKGROUND_STOPPED_UNITS=""
 APT_RUNTIME_MASKED_UNITS=""
@@ -2172,10 +2172,9 @@ configure_dns_servers() {
 }
 
 # ── Configure chrony NTP source ───────────────────────────────────────────────
-# Kerberos requires reasonable clock sync. If DNS_SERVERS override is set, use
-# those servers as NTP sources. Otherwise, use the DHCP/VPN-provided DNS servers
-# currently active on the interface. If none can be determined, leave chrony
-# defaults in place and allow sync_time() to warn rather than hard-fail.
+# Kerberos requires reasonable clock sync. Prefer an explicit NTP_SERVERS
+# override when configured; otherwise discover AD domain controllers from the
+# Kerberos SRV records. DHCP DNS resolver addresses are never assumed to be NTP.
 
 get_ad_ntp_servers() {
     command -v dig >/dev/null 2>&1 || return 1
@@ -2277,41 +2276,6 @@ configure_chrony() {
 # causes domain joins and logins to fail with cryptic errors. Chrony must be
 # running and the clock synchronized before attempting to join.
 
-force_step_from_chrony_offset() {
-    # Fallback for large offsets where chrony has valid NTP replies but has not
-    # selected a source yet. This reads the measured offset from chronyc ntpdata
-    # and steps the system clock once, then writes the corrected time to RTC.
-    local sources source offset offset_int abs_offset now_epoch new_epoch
-    sources="$(get_current_dns_servers | tr '\n' ' ')"
-
-    for source in $sources; do
-        if ! is_valid_ip_literal "$source"; then
-            continue
-        fi
-
-        offset="$(chronyc ntpdata "$source" 2>/dev/null \
-            | awk -F: '/^Offset[[:space:]]*:/ {gsub(/ seconds/, "", $2); gsub(/^ +| +$/, "", $2); print $2; exit}')"
-
-        if [ -z "$offset" ]; then
-            continue
-        fi
-
-        offset_int="$(awk -v o="$offset" 'BEGIN { printf "%.0f", o }')"
-        abs_offset="$(awk -v o="$offset" 'BEGIN { if (o < 0) o = -o; printf "%.0f", o }')"
-
-        if [ "$abs_offset" -ge 300 ]; then
-            print_warning "Large clock offset detected from $source: ${offset}s — forcing one-time clock step"
-            now_epoch="$(date -u +%s)"
-            new_epoch=$((now_epoch + offset_int))
-            date -u -s "@$new_epoch" > /dev/null
-            hwclock --systohc > /dev/null 2>&1 || true
-            return 0
-        fi
-    done
-
-    return 1
-}
-
 sync_time() {
     print_info "Enabling time synchronization via chrony..."
     systemctl enable --now chrony > /dev/null 2>&1
@@ -2321,10 +2285,9 @@ sync_time() {
     sleep 2
     chronyc -a makestep > /dev/null 2>&1 || true
 
-    # If the offset is extremely large, chrony may receive valid NTP replies but
-    # still not select a source. Force a one-time step from a valid NTP offset.
+    # Give chrony one restart/retry if it has not selected a source yet.
+    # A later independent HTTP Date check handles large or blocked-NTP cases.
     if ! chronyc tracking 2>/dev/null | grep -qE '^Leap status[[:space:]]*:[[:space:]]*Normal'; then
-        force_step_from_chrony_offset || true
         systemctl restart chrony > /dev/null 2>&1 || true
         chronyc -a burst 4/4 > /dev/null 2>&1 || true
         sleep 2
